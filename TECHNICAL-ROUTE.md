@@ -280,23 +280,226 @@ OpenAI 托管模型不返回原始 CoT，Gemini 的 `-o json` 会剥掉思考内
 
 ---
 
-## 六、起手式
+## 六、DSH 版本策略（回答"必须 follow 最新版"）
 
-### 分叉 1 还差一个输入：**C1 的决策模块用什么语言？**
+### 6.1 现状：DSH 没有任何正式版
+
+实测（2026-09-23，GitHub API）：
+
+- `GET /releases/latest` → **404**。即**不存在非 prerelease 的正式版**。
+- 近期 12 个 release 的 `prerelease` 字段**全部为 `true`**。
+- 发版节奏：09-03、09-04、09-07、09-08、09-09、09-10×2、09-15、09-17、09-22×2、09-23
+  —— **20 天 12 个版本**。
+- 最新：**`dsh-v0.1.7-rc.1`**（commit `46a7f68b0922`，**今天**发布）。
+- **归档里的 checkout 是 `dsh-v0.1.7-alpha.1`（`c36a83f`），落后两个版本**（alpha.2、rc.1）。
+
+→ **"等正式版"这个选项现在不存在。** 要 follow 最新，就是跟一条 20 天 12 版的 prerelease 快车道。
+
+### 6.2 但 DSH 对已发布数据有正式兼容义务（不是"预览版就随便变"）
+
+`docs/session-format-status.md` 原话：
+
+> An alpha, beta, or release-candidate product publication **establishes released
+> Session-format obligations**. **GitHub's prerelease flag does not make persisted
+> user data disposable.**
+
+机制是正式的：
+
+- `latestFinalizedVersion: 4`（= checkout 写入器）
+- `latestReleasedVersion: 3`，`evidenceTag: dsh-v0.1.5-alpha.1`
+- 每个整数 **0..4 都有历史格式文档**（`docs/persistence-changes/historical-formats/`）
+- **迁移只允许相邻**：`v0→v1`、`v1→v2`、`v2→v3`、`v3→v4`，各一个包，不能跳
+- 有机器检查：`scripts/doc-standard.spec.ts` 校验记录结构、双语一致、证据 tag 与写入器路径一致
+
+> ⚠️ **一个要盯的坑**：checkout 写 **V4**，但最后**发布**的格式是 **V3**（`dsh-v0.1.5-alpha.1`）。
+> 即 V4 已 finalized 但未记录为已发布。用这份 checkout 跑出来的 session 是 V4，
+> 换到发布版可能要跑迁移。
+
+### 6.3 抗升级的抓手：DSH 自己给了
+
+三条都是 DSH 文档原话：
+
+1. "Extension plugins depend on **Service Definitions, never concrete providers**."
+2. "extension packages depend on `dsh-agent` events and services, **not on** `dsh-agent-loop`."
+3. `docs/capability-seams.md` 是**生成**的（`scripts/gen-doc-graphs.ts`），**带完整性守卫**，
+   逐条列出每个 `ctx.*` 服务的 **Role**：`core` / `seam` / `service` / `bundle`。
+
+→ **我们依赖「`ctx.*` 服务名 + `dsh-agent` 事件签名 + Role」，不 import 具体实现包。**
+
+我们真正会依赖的服务及其 Role（已核）：
+
+| `ctx.*` | Role | 用途 |
+|---|---|---|
+| `ctx.tools` | **core** | 工具注册 + 五阶段执行流水线 |
+| `ctx.approval` | **seam** | 审批（湿实验 / 付费动作） |
+| `ctx.storageDomain` | **core** | **typed durable state —— decision 模块状态放这里** |
+| `ctx.llm` | **seam** | 模型适配 |
+| `ctx.sessions` | **core** | append-only 事件日志 |
+| `ctx.sessionPersistence` | **seam** | 持久化后端 |
+| `ctx.credentials` | **seam** | 凭证 |
+| `ctx.commands` | **core** | 斜杠命令 |
+| `ctx.skills` | **seam** | 技能 |
+| `ctx.subagents` | **seam** | 子代理 |
+| `ctx.jobs` | **seam** | 后台任务 |
+| `ctx.agentLoop` | **bundle** | 可替换的 loop（**不要直接依赖它**） |
+
+### 6.4 建议：把"版本兼容性门禁"做成一等组件
+
+```
+升级 DSH 时跑：
+1. 记录新 tag / commit / SESSION_FORMAT_VERSION
+2. 重新生成 capability-seams 表，diff：
+   - 我们依赖的 ctx.* 是否还存在
+   - Role 是否从 seam/core 变了
+   - 依赖的 seam 的 implementations 是否换了
+3. diff interception 事件签名（agent/pre-step、agent/turn-stopping、tools/*）
+4. session format version 是否变 → 变了要跑迁移
+5. 跑我们的契约测试
+```
+
+**关键设计**：**我们自己的持久化状态不要放在 DSH 的 session 格式里**，走 `ctx.storageDomain`
+（"domain form as one lifecycle-bound service for **typed durable state**"）。
+这样 DSH 换 session 格式不会打穿我们的状态。
+
+**版本策略建议**：跟 **rc** 而不是 alpha（rc 是发布前最后阶段，变更面收窄）；
+每次升级**必须**跑门禁，不过就不升；把 DSH tag / commit / session-format-version 作为
+**构建元数据**打进我们的产物。
+
+---
+
+## 七、长程任务上如何用 feedback 更新 decision 模块
+
+### 7.1 先把"长程"拆成三层（否则会把在线学习和 RL 混在一起）
+
+| 层 | 含义 | 更新对象 | 时机 | 归谁 |
+|---|---|---|---|---|
+| **L0** | run 内，本轮 feedback → 下一轮 | decision 的**状态**（后验 / memory） | 每轮 | C3 保证交付 |
+| **L1** | run 内，长程（几十～几百轮） | 同上，但要处理迟到 / 乱序 / 缺失 | 每轮 | C3 + 时序管理 |
+| **L2** | **跨 run** | decision 的**参数 / 策略** | 每 run 或每 N run | **C2（self-evolve）** |
+
+**L2 不能在 run 内做**，否则归因失效——这与你之前定的"self-evolve 定义在 run 之间"一致。
+下面主要讲 L1，但接口要同时支撑 L2。
+
+### 7.2 核心困难不是算法，是反馈的时序与归属
+
+长程 + 异步实验端，feedback 会长这样：
+
+| 情况 | 说明 |
+|---|---|
+| **迟到** | 第 5 轮的 feedback 在第 8 轮才到 |
+| **部分到达** | 先拿到部分读数，后来补全 |
+| **永久缺失** | 实验失败 / 取消，永远不会有 |
+| **重复 / 修订** | 同一个 observation 被修正后重发 |
+| **批量对应** | 一个 decision 选了 k 个 action，feedback 分批到 |
+
+→ `observe()` 必须**按 `(action_id, round)` 键控**，不能是"喂最新一条"。
+
+### 7.3 三条设计原则
+
+**原则 1：数值反馈走结构化旁路，不经过模型文本。**
+让 agent 读 feedback 再调 `update_decision(text)`，数值会被模型重述一遍——
+**lossy + retokenization drift**，正是职责③要防的问题。
+正确做法：experiment tool 返回时，runtime 直接把结构化 observation 交给 `DecisionService.observe()`。
+模型的定性解释（"这次失败可能是剂量选错了"）走**另一条通道** `annotate()`，
+与数值反馈**分开存**。
+
+**原则 2：decision 的状态必须外置、可持久化、可快照。**
+长程状态不能塞 prompt。用 `ctx.storageDomain`。
+`snapshot()` / `restore()` 是必须的——run 暂停（等湿实验）后要恢复；
+也是 L2 的前提（训练器需要"初始状态 + 轨迹"）。
+
+**原则 3：增量更新，且显式区分"状态更新"与"策略更新"。**
+L0 / L1 = 状态更新，可以每轮做。L2 = 策略更新，**不能在 run 内做**。
+第一版用最简单的序贯决策，refit 成本可接受，但接口要能表达增量。
+
+### 7.4 建议的接口
+
+```python
+class DecisionService(Protocol):
+    model_version: str
+
+    # 取推荐 —— agent 每轮必须调（turn-stopping 强制）
+    def propose(self, request: DecisionRequest) -> DecisionPacket: ...
+
+    # 数值反馈 —— 结构化旁路，不经过模型
+    def observe(self, observation: Observation) -> UpdateReceipt: ...
+
+    # 模型的定性解释 —— 与数值反馈分开存
+    def annotate(self, annotation: Annotation) -> None: ...
+
+    # 长程：状态快照 / 恢复
+    def snapshot(self) -> bytes: ...
+    def restore(self, blob: bytes) -> None: ...
+
+    # 长程：还有多少反馈没到
+    def pending(self) -> list[ObservationRef]: ...
+```
+
+`UpdateReceipt` 必须可审计：
+
+```
+consumed:  [observation_id, ...]     # 这次消费了哪些
+pending:   [observation_id, ...]     # 还没到
+abandoned: [observation_id, ...]     # 超时放弃
+state_revision_before / after: int
+affected_rounds: [int, ...]
+```
+
+### 7.5 "闭环真的闭合"的判据（配对审计）
+
+```
+对每一轮 r：
+  1. decision_r 存在                              ← turn-stopping 强制
+  2. action_r = decision_r 选出的
+  3. observation_r 存在，或显式标记 missing / timeout
+  4. decision_{r+1}.input_refs ∋ observation_r    ← 核心
+```
+
+**第 4 条不成立，闭环就是假的。** 每次 run 都要产出这个 pairing audit artifact。
+
+这不是形式主义：PerturbTrace 测出的"576 次转移只有 7.5% 走完四段"，
+就是第 3、4 条不成立。
+
+### 7.6 长程特有的陷阱：credit assignment
+
+长程任务里，"这一轮命中率变高"可能来自 **3 轮前**的反馈，不是上一轮。
+所以不能只做即时配对（上一轮 feedback → 这一轮决策）。
+
+需要 **per-round gain 归因**（PerturbTraceBench 的 `round_hit_gain` 正是这个），
+并且要能把 gain 追溯到**具体哪条 feedback**。
+
+**没有这个，你在长程任务上无法回答"feedback 到底有没有用"**——而这正是 PerturbTrace 的核心问题，
+也是这个项目要解决的东西。
+
+---
+
+## 八、起手式
+
+### 还差两个输入
+
+**输入 1：C1 的决策模块用什么语言？**
 
 - 能用 TypeScript 写 → **A**（只写插件，最简单，无进程边界）
 - 要用 Python（PyTorch / scanpy / 多组学 embedding）→ **B**（TS 插件 + Python 决策服务）
 
-**这个答案一给，代码结构就定了。**
+**输入 2：DSH 版本跟到哪一档？**
+
+| 选项 | 含义 | 风险 |
+|---|---|---|
+| **跟 rc**（现在 `dsh-v0.1.7-rc.1`） | 发布前最后阶段，变更面收窄 | 低。**推荐** |
+| 跟最新 tag（可能是 alpha） | 最激进，永远最新 | 中，alpha 变更面大 |
+| 等 `0.1.7` 正式发布 | —— | **不可行**：`/releases/latest` 是 404，没有正式版 |
 
 ### 然后按性价比排序动手
 
-1. **补 Phase 0**：用归档里的 checkout 做逐符号核对，产出 `LlmAdapter` / StreamChunk /
-   session persistence / plugin registration 的源码核对表 + 一份可运行的二次开发样例。
-   **零网络依赖、零凭证需求**，且能立刻消掉上一轮最大的未验收项。
-2. **落地"每轮强制调用 decision"的骨架**：一个最小 `DecisionService` Service Definition +
-   一个 `agent/turn-stopping` 监听者 + 一个 feedback→update 的配对校验。
-   **先让闭环跑通，决策算法用最简单的主动学习即可**（这是分叉 2 的原话）。
+0. **先建版本兼容性门禁**（新增，优先级最高）。一个脚本：吃 DSH tag / commit，
+   产出 capability-seams diff + interception 事件签名 diff + session-format-version 变化；
+   **门禁不过就不升级**。先建它，后面每次升级都省事。
+1. **把 checkout 升到选定版本**。归档那份是 `0.1.7-alpha.1`，**落后两个版本**。
+   升级后重跑 Phase 0 的逐符号核对（现在有源码，可离线做，零网络零凭证）。
+2. **落地"每轮强制调用 decision"的骨架**：最小 `DecisionService` Service Definition +
+   `agent/turn-stopping` 监听者 + feedback→update 配对校验 + **pairing audit artifact**。
+   **先让闭环跑通，决策算法用最简单的主动学习即可**（分叉 2 原话）。
 3. **把实验工具做成异步 + 幂等**（分叉 3）：即使现在只跑 in-silico，也按这个契约写，
    以后接湿实验不改契约。
 4. **trace 保真**：在模型 API 边界记录原始请求/响应，harness 注入打标。
