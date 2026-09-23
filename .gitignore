@@ -36,6 +36,10 @@ outputs/
 credentials.json
 *.local.json
 
+# ---- 本地工具与 agent 状态（非项目源码）----
+.qoder/
+.workbuddy-ai/
+
 # ---- 编辑器与系统 ----
 .vscode/
 .idea/
