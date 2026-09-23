@@ -124,6 +124,50 @@ B 套用 Python 重写了审批、durable workflow、告警、存储、session �
 
 ---
 
+## 三·五、DSH 的 interception surface（本次最关键的技术发现）
+
+> 来源：`packages/hooks/README.md` + `.agents/notes/implemented/feature/2026-06-30-interception-extension-points.md`
+> 这份 Agent Note 的状态是 **implemented**，且有集成测试
+> `packages/core/agent-loop/tests/interception.spec.ts` 在真实 loop 上验证。
+
+**核心 reframe（原文）**：
+> "native hooks" **不是**一个包——native hook 就是一个普通的 Cordis 插件，
+> 订阅规范生命周期事件。CC/Codex 桥只是把外部 shell-hook 协议翻译到同一个 API 的翻译器。
+> **Anything a bridge can do, a plain plugin can do directly — more powerfully
+> (no serialization boundary, full `ctx`, typed returns).**
+
+### 生命周期扩展点
+
+| 事件 | 语义 | 关键能力 |
+|---|---|---|
+| `agent/created` | 每个 agent 首次 turn 前的串行初始化 | 监听者可 **安装工具**、通过 `agent.inject()` 播种上下文 |
+| `agent/pre-step` | **每个** proposed step 前的 waterfall | `enter` 返回完整 message batch（可注入上下文）；`reject` 关闭该 turn |
+| `agent/turn-stopping` | 自然停止边界上的 awaited notification | **需要再来一步的监听者调用 `agent.steer()`，loop 会重新读取 outbox 并继续** |
+
+### 工具五阶段流水线
+
+```
+tools/pre-execute → guards → tools/execute → dispatch → tools/post-execute
+                  → finalizeContent → tools/result
+```
+
+| 阶段 | 决策类型 | 能做 |
+|---|---|---|
+| `tools/pre-execute` | `PreToolDecision` | **allow / deny / ask**。deny 直接跳过 dispatch；ask 走 `ctx.approval`，**只有 `allowed-once` 才继续**；审批服务缺失 → 归一化为拒绝 |
+| `ctx.tools.guard()` | 同步作用域策略 | 只能 **deny 或弃权，永不 force-allow**（所以监听器顺序不能复活被最终不变量禁止的操作） |
+| `tools/execute` | around-dispatch | timeout / retry / metrics 包装，可替换并恢复 `exec.signal` |
+| `tools/post-execute` | `PostToolDecision` | **accept / 带 feedback 阻断 / 替换内容或值 / 附加 `additionalContexts`** |
+| `ToolDefinition.finalizeContent` | 同步、全量、只碰 content | 工具自己的最后一公里内容不变量 |
+| `tools/result` | 只读通知 | 观察者失败被隔离，不能改变结果 |
+
+**这条缝直接回答了一个原本以为要 fork 才能解决的问题**：
+"agent 每一轮**必须**调用 decision making" —— 用 `agent/turn-stopping` 监听者检查本轮是否调用了
+decision 工具，没调用就 `agent.steer()` 带模型可见内容 → loop 继续。
+**不需要改 DSH 源码。** 若还要更硬的约束，`core/agent-loop` 本身是**可替换**的
+（"extension plugins depend on `agent` and the driver stays swappable"）。
+
+---
+
 ## 四、未决问题（B 套没解决的）
 
 1. **Phase 0 从未验收** —— 但现在源码 checkout 在归档里，**可以离线补**（逐符号核对
@@ -139,34 +183,94 @@ B 套用 Python 重写了审批、durable workflow、告警、存储、session �
 
 ## 五、必须你拍板的分叉点
 
-### 分叉 1（最关键）：DSH 怎么引入？
+### 分叉 1：DSH 以什么形式引入？—— 四选项的区别
 
-| 选项 | 含义 | 代价 |
+**先说结论：结合分叉 2 的要求，只有 A 和 B 可选，fork 不需要。**
+
+真正的轴只有一条：**我们的科研能力写在哪一侧、用什么语言。**
+
+| | **A. 只写插件（bundle）** | **B. DSH 内核 + Python 决策服务** | **C. fork DSH 源码** | **D. Python SDK 子进程** |
+|---|---|---|---|---|
+| 代码语言 | TypeScript / npm 包 | TS 插件 + Python 服务 | TypeScript（改 DSH 自身） | Python |
+| 改 DSH 源码 | 否 | 否 | **是** | 否 |
+| 能碰到的 DSH 内部 | **全部 `ctx.*`** | 同 A | 全部 + 能改能力缝 | 只有 JSON-RPC 表面 |
+| 每轮强制调 decision | ✅ `agent/turn-stopping` + `agent.steer()` | ✅ 同 A | ✅（但不必需） | ❌ 只能靠 prompt 求 |
+| 换 decision 模块 | 换 Provider / 插件 | **换 Python 服务，DSH 侧不动** | 改源码 | 换 HTTP 服务 |
+| C1（多组学 / PyTorch） | 要重写成 TS 或走服务边界 | **原生 Python** | 要重写 | 原生 Python |
+| DSH 升级成本 | 中（跟 patch layer） | 中 | **高**（跟上游 merge） | 低 |
+| 主要风险 | 决策层跨语言 | 多一个进程边界（超时/版本/幂等要设计） | DSH 是 alpha，格式变得勤 | **拿不到能力缝 = B 套的老路** |
+
+**A. 只写插件（bundle）**
+DSH 的官方扩展方式。我们写一个 npm 包，声明 `dsh.bundle.patch`，launcher 按顺序叠加进 profile。
+`packages/bundle/README.md` 明确说 "Domain packages can declare additional layers outside this directory"，
+所以领域层**不必**放进 DSH 仓库里。安装用 `dsh plugin --profile sdk add file:<bundle>`。
+**优点**：用到全部 `ctx.*`（tools / approval / commands / session / storage / credentials / llm），
+零序列化边界、强类型返回。**缺点**：C1 若要用 PyTorch / scanpy，得用 TS 重写，
+或在插件内部再调外部服务——那就变成 B 了。
+
+**B. DSH 内核 + Python 决策服务**
+= A + 把决策层放到独立 Python 进程，插件通过稳定服务边界调用它。
+**这正好命中"后续只需要换 tool 就行"**：decision 是注册进 `ctx.tools` 的工具，
+背后是 `DecisionService` 这个 Service Definition，C1 提供 Service Provider。
+换决策方法 = 换 Provider，DSH 侧和工具 schema 都不用动。
+B 套的 `RemoteDecisionModule`（versioned JSON HTTP，版本不匹配 fail closed）就是这个思路，可借鉴。
+**代价**：多一个进程边界，超时 / 版本 / 幂等必须显式设计。
+
+**C. fork DSH 源码**
+把归档的 checkout 恢复进工作区，直接改 `packages/`。
+**只在"能力缝不够用、必须改缝"时才值得**——现在看不需要，第三·五节的 interception surface
+已覆盖"每轮强制调用"这类硬约束。
+另外 **DSH 是 alpha 预览版**：`packages/session/` 下有 `session-format-v0-to-v1`、`v1-to-v2`、
+`v2-to-v3`、`v3-to-v4` **四个**迁移包，说明 session 格式变得很勤——fork 就要一直跟。
+
+**D. Python SDK 子进程**
+只用 `DeepSeekHarness.run()` / `Session.run()`，拿 `RunResult(session_id, final_response,
+finish_reason, events, notifications)`。
+**能拿到**：完整事件流、notifications（含子代理）、finish_reason。
+**拿不到**：`ctx.approval`、`ctx.commands`、`ctx.tools.guard()`、interception 的 typed Decision——
+即除了"发 prompt、收事件"之外的一切。
+**B 套走的就是这条路**（Python 侧 + 一个 TS 工具插件），这是它"只用到 DSH 皮毛"的直接原因。
+
+> **推荐 B。** 分叉 2 的三条硬约束（每轮强制调用 / 每轮强制更新 / 换 tool 就行）
+> 用 `agent/turn-stopping` + `ctx.tools` + Service Definition/Provider 分离即可满足，
+> 全在 A 的能力范围内；而 C1 大概率是 Python，B 让它在原生环境跑，
+> 同时保持"换 Provider 就换掉 decision"。
+
+### 分叉 2：**已定** —— 闭环是硬约束，不是选项
+
+把原话拆成三条可验证约束：
+
+| # | 约束 | 落在 DSH 的哪里 |
 |---|---|---|
-| **A. fork 源码进工作区** | 把归档的 checkout 恢复进来，可以直接改 DSH 本身 | 161 MB；要跟上游 merge；升级成本高 |
-| **B. 只写插件（bundle）** | DSH 作为依赖装在 `DSH_HOME`，我们只提供 patch layer + Provider | 不改 DSH 源码；受 Service Definition 约束 |
-| **C. Python SDK 子进程** | 只通过 JSON-RPC 交互，完全不进 DSH 内部 | 最省事；但拿不到进程内能力（无法注册 in-process 工具） |
+| 1 | **decision making 必须以工具形式预留位置** | `ctx.tools.register(defineTool(...))`；背后是 `DecisionService` 这个 Service Definition，C1 提供 Provider |
+| 2 | **agent 每一轮执行科学发现任务都必须调用它**（其他 toolkit 由 agent 自行决定） | `agent/turn-stopping` 监听者：本轮没调 decision 工具就 `agent.steer()` 带模型可见内容 → loop 继续。要更硬就换 `agent-loop`（可替换） |
+| 3 | **每轮拿到 feedback 必须更新 decision making** | `tools/post-execute` 的 `PostToolDecision`：feedback 工具返回后若未调用 update，则带 feedback 阻断或附加 `additionalContexts` |
 
-**判断依据：你要不要改 DSH 的源码？**
-如果科研能力全都能做成 Provider / tool / command / hook，**B 就够，而且是最优解**。
-A 只在"DSH 的某个缝不够用、必须改缝"时才需要。
+**前期 decision 模块可以用最简单的主动学习 / 序贯决策方法，但闭环更新必须跑通。**
+这意味着第一版就必须有三件事：
 
-> B 套走的是 **C + 一个工具插件**，这也是它"只用到 DSH 皮毛"的原因——
-> C 只能拿 JSON-RPC 暴露的东西，拿不到 `ctx.approval`、`ctx.tools` 之外的 50 个能力组。
+- 一个**可替换的 `DecisionService` Service Definition**（不是"先写死以后再抽"）；
+- decision 调用与 feedback 更新的**配对校验**（可审计：这一轮的 feedback 有没有真进到下一轮决策）；
+- trace 里能读出「决策输入 → 决策输出 → feedback → 下一次决策输入」的完整链。
 
-### 分叉 2：**"能做科学发现"的定义是什么？**
+> 第三条正好对上 harness 职责③与 **retokenization drift** 那个硬问题：
+> 必须在**模型 API 边界**记录原始请求/响应，不能在节点层记摘要。
 
-| 选项 | 含义 | 是否需要 decision module |
-|---|---|---|
-| **A. 真闭环** | agent 自主提假设 → 设计扰动 → 执行 → 读结果 → 改下一步 | 需要（C1） |
-| **B. 工具增强** | agent 能调用科研工具完成一个给定任务 | 不需要 |
+### 分叉 3：**在 agent 边界上两者一样 —— 这个判断是对的**
 
-这决定要不要留 C1 的接口，以及 trace 要不要保到 CoT 级。
+"agent 不负责接入湿实验仪器，一定会有实体把实验结果作为 feedback 传进来"——
+在 agent 的工具边界上，in-silico 和湿实验是**同一个形状**：调工具 → 拿 feedback。
 
-### 分叉 3：实验端是**真湿实验**还是 in-silico？
+但契约里必须提前放两样东西，否则以后接湿实验要改契约：
 
-真湿实验 → durable execution 和审批是**第一优先级**，必须先做。
-in-silico → 这两样可以推后，先做领域状态和决策闭环。
+| 差异 | in-silico | 真湿实验 | 契约上要预留 |
+|---|---|---|---|
+| 延迟量级 | 秒级 | 小时～天级 | 工具返回**异步句柄**（pending + 后回填），不能假设同步返回 |
+| 成本 | 免费 | 每次真花钱 | 预算门 + `interaction/user-approval` 审批 |
+| 可重放性 | 可重跑 | **不可重放** | **幂等键**（防重复提交不可逆实验） |
+
+**结论**：从第一天就把实验工具设计成 **异步 + 幂等**，两者共用同一套契约，只是等待时间不同。
+durable execution 的优先级取决于你近期跑不跑真湿实验——**不跑就可以推后**。
 
 ### 分叉 4：后端只用 `deepseek-official` 吗？
 
@@ -176,14 +280,24 @@ OpenAI 托管模型不返回原始 CoT，Gemini 的 `-o json` 会剥掉思考内
 
 ---
 
-## 六、建议的起手式（等你确认分叉点后再定）
+## 六、起手式
 
-按性价比排序：
+### 分叉 1 还差一个输入：**C1 的决策模块用什么语言？**
 
-1. **补 Phase 0**：用归档里的 checkout 做逐符号核对，产出 `LlmAdapter`/StreamChunk/
-   session persistence/plugin registration 的源码核对表 + 一份可运行的二次开发样例。
+- 能用 TypeScript 写 → **A**（只写插件，最简单，无进程边界）
+- 要用 Python（PyTorch / scanpy / 多组学 embedding）→ **B**（TS 插件 + Python 决策服务）
+
+**这个答案一给，代码结构就定了。**
+
+### 然后按性价比排序动手
+
+1. **补 Phase 0**：用归档里的 checkout 做逐符号核对，产出 `LlmAdapter` / StreamChunk /
+   session persistence / plugin registration 的源码核对表 + 一份可运行的二次开发样例。
    **零网络依赖、零凭证需求**，且能立刻消掉上一轮最大的未验收项。
-2. **画能力缝边界图**：把第三节的表做成 DSH 源码级证据（每个结论落到具体包和符号），
-   确定"我们只写哪些 Provider"。
-3. **定领域层的挂载方式**：一个 `bundle` patch layer + 一组 Provider，
-   还是独立的 npm 包。这一步定了，代码结构就定了。
+2. **落地"每轮强制调用 decision"的骨架**：一个最小 `DecisionService` Service Definition +
+   一个 `agent/turn-stopping` 监听者 + 一个 feedback→update 的配对校验。
+   **先让闭环跑通，决策算法用最简单的主动学习即可**（这是分叉 2 的原话）。
+3. **把实验工具做成异步 + 幂等**（分叉 3）：即使现在只跑 in-silico，也按这个契约写，
+   以后接湿实验不改契约。
+4. **trace 保真**：在模型 API 边界记录原始请求/响应，harness 注入打标。
+   对应职责③与 retokenization drift。
