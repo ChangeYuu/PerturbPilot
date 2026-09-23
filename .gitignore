@@ -1,0 +1,44 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Node / DSH 运行时 ----
+node_modules/
+dist/
+build/
+.npm/
+*.tsbuildinfo
+
+# ---- 运行产物（不进版本库）----
+runs/
+runs_*/
+outputs/
+*.sqlite
+*.sqlite3
+*.db
+
+# ---- 外部抓取与缓存 ----
+.upstream/
+.cache/
+*.tree.json
+
+# ---- 密钥与本地配置 ----
+.env
+.env.*
+credentials.json
+*.local.json
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
