@@ -44,7 +44,7 @@ PerturbPilot 是**基于 DSH（DeepSeek Harness）开发的生物科学发现框
 
 **W-4 依赖只用白名单里的。**
 - 插件：Node 标准库，加 DSH 自己的包（`@deepseek-ai/cordis`、`dsh-llm`、`dsh-tools`、`schemastery`，写成 peerDependencies）。
-- 服务：Python 标准库加 `numpy`。
+- 服务：Python 标准库加 `numpy`；`torch` 只给 coreset / top-uncertain 两个决策方法用，按需加载。
 - 开发：`pytest`、`ruff`；JS 测试用 `node --test`。
 - 面板不用任何第三方库，也不用构建工具。
 - 其他任何依赖都要用户批准。

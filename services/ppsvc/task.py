@@ -4,6 +4,8 @@
     task.json        公开的任务卡片
     candidates.csv   id + 公开属性列
     data/            数据卡片的文件（task.json 的 data_cards 里列出）
+                     候选特征表（role=candidate_features, modality=embedding）是 id + 数值列的 CSV，
+                     可以只覆盖一部分候选：没有行的候选就是没有特征，决策模块不会假装它有
 
   <隐藏数据目录>/     只有 oracle 读，放在任务包外面（服务用 --hidden 指定）
     scores.csv       id + 各读数字段
@@ -100,6 +102,14 @@ def target_sign(objective: dict[str, Any]) -> float:
 
 
 @dataclass
+class Features:
+    """候选特征：rows 是有特征的候选在 ids 里的下标（升序），X 的第 i 行属于 ids[rows[i]]。"""
+
+    rows: np.ndarray
+    X: np.ndarray
+
+
+@dataclass
 class Package:
     root: Path
     card: dict[str, Any]
@@ -123,19 +133,33 @@ class Package:
     def public_card(self) -> dict[str, Any]:
         return {**self.card, "package_dir": str(self.root), "n_candidates": len(self.ids)}
 
-    def features(self, visible: tuple[str, ...] = VISIBILITIES) -> np.ndarray | None:
-        """把角色为候选特征的嵌入卡片按候选顺序拼成一个矩阵；没有就返回 None。"""
-        blocks = []
+    def features(self, visible: tuple[str, ...] = VISIBILITIES) -> Features | None:
+        """把角色为候选特征的嵌入卡片按候选顺序拼起来；有几张卡片时只留每张都有行的候选。没有卡片就返回 None。"""
+        tables = []
+        known = set(self.ids)
         for dc in self.card.get("data_cards", []):
             if dc["role"] != "candidate_features" or dc["modality"] != "embedding" or dc["visibility"] not in visible:
                 continue
             header, rows = read_csv(self.root / dc["file"])
-            by_id = {r[0]: [float(x) for x in r[1:]] for r in rows}
-            missing = [c for c in self.ids if c not in by_id]
-            if missing:
-                raise TaskError(f"data card {dc['name']!r} has no row for {missing[0]!r}")
-            blocks.append(np.asarray([by_id[c] for c in self.ids], dtype=float).reshape(len(self.ids), len(header) - 1))
-        return np.hstack(blocks) if blocks else None
+            by_id = {}
+            for r in rows:
+                if r[0] not in known:
+                    raise TaskError(f"data card {dc['name']!r} has a row for {r[0]!r}, which is not a candidate")
+                if r[0] in by_id:
+                    raise TaskError(f"data card {dc['name']!r} has two rows for {r[0]!r}")
+                if len(r) != len(header):
+                    raise TaskError(f"data card {dc['name']!r} row {r[0]!r} has {len(r)} columns, expected {len(header)}")
+                by_id[r[0]] = [float(x) for x in r[1:]]
+            if not by_id:
+                raise TaskError(f"data card {dc['name']!r} has no rows")
+            tables.append(by_id)
+        if not tables:
+            return None
+        rows = np.array([i for i, c in enumerate(self.ids) if all(c in t for t in tables)], dtype=int)
+        if len(rows) == 0:
+            raise TaskError("no candidate has a row in every candidate_features card")
+        X = np.hstack([np.asarray([t[self.ids[i]] for i in rows], dtype=float).reshape(len(rows), -1) for t in tables])
+        return Features(rows, X)
 
 
 def write_synthetic_package(

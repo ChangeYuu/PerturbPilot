@@ -514,6 +514,10 @@ export class Run {
     lines.push(`预算：共 ${b.rounds} 轮，每轮正好 ${b.batch_size} 个；候选 ${t.n_candidates} 个，${b.allow_repeats ? '可以重复测' : '不能重复测'}`)
     const used = s.decision.inputs_used ?? []
     lines.push(`决策模块：${s.decision.name}，方法 ${s.decision.method}，${used.length ? `用到 ${used.map((x) => `${x.role}/${x.modality}`).join(', ')}` : '没用任何候选特征'}`)
+    const cards = t.data_cards ?? []
+    lines.push(cards.length
+      ? `任务包的数据：${cards.map((dc) => `${dc.name}（${dc.role}/${dc.modality}，${dc.visibility === 'public' ? `${dc.file}，pp_run_python 的目录里也有` : '只给决策模块'}）`).join('；')}`
+      : '任务包的数据：没有，候选只有标识符')
     const statusText = { active: '进行中', paused: '已暂停（不会自动开始下一轮）', stopped: '已停止', finished: '已完成' }[s.status]
     lines.push(`状态：${statusText}`)
     if (!this.closed) {

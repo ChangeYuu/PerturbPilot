@@ -8,7 +8,8 @@
 
 隐藏数据（scores.csv 等）放在任务包外面；给了 --task 就必须给 --hidden。
 
---decision：auto（默认，有嵌入特征用 gp-ucb，否则 coverage）、gp-ucb、coverage。
+--decision：auto（默认，有嵌入特征用 gp-ucb，否则 coverage）、gp-ucb、coreset、top-uncertain、coverage。
+gp-ucb、coreset、top-uncertain 要任务包里有候选特征；coreset 和 top-uncertain 还要装 torch。
 决策模块启动时还没读任务，插件开任务时调 /init 把任务包交给它。
 
 设了环境变量 PERTURBPILOT_SERVICE_TOKEN 时，两个服务都只接受带同一个值的

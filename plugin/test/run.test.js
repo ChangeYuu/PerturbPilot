@@ -323,6 +323,7 @@ test('brief describes the task generically and shows the objective field', async
   assert.match(text, /读数字段：score（效应（有符号））；absolute_effect/)
   assert.match(text, /共 3 轮，每轮正好 3 个；候选 20 个，可以重复测/)
   assert.match(text, /方法 coverage，没用任何候选特征/)
+  assert.match(text, /任务包的数据：expr（candidate_features\/expression，data\/expr\.csv，pp_run_python 的目录里也有）/)
   await playRound(run, services)
   text = run.brief()
   assert.match(text, /第 2\/3 轮/)

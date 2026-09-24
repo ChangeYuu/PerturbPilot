@@ -41,7 +41,7 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 
 ```powershell
 # 1. 起 oracle 和决策模块（另开一个窗口，常驻）。令牌随便取一个随机串，这个窗口和第 4 步的窗口要设成同一个值
-#    不加 --task 就用合成任务；--task 指向任务包目录，--hidden 指向它的隐藏数据目录（在任务包外面，两个要一起给）。--decision 选方法（auto / gp-ucb / coverage，auto 按任务包里有没有嵌入特征决定）
+#    不加 --task 就用合成任务；--task 指向任务包目录，--hidden 指向它的隐藏数据目录（在任务包外面，两个要一起给）。--decision 选方法（auto / gp-ucb / coreset / top-uncertain / coverage，auto 在任务包有候选特征时用 gp-ucb、没有时用 coverage；coreset 和 top-uncertain 要装 torch）
 $env:PERTURBPILOT_SERVICE_TOKEN = '<随机串>'
 cd D:\internwork\科学发现智能体系统\services
 ..\.venv\Scripts\python -m ppsvc --seed 0
@@ -75,12 +75,14 @@ cd D:\internwork\科学发现智能体系统
 <任务包>/
   task.json        公开的任务卡片：task_id, title, synthetic, brief, action, readout.fields, objective{kind, field, direction, description}, budget{rounds, batch_size, allow_repeats}, data_cards
   candidates.csv   id + 公开属性列
-  data/            data_cards 里列出的公开数据文件
+  data/            data_cards 里列出的公开数据文件；role 为 candidate_features 的表是 id + 数值列，可以只覆盖部分候选
 
 <隐藏数据目录>/     服务启动时用 --hidden 指定
   scores.csv       id + 各读数字段
   hits.txt         命中名单，可选；运行时不读，事后评估用
 ```
+
+gp-ucb、coreset、top-uncertain 要任务包里有候选特征。特征表只覆盖部分候选时，没有特征的候选决策模块不推荐（它给的候选池里这些候选只有 id 和 measured），它们的读数照收但不进模型；它们仍是候选，agent 写理由就能选。每一步的简报里有一行“任务包的数据”，列出数据卡片。
 
 任务包里还有 `hidden/` 目录（早期布局）时，服务拒绝启动；隐藏数据目录在任务包里面时也拒绝。
 
@@ -90,6 +92,8 @@ PerturbTrace（ptbench）的任务可以转换过来（转换器用到 pyyaml，
 cd D:\internwork\科学发现智能体系统\services
 ..\.venv\Scripts\python -m ppsvc.import_ptbench <ptbench 任务目录> D:\internwork\pp-tasks\<名字> D:\internwork\pp-tasks-hidden\<名字>
 ```
+
+基因任务可以加 `--features <STRING Mashup 目录>`（目录里要有 `string_human_genes.txt` 和 `string_human_mashup_vectors_d800.txt`），转换器按 PerturbTrace 基线的做法把 800 维 Mashup 向量用种子 2022 的高斯矩阵投影到 64 维再逐行归一化，写成 `data/string_mashup64.csv` 和一张数据卡片；不在 STRING 里的基因不写特征（不用哈希之类的办法补），任务简报里写明覆盖了多少个。药物等非基因任务不加这个参数，就没有特征。
 
 转换只搬可以给 agent 看的字段；数据集来源、原始列名、命中名单都不进 `task.json`，读数表和命中名单写进第三个参数给的隐藏数据目录。任务包和隐藏数据目录都不要提交进仓库。
 

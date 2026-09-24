@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 
 from ppsvc.decision import DecisionService
-from ppsvc.import_ptbench import convert
+from ppsvc.import_ptbench import MASHUP_FILE, convert
+from ppsvc.neural import farthest_first
 from ppsvc.jsonhttp import HttpError, make_server
 from ppsvc.oracle import Oracle
 from ppsvc.task import Package, TaskError, write_json, write_synthetic_package
@@ -54,8 +55,8 @@ def small_package(root, *, objective, fields=("score",), allow_repeats=False, id
 
 def test_synthetic_package_is_deterministic_per_seed(tmp_path):
     a, b, c = (Package.load(write_synthetic_package(tmp_path / n, tmp_path / f"{n}-hidden", seed=s)) for n, s in (("a", 1), ("b", 1), ("c", 2)))
-    assert np.array_equal(a.features(), b.features())
-    assert not np.array_equal(a.features(), c.features())
+    assert np.array_equal(a.features().X, b.features().X)
+    assert not np.array_equal(a.features().X, c.features().X)
     assert (tmp_path / "a-hidden" / "scores.csv").read_text(encoding="utf-8") == (tmp_path / "b-hidden" / "scores.csv").read_text(encoding="utf-8")
     assert not (tmp_path / "a" / "hidden").exists()
 
@@ -260,7 +261,103 @@ def test_closed_loop_beats_random_on_average(tmp_path):
     assert np.mean(gains) > 0
 
 
+def partial_package(root, featured=("A", "B", "C", "D", "E", "F"), ids=tuple("ABCDEFGH")):
+    """一维特征，只覆盖一部分候选；读数 score = 特征值。"""
+    values = {c: float(i) for i, c in enumerate(ids)}
+    small_package(root, objective={"kind": "maximize", "field": "score"}, ids=ids, values=values)
+    (root / "data").mkdir()
+    (root / "data" / "emb.csv").write_text("id,f0\n" + "".join(f"{c},{values[c]}\n" for c in featured), encoding="utf-8")
+    card = json.loads((root / "task.json").read_text(encoding="utf-8"))
+    card["data_cards"] = [{"name": "emb", "modality": "embedding", "index": "candidate", "role": "candidate_features", "visibility": "public", "file": "data/emb.csv"}]
+    write_json(root / "task.json", card)
+    return root
+
+
+@pytest.mark.parametrize("method", ["gp-ucb", "coreset", "top-uncertain"])
+def test_candidates_without_features_are_never_recommended(tmp_path, method):
+    root = partial_package(tmp_path / "p")
+    feats = Package.load(root).features()
+    assert feats.rows.tolist() == [0, 1, 2, 3, 4, 5] and feats.X.shape == (6, 1)
+    d = DecisionService(method)
+    assert d.init({"package_dir": str(root)})["inputs_used"] == [{"role": "candidate_features", "modality": "embedding"}]
+    for r in range(1, 4):
+        p = d.propose({"round": r, "k": 8})
+        recs = [x["id"] for x in p["recommendations"]]
+        assert recs and not {"G", "H"} & set(recs)
+        pool = {x["id"]: x for x in p["pool"]}
+        assert set(pool["G"]) == {"id", "measured"} and "score" in pool["A"]
+        # 没有特征的候选测到了照样收下，只是不进模型
+        receipt = d.observe({"round": r, "observations": [{"id": recs[0], "readout": {"score": 1.0}}, {"id": "GH"[r % 2], "readout": {"score": 9.0}}]})
+        assert len(receipt["accepted"]) == 2
+    assert d.propose({"k": 8})["pool"][6]["measured"] is True
+
+
+def test_feature_tables_are_checked(tmp_path):
+    root = partial_package(tmp_path / "p")
+    (root / "data" / "emb.csv").write_text("id,f0\nA,1\nZZ,2\n", encoding="utf-8")
+    with pytest.raises(TaskError, match="not a candidate"):
+        Package.load(root).features()
+    (root / "data" / "emb.csv").write_text("id,f0\nA,1\nA,2\n", encoding="utf-8")
+    with pytest.raises(TaskError, match="two rows"):
+        Package.load(root).features()
+    (root / "data" / "emb.csv").write_text("id,f0\n", encoding="utf-8")
+    with pytest.raises(TaskError, match="no rows"):
+        Package.load(root).features()
+
+
+def test_farthest_first_orders_picks():
+    E = np.array([[0.0], [1.0], [2.0], [10.0], [11.0]])
+    out = farthest_first(E, np.array([0]), np.zeros(5, dtype=bool), 2)
+    order = [int(i) for i in np.argsort(-out["score"], kind="stable")]
+    assert order[:2] == [4, 2]  # 离 0 最远的 11，再是离 {0, 11} 最远的 2（距离 2）
+    assert out["distance"][4] == 11 and out["distance"][2] == 2
+    assert out["distance"][0] == 0 and out["distance"][1] == 1 and out["distance"][3] == 1
+    # 没有中心：先选离重心（4.8）最近的 2
+    out = farthest_first(E, np.array([], dtype=int), np.array([False, False, False, True, False]), 2)
+    assert [int(i) for i in np.argsort(-out["score"], kind="stable")[:2]] == [2, 4]
+
+
+@pytest.mark.parametrize("method", ["coreset", "top-uncertain"])
+def test_mlp_methods_are_deterministic_and_restorable(tmp_path, method):
+    _, pkg, d = make(tmp_path, method=method)
+    assert d.manifest({})["inputs"]["required"] == [{"role": "candidate_features", "modality": "embedding"}]
+    p0 = d.propose({"round": 1, "k": 6})
+    assert p0["method"] == method and p0["params"]["space"] == "raw_features"
+    assert len({x["id"] for x in p0["recommendations"]}) == 6
+    ids = [x["id"] for x in p0["recommendations"]]
+    d.observe({"round": 1, "observations": [{"id": c, "readout": {"phenotype_reduction": float(i)}} for i, c in enumerate(ids)]})
+    p1 = d.propose({"round": 2, "k": 6})
+    assert p1["params"]["space"] == "hidden_layer" and p1["params"]["n_train"] + p1["params"]["n_val"] == 6
+    assert not set(ids) & {x["id"] for x in p1["recommendations"]}
+    if method == "top-uncertain":
+        assert set(p1["recommendations"][0]) == {"id", "rank", "mu", "sigma", "score"}
+        sig = [x["sigma"] for x in p1["recommendations"]]
+        assert sig == sorted(sig, reverse=True) and sig[0] > 0
+    else:
+        assert set(p1["recommendations"][0]) == {"id", "rank", "distance", "score"}
+    # 同样的观测得到同样的推荐，快照恢复后也一样
+    d2 = DecisionService(method)
+    d2.init({"package_dir": str(pkg.root)})
+    d2.restore({"snapshot": d.snapshot({})})
+    assert d2.propose({"round": 2, "k": 6})["recommendations"] == p1["recommendations"]
+
+
+def test_coverage_refuses_nothing_and_feature_methods_need_features(tmp_path):
+    root = small_package(tmp_path / "p", objective={"kind": "maximize", "field": "score"})
+    for method in ("coreset", "top-uncertain"):
+        with pytest.raises(HttpError, match="candidate_features"):
+            DecisionService(method).init({"package_dir": str(root)})
+
+
 # ---- ptbench 转换 ----
+
+
+def fake_mashup(root, names, dim=801, seed=0):
+    root.mkdir()
+    (root / "string_human_genes.txt").write_text("".join(f"{n}\n" for n in names), encoding="utf-8")
+    vec = np.random.default_rng(seed).standard_normal((len(names), dim))
+    np.savetxt(root / "string_human_mashup_vectors_d800.txt", vec, delimiter="\t")
+    return root, vec
 
 
 def ptbench_task(root, readout, action_type="gene", operation="gene knockout", ids=("G1", "G2", "G3", "G4")):
@@ -315,6 +412,32 @@ def test_ptbench_directional_and_drug_tasks(tmp_path):
     info = convert(src, tmp_path / "drug", tmp_path / "drug-hidden")
     assert Package.load(tmp_path / "drug").card["action"]["type"] == "drug"
     assert any("数字编号" in n for n in info["notes"])
+
+
+def test_ptbench_features_cover_only_known_genes(tmp_path):
+    mashup, vec = fake_mashup(tmp_path / "mashup", ["X9", "G3", "G1"])
+    src = ptbench_task(tmp_path / "src", "normalized cytokine production")
+    info = convert(src, tmp_path / "pkg", tmp_path / "pkg-hidden", mashup)
+    assert info["n_featured"] == 2
+    pkg = Package.load(tmp_path / "pkg")
+    assert pkg.card["data_cards"] == [{"name": "string_mashup", "modality": "embedding", "index": "candidate",
+                                       "role": "candidate_features", "visibility": "public", "file": MASHUP_FILE}]
+    assert "覆盖 2/4 个候选" in pkg.card["brief"] and "其余 2 个不在 STRING 里" in pkg.card["brief"]
+    feats = pkg.features()
+    assert feats.rows.tolist() == [0, 2] and feats.X.shape == (2, 64)
+    assert np.allclose(np.linalg.norm(feats.X, axis=1), 1.0, atol=1e-5)
+    # 去掉第一列、种子 2022 的高斯投影、L2 归一化
+    proj = np.random.RandomState(2022).normal(0.0, 1.0 / 8.0, size=(800, 64))
+    want = vec[2, 1:] @ proj
+    assert np.allclose(feats.X[0], want / np.linalg.norm(want), atol=1e-5)
+    assert DecisionService("coreset").init({"package_dir": str(pkg.root)})["method"] == "coreset"
+
+    # 药物任务一个都覆盖不到：不写特征表
+    src = ptbench_task(tmp_path / "src2", "sensitivity z-score", action_type="drug", operation="small-molecule treatment", ids=("101", "102", "103", "104"))
+    info = convert(src, tmp_path / "drug", tmp_path / "drug-hidden", mashup)
+    assert info["n_featured"] == 0 and Package.load(tmp_path / "drug").card["data_cards"] == []
+    assert any("覆盖 0/4" in n and "没有写特征表" in n for n in info["notes"])
+    assert not (tmp_path / "drug" / "data").exists()
 
 
 # ---- HTTP ----
