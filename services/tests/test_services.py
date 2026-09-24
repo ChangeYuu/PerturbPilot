@@ -488,3 +488,73 @@ def test_token_required_when_configured(tmp_path):
         assert res["results"][0]["id"] == "G001"
     finally:
         server.shutdown()
+
+
+# ---- 多个任务包 ----
+
+
+def two_tasks(tmp_path):
+    tasks, hidden = tmp_path / "tasks", tmp_path / "hidden"
+    write_synthetic_package(tasks / "a", hidden / "a", seed=1, max_rounds=4, batch_size=3)
+    small_package(tasks / "b", objective={"kind": "hit_discovery", "field": "score", "direction": "high", "description": "高"})
+    (hidden / "b").mkdir(parents=True)
+    (hidden_of(tasks / "b") / "scores.csv").replace(hidden / "b" / "scores.csv")
+    (tasks / "broken").mkdir()
+    (tasks / "broken" / "task.json").write_text("{}", encoding="utf-8")
+    (tasks / "notes").mkdir()  # 没有 task.json 的子目录不算任务包
+    return tasks, hidden
+
+
+def test_hub_lists_tasks_and_runs_one_at_a_time(tmp_path):
+    from ppsvc.oracle import OracleHub
+
+    hub, skipped = OracleHub.from_dirs(*two_tasks(tmp_path))
+    assert [name for name, _ in skipped] == ["broken"]
+    listed = hub.tasks({})
+    assert listed["active"] is None
+    assert sorted(t["task_id"] for t in listed["tasks"]) == sorted(hub.oracles)
+    assert all("package_dir" in t and "n_candidates" in t for t in listed["tasks"])
+    a = next(t for t in listed["tasks"] if t["synthetic"])["task_id"]
+    with pytest.raises(HttpError) as e:
+        hub.run({"batch": ["G001"]})
+    assert e.value.status == 409
+    with pytest.raises(HttpError):
+        hub.reset({"task_id": "nope"})
+    with pytest.raises(HttpError):
+        hub.reset({"task_id": a, "batch_size": 0})
+    assert hub.reset({"task_id": a, "batch_size": 5}) == {"ok": True, "task_id": a, "batch_size": 5}
+    assert len(hub.run({"task_id": a, "batch": ["G001", "G002", "G003", "G004", "G005"]})["results"]) == 5
+    with pytest.raises(HttpError):
+        hub.run({"batch": [f"G{i:03d}" for i in range(6)]})  # 超过本次的批量上限
+    with pytest.raises(HttpError) as e:
+        hub.run({"task_id": "t-small", "batch": ["A"]})
+    assert e.value.status == 409
+    hub.reset({"task_id": "t-small"})
+    assert hub.oracles["t-small"].batch_size == 2  # 不给 batch_size 就用卡片的
+    assert hub.run({"task_id": "t-small", "batch": ["A"]})["results"][0]["readout"] == {"score": 0.0}
+    assert hub.routes()[("GET", "/task")]({})["task_id"] == "t-small"
+
+
+def test_single_task_hub_is_active_from_the_start(tmp_path):
+    from ppsvc.oracle import OracleHub
+
+    oracle, _, _ = make(tmp_path)
+    hub = OracleHub([oracle])
+    assert hub.active == oracle.card["task_id"]
+    assert hub.run({"batch": ["G001"]})["results"][0]["id"] == "G001"
+    assert hub.reset({})["task_id"] == hub.active
+
+
+def test_init_can_pick_the_method_and_manifest_lists_requirements(tmp_path):
+    root = write_synthetic_package(tmp_path / "syn", tmp_path / "syn-hidden", seed=0)
+    d = DecisionService()
+    m = d.manifest({})
+    assert m["requires"]["coverage"] == [] and m["requires"]["gp-ucb"] == [{"role": "candidate_features", "modality": "embedding"}]
+    assert set(m["requires"]) == set(m["methods"])
+    assert d.init({"package_dir": str(root), "method": "coverage"})["method"] == "coverage"
+    assert d.init({"package_dir": str(root)})["method"] == "gp-ucb"
+    with pytest.raises(HttpError):
+        d.init({"package_dir": str(root), "method": "bogus"})
+    no_feats = small_package(tmp_path / "small", objective={"kind": "hit_discovery", "field": "score", "direction": "high", "description": "高"})
+    with pytest.raises(HttpError, match="candidate_features/embedding"):
+        DecisionService("coverage").init({"package_dir": str(no_feats), "method": "gp-ucb"})

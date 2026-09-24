@@ -8,7 +8,8 @@ import { join } from 'node:path'
 
 /**
  * @param options.empty - 这些候选的读数为空（readout: null）
- * @param options.required - 决策模块声明的必需输入 [{role, modality}]
+ * @param options.required - 决策模块默认方法声明的必需输入 [{role, modality}]
+ * @param options.otherTask - 再列一个任务（同一个任务包，换了 task_id 和标题），用来测选任务
  */
 export function fakeServices({
   n = 20,
@@ -19,6 +20,7 @@ export function fakeServices({
   empty = [],
   direction = 'high',
   required = [],
+  otherTask = false,
 } = {}) {
   const ids = Array.from({ length: n }, (_, i) => `G${String(i).padStart(3, '0')}`)
   const truth = Object.fromEntries(ids.map((id, i) => [id, Math.sin(i)]))
@@ -45,6 +47,10 @@ export function fakeServices({
   mkdirSync(join(packageDir, 'data'))
   writeFileSync(join(packageDir, 'data', 'expr.csv'), `id,x\n${ids.map((id, i) => `${id},${i}`).join('\n')}\n`, 'utf8')
 
+  const preview = { ...card, package_dir: packageDir, n_candidates: ids.length }
+  const tasks = otherTask ? [preview, { ...preview, task_id: 'other-task', title: '另一个任务' }] : [preview]
+  let active = tasks.length === 1 ? card.task_id : null
+  let method = 'coverage'
   let replicates = {}
   let obs = []
   let version = 0
@@ -56,22 +62,35 @@ export function fakeServices({
     card,
     async task() {
       log('task')
-      return { ...card, package_dir: packageDir, n_candidates: ids.length }
+      return preview
+    },
+    async tasks() {
+      log('tasks')
+      return { tasks, active }
     },
     async manifest() {
       log('manifest')
-      return { name: 'fake', version: 'fake/0', method: 'coverage', methods: ['coverage'], inputs: { required, optional: [] } }
+      return {
+        name: 'fake',
+        version: 'fake/0',
+        method: 'coverage',
+        methods: { coverage: '按顺序覆盖', 'gp-ucb': '高斯过程' },
+        requires: { coverage: [], 'gp-ucb': [{ role: 'candidate_features', modality: 'embedding' }] },
+        inputs: { required, optional: [] },
+      }
     },
     async init(body) {
       log('init', body)
       obs = []
       version = 0
-      return { ok: true, decision_version: 'fake/0', method: 'coverage', inputs_used: [] }
+      method = body.method ?? 'coverage'
+      return { ok: true, decision_version: 'fake/0', method, inputs_used: [] }
     },
     async resetOracle(body) {
       log('resetOracle', body)
       replicates = {}
-      return { ok: true }
+      active = body.task_id ?? active
+      return { ok: true, task_id: active, batch_size: body.batch_size ?? batchSize }
     },
     async restore(body) {
       log('restore', body)
@@ -85,7 +104,7 @@ export function fakeServices({
       const recs = ids.filter((id) => !seen.has(id)).slice(0, body.k)
       return {
         decision_version: 'fake/0',
-        method: 'coverage',
+        method,
         state_version: version,
         inputs_used: [],
         n_observations: obs.length,

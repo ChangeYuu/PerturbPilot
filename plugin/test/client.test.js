@@ -55,6 +55,7 @@ let base
 let services
 let fresh // 面板上点"开始任务"后建的第二个任务，放在另一个目录，不进任务列表
 let freshDir
+let startedWith // 面板交给宿主的开始设置
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'pp-client-'))
   freshDir = mkdtempSync(join(tmpdir(), 'pp-client-fresh-'))
@@ -70,16 +71,21 @@ before(async () => {
   const handler = createPanelHandler({
     getRun: (id) => (id === 'sess-1' ? run : id === 'sess-2' ? fresh : undefined),
     control: (_id, action) => run.control(action, 'human'),
-    async start(id) {
+    async start(id, setup) {
       if (id !== 'sess-2') throw new PanelError(404, '找不到这个会话')
-      fresh = await Run.start({ dir: join(freshDir, 'sess-2'), runId: 'sess-2', services })
+      startedWith = setup
+      fresh = await Run.start({ dir: join(freshDir, 'sess-2'), runId: 'sess-2', services, setup })
     },
-    task: async () => taskPreview(await services.task()),
+    proposal: (id) => (id === 'sess-2' && !fresh ? { task_id: 'fake-task', rounds: 2, rationale: '先少跑两轮看看', at: 't1' } : null),
+    tasks: async () => {
+      const [{ tasks, active }, m] = await Promise.all([services.tasks(), services.manifest()])
+      return { tasks: tasks.map(taskPreview), active, decision: { name: m.name, default_method: m.method, methods: m.methods, requires: m.requires }, limits: { rounds: [1, 50], batch_size: [1, 'n_candidates'] } }
+    },
     listRuns: () => listRuns(dir),
     status: async () => ({
       config: { oracleUrl: 'http://127.0.0.1:8701', serviceTokenEnv: 'PERTURBPILOT_SERVICE_TOKEN', pythonTimeoutMs: 60000 },
       token_set: false,
-      services: { oracle: { ok: true, task_id: 'fake-task', synthetic: true }, decision: { ok: false, error: 'decision /manifest failed: unreachable' } },
+      services: { oracle: { ok: true, tasks: ['fake-task'], active: null }, decision: { ok: false, error: 'decision /manifest failed: unreachable' } },
     }),
   })
   server = createServer(handler)
@@ -124,7 +130,7 @@ test('bundle registers under the package name with a page tab type and a session
   const views = slots.slice(1, 1 + exports.TOOL_NAMES.length)
   assert.ok(views.every((s) => s.opts.name === 'tool.call.toolview' && s.component === exports.ToolCard))
   assert.deepEqual(views.map((s) => s.opts.key).sort(), [
-    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
+    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_list_tasks', 'pp_propose_task', 'pp_run_python', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
   ])
   // 主区的科学台账页、左侧栏入口（id 对上主区的 key）、设置页
   const [page, entry, settings, mark, name, hero] = slots.slice(1 + exports.TOOL_NAMES.length)
@@ -136,6 +142,9 @@ test('bundle registers under the package name with a page tab type and a session
   assert.deepEqual([mark, name, hero].map((s) => [s.opts.name, s.component]), [
     ['sidebar.brand.mark', exports.BrandMark], ['sidebar.brand.name', exports.BrandName], ['conversation.hero.brand.mark', exports.HeroBrand],
   ])
+  // 新会话中间有一段话，告诉用户可以用自然语言发起一个模糊的任务
+  assert.ok(text(exports.HeroBrand()).includes(exports.HERO_GUIDE))
+  assert.match(exports.HERO_GUIDE, /自然语言/)
 })
 
 // 按 DSH 工具块的形状包一次调用：start 只有参数，result 带 call 和 content（插件工具的输出是 JSON 文本）。
@@ -206,22 +215,58 @@ test('panel renders loading, empty, error and full states', () => {
   const render = (props) => exports.renderPanel({ busy: false, error: null, onControl: () => {}, ...props })
   assert.match(text(render({ view: undefined })), /加载中/)
   assert.match(text(render({ view: null })), /还没有开始任务/)
-  // 没开始任务：显示任务卡片和“开始任务”按钮；卡片还没读到或读不到时按钮不能点
-  const startButton = (props) => find(render({ view: null, ...props }), (n) => n.type === 'button')[0]
-  assert.match(text(render({ view: null, task: undefined })), /正在读取任务/)
-  assert.ok(startButton({ task: undefined }).props.disabled)
-  assert.match(text(render({ view: null, task: null })), /读不到任务卡片/)
-  assert.ok(startButton({ task: null }).props.disabled)
-  const preview = { title: '测试任务', synthetic: true, action: { type: 'knockout', description: 'CRISPR 敲除' }, objective_text: '找效应最强的基因', budget: { rounds: 3, batch_size: 3, allow_repeats: true }, n_candidates: 20 }
-  const card = text(render({ view: null, task: preview }))
-  for (const s of ['测试任务', '合成数据', '扰动：knockout，CRISPR 敲除', '目标：找效应最强的基因', '共 3 轮，每轮 3 个；候选 20 个，可以重复测']) assert.ok(card.includes(s), s)
-  let clicked = 0
-  const button = startButton({ task: preview, onStart: () => clicked++ })
+  // 没开始任务：选任务、方法和预算的表单和“开始任务”按钮；任务列表还没读到或读不到时没有按钮
+  const startButtons = (props) => find(render({ view: null, ...props }), (n) => n.type === 'button')
+  assert.match(text(render({ view: null, catalog: undefined })), /正在读取任务列表/)
+  assert.equal(startButtons({ catalog: undefined }).length, 0)
+  assert.match(text(render({ view: null, catalog: null })), /读不到任务列表/)
+  assert.equal(startButtons({ catalog: null }).length, 0)
+  const preview = (id, title, extra = {}) => ({
+    task_id: id, title, synthetic: true, action: { type: 'knockout', description: 'CRISPR 敲除' }, objective_text: '找效应最强的基因',
+    budget: { rounds: 3, batch_size: 3, allow_repeats: true }, n_candidates: 20,
+    data_cards: [{ role: 'candidate_features', modality: 'expression' }], ...extra,
+  })
+  const catalog = {
+    tasks: [preview('t1', '测试任务'), preview('t2', '有嵌入的任务', { budget: { rounds: 8, batch_size: 5 }, n_candidates: 40, synthetic: false, data_cards: [{ role: 'candidate_features', modality: 'embedding' }] })],
+    active: null,
+    decision: { name: 'fake', default_method: 'coverage', methods: { coverage: '按顺序覆盖', 'gp-ucb': '高斯过程' }, requires: { coverage: [], 'gp-ucb': [{ role: 'candidate_features', modality: 'embedding' }] } },
+    limits: { rounds: [1, 50], batch_size: [1, 'n_candidates'] },
+  }
+  assert.match(text(render({ view: null, catalog: { ...catalog, tasks: [] } })), /服务里没有任务包/)
+  const forms = []
+  const starts = []
+  const form = { task_id: 't1', method: '', rounds: '3', batch_size: '3' }
+  const picker = (props) => render({ view: null, catalog, form, onForm: (f) => forms.push(f), onStart: (s) => starts.push(s), ...props })
+  const tree0 = picker()
+  const card = text(tree0)
+  for (const s of ['测试任务（t1）', '有嵌入的任务（t2）', '合成数据', '扰动：knockout，CRISPR 敲除', '目标：找效应最强的基因', '任务包原定 3 轮，每轮 3 个；候选 20 个，可以重复测', '默认（coverage）', '轮数（1–50）', '每轮个数（1–20）']) assert.ok(card.includes(s), s)
+  // 方法按任务包有没有它要的特征决定能不能选
+  const options = (t) => find(t, (n) => n.type === 'option' && ['coverage', 'gp-ucb'].includes(n.props.value))
+  assert.deepEqual(options(tree0).map((o) => [o.props.value, !!o.props.disabled]), [['coverage', false], ['gp-ucb', true]])
+  assert.match(text(options(tree0)[1]), /任务包缺它要的特征/)
+  const t2 = picker({ form: { ...form, task_id: 't2' } })
+  assert.deepEqual(options(t2).map((o) => !!o.props.disabled), [false, false])
+  // 换任务：表单按新任务包的预算重填；改轮数只改那一项
+  const [taskSelect, methodSelect] = find(tree0, (n) => n.type === 'select')
+  taskSelect.props.onChange({ target: { value: 't2' } })
+  assert.deepEqual(forms.at(-1), { task_id: 't2', method: '', rounds: '8', batch_size: '5' })
+  methodSelect.props.onChange({ target: { value: 'coverage' } })
+  assert.deepEqual(forms.at(-1), { ...form, method: 'coverage' })
+  find(tree0, (n) => n.type === 'input')[0].props.onChange({ target: { value: '12' } })
+  assert.deepEqual(forms.at(-1), { ...form, rounds: '12' })
+  // 开始：数字交数字，方法留空就不交；格式不对的原样交给宿主去报错
+  const [button] = find(tree0, (n) => n.type === 'button')
   assert.equal(text(button), '开始任务')
-  assert.ok(!button.props.disabled)
   button.props.onClick()
-  assert.equal(clicked, 1)
-  assert.ok(startButton({ task: preview, busy: true }).props.disabled)
+  assert.deepEqual(starts.at(-1), { task_id: 't1', rounds: 3, batch_size: 3 })
+  find(picker({ form: { task_id: 't2', method: 'gp-ucb', rounds: '2.5', batch_size: '4' } }), (n) => n.type === 'button')[0].props.onClick()
+  assert.deepEqual(starts.at(-1), { task_id: 't2', method: 'gp-ucb', rounds: '2.5', batch_size: 4 })
+  assert.ok(find(picker({ busy: true }), (n) => n.type === 'button')[0].props.disabled)
+  // agent 提议过：显示理由，按钮变成“确认开始”
+  const proposed = picker({ proposal: { task_id: 't1', rounds: 2, rationale: '用户想先少跑几轮' } })
+  assert.match(text(proposed), /确认开始任务/)
+  assert.match(text(proposed), /agent 的提议.*用户想先少跑几轮/)
+  assert.equal(text(find(proposed, (n) => n.type === 'button')[0]), '确认开始')
   assert.match(text(render({ view: null, error: 'HTTP 500' })), /出错了：HTTP 500/)
 
   const view = panelView(run)
@@ -273,12 +318,17 @@ test('panel body talks to the real host route: poll, then pause', async () => {
     await assert.rejects(missing.control('pause'), /还没有开始任务/)
     await assert.rejects(missing.start(), /找不到这个会话/)
 
-    // 开始任务：先读任务卡片预览（组件里的读法见下面），再点开始，拿回新任务的视图
+    // 开始任务：会话里带着 agent 的提议，按表单交设置，拿回新任务的视图
     const second = slots[0].inject('sess-2').api
-    assert.equal((await second.get()).run, null)
-    const started = await second.start()
+    const pending = await second.get()
+    assert.equal(pending.run, null)
+    assert.equal(pending.proposal.rationale, '先少跑两轮看看')
+    const started = await second.start({ task_id: 'fake-task', rounds: 2, batch_size: 3 })
+    assert.deepEqual(startedWith, { task_id: 'fake-task', method: undefined, rounds: 2, batch_size: 3 })
     assert.equal(started.run.run_id, 'sess-2')
     assert.equal(started.run.round, 1)
+    assert.equal(fresh.state.task.budget.rounds, 2)
+    assert.equal((await second.get()).proposal, null)
     await assert.rejects(second.start(), /已经开始过/)
 
     // 组件本身：一次渲染 + 执行它登记的轮询 effect，拿到的数据经 setState 送出
@@ -287,13 +337,13 @@ test('panel body talks to the real host route: poll, then pause', async () => {
     react.effects.length = 0
     const tree = exports.PanelBody({ useTabInfo: () => ({ tab: { visible: true } }), api })
     assert.match(text(tree), /加载中/)
-    assert.equal(react.effects.length, 2) // 轮询；还没开始任务时读任务卡片（view 初始是 undefined，这个 effect 什么也不做）
+    assert.equal(react.effects.length, 3) // 轮询；还没开始任务时读任务列表；按列表和提议填表（view 初始是 undefined，后两个 effect 什么也不做）
     const cleanup = react.effects[0]()
     await new Promise((r) => setTimeout(r, 100))
     cleanup()
     assert.ok(updates.some((v) => v && v.run_id === 'sess-1' && v.status === 'stopped'))
 
-    // 还没开始任务的会话：组件读一次任务卡片给预览（第一个 state 是视图，这里给 null）
+    // 还没开始任务的会话：组件读一次任务列表给表单（第一个 state 是视图，这里给 null）
     updates.length = 0
     let calls = 0
     react.useState = (initial) => [calls++ === 0 ? null : initial, (v) => updates.push(v)]
@@ -302,7 +352,10 @@ test('panel body talks to the real host route: poll, then pause', async () => {
     assert.match(text(waiting), /还没有开始任务/)
     react.effects[1]()
     await new Promise((r) => setTimeout(r, 100))
-    assert.ok(updates.some((v) => v?.title === '测试任务' && v.package_dir === undefined))
+    const listed = updates.find((v) => v?.tasks)
+    assert.equal(listed.tasks[0].title, '测试任务')
+    assert.equal(listed.tasks[0].package_dir, undefined)
+    assert.deepEqual(Object.keys(listed.decision.methods), ['coverage', 'gp-ucb'])
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -425,12 +478,12 @@ test('settings page shows service reachability, the token and the config', () =>
   const status = {
     config: { oracleUrl: 'http://127.0.0.1:8701', serviceTokenEnv: 'PERTURBPILOT_SERVICE_TOKEN', pythonTimeoutMs: 60000 },
     token_set: false,
-    services: { oracle: { ok: true, task_id: 'fake-task', synthetic: true }, decision: { ok: false, error: 'unreachable' } },
+    services: { oracle: { ok: true, tasks: ['fake-task', 'il2'], active: 'il2' }, decision: { ok: false, error: 'unreachable' } },
   }
   const refreshed = []
   const tree = exports.renderSettings({ status, error: null, onRefresh: () => refreshed.push(1) })
   const all = text(tree)
-  assert.match(all, /oracle：连得上 fake-task（合成数据）/)
+  assert.match(all, /oracle：连得上 2 个任务包（fake-task, il2），当前 il2/)
   assert.match(all, /决策模块：连不上：unreachable/)
   assert.match(all, /没设.*PERTURBPILOT_SERVICE_TOKEN/)
   assert.match(all, /oracle 服务地址oracleUrlhttp:\/\/127\.0\.0\.1:8701/)
@@ -466,7 +519,7 @@ test('ledger page and settings section talk to the real host routes', async () =
     react.effects[0]()
     await new Promise((r) => setTimeout(r, 100))
     const status = updates.find((v) => v && v.services)
-    assert.equal(status.services.oracle.task_id, 'fake-task')
+    assert.deepEqual(status.services.oracle.tasks, ['fake-task'])
     assert.equal(status.token_set, false)
   } finally {
     globalThis.fetch = originalFetch
@@ -490,8 +543,8 @@ test('brand pieces crop the mark and the name out of the one logo image', () => 
   assert.equal(name.height, '15px')
   const n = 15 / 182
   assert.equal(name.backgroundPosition, `${-267 * n}px ${-70 * n}px`)
-  // 新会话中间：螺旋加两行字
+  // 新会话中间：螺旋、名字、一句口号和怎么开始的指引
   const hero = exports.HeroBrand()
   assert.equal(hero.children[0].props.style.height, '56px')
-  assert.deepEqual(find(hero, (n) => n.props.className?.startsWith?.('pp-hero-')).slice(1).map(text), ['PerturbPilot', '提出假设 · 挑选实验 · 从每一轮读数里学习'])
+  assert.deepEqual(find(hero, (n) => n.props.className?.startsWith?.('pp-hero-')).slice(1).map(text), ['PerturbPilot', '提出假设 · 挑选实验 · 从每一轮读数里学习', exports.HERO_GUIDE])
 })

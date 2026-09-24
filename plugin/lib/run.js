@@ -6,6 +6,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { auditRun, checkReceipt } from './audit.js'
 import { RunRecorder, roundFile } from './records.js'
+import { checkSetup } from './setup.js'
 import { lowerIsBetter, objectiveText, objectiveValue, readCandidateIds } from './task.js'
 
 /** 一组候选被选进来的依据。decision = 照决策模块的推荐。 */
@@ -39,17 +40,17 @@ export class Run {
     return new Run(recorder, state)
   }
 
-  static async start({ dir, runId, services, signal }) {
-    const card = await services.task(signal)
+  /**
+   * 开始一次任务。setup = { task_id, method, rounds, batch_size }（都可以省略，见 setup.js），
+   * proposal 是 agent 用 pp_propose_task 提的、用户确认前还在等的那份提议（没有就省略），原样记进 state.setup。
+   */
+  static async start({ dir, runId, services, setup = {}, proposal = null, signal }) {
+    const { tasks } = await services.tasks(signal)
     const manifest = await services.manifest(signal)
-    const cards = card.data_cards ?? []
-    const missing = (manifest.inputs?.required ?? []).filter((need) => !cards.some((dc) => dc.role === need.role && dc.modality === need.modality))
-    if (missing.length) {
-      throw new RunError(`决策模块 ${manifest.name} 需要的输入任务包里没有：${missing.map((x) => `${x.role}/${x.modality}`).join(', ')}`)
-    }
-    // /init 把任务包交给决策模块并清空它的观测；oracle 清空重复测量计数。
-    const init = await services.init({ task: card, package_dir: card.package_dir }, signal)
-    await services.resetOracle({}, signal)
+    const { card, method, budget } = checkSetup(tasks, manifest, setup)
+    // /init 把任务包交给决策模块并清空它的观测；oracle 切到这个任务、定本次的批量，清空重复测量计数。
+    const init = await services.init({ task: card, package_dir: card.package_dir, ...(method ? { method } : {}) }, signal)
+    await services.resetOracle({ task_id: card.task_id, batch_size: budget.batch_size }, signal)
     const candidateIds = readCandidateIds(card.package_dir)
     if (candidateIds.length !== card.n_candidates) throw new RunError('任务包的 candidates.csv 和 oracle 报的候选数对不上')
 
@@ -58,7 +59,8 @@ export class Run {
     const state = {
       format: STATE_FORMAT,
       runId,
-      task: card,
+      task: { ...card, budget },
+      setup: { method, package_budget: card.budget, proposal },
       candidateIds,
       decision: { name: manifest.name, version: init.decision_version, method: init.method, inputs_used: init.inputs_used },
       status: 'active',
@@ -77,11 +79,14 @@ export class Run {
       synthetic: card.synthetic,
       action: card.action.type,
       objective: card.objective,
-      budget: card.budget,
+      budget,
+      package_budget: card.budget,
       n_candidates: card.n_candidates,
       decision_version: init.decision_version,
       method: init.method,
       inputs_used: init.inputs_used,
+      requested_method: method,
+      proposed: proposal !== null,
     })
     run.save()
     return run
@@ -254,7 +259,7 @@ export class Run {
       forced: rec.steers > 0,
     })
 
-    const run = await services.run({ round: r, batch: selection.batch }, signal)
+    const run = await services.run({ task_id: this.state.task.task_id, round: r, batch: selection.batch }, signal)
     this.recorder.writeJson(join('oracle', roundFile('run', r)), run)
     rec.results = run.results
     for (const x of run.results) this.state.observations.push({ id: x.id, round: r, replicate: x.replicate, readout: x.readout })
@@ -512,6 +517,8 @@ export class Run {
     lines.push(`目标：${objectiveText(objective)}`)
     lines.push(`读数字段：${t.readout.fields.map((f) => `${f.name}（${f.description ?? ''}）`).join('；')}`)
     lines.push(`预算：共 ${b.rounds} 轮，每轮正好 ${b.batch_size} 个；候选 ${t.n_candidates} 个，${b.allow_repeats ? '可以重复测' : '不能重复测'}`)
+    const pb = s.setup?.package_budget
+    if (pb && (pb.rounds !== b.rounds || pb.batch_size !== b.batch_size)) lines.push(`（任务包原定 ${pb.rounds} 轮、每轮 ${pb.batch_size} 个，开始时改成了上面的预算）`)
     const used = s.decision.inputs_used ?? []
     lines.push(`决策模块：${s.decision.name}，方法 ${s.decision.method}，${used.length ? `用到 ${used.map((x) => `${x.role}/${x.modality}`).join(', ')}` : '没用任何候选特征'}`)
     const cards = t.data_cards ?? []

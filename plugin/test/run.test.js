@@ -38,8 +38,10 @@ async function playRound(run, services, { extra = [] } = {}) {
 test('start hands the task package to the decision module, resets the oracle and writes the card', async () => {
   const services = fakeServices()
   const run = await Run.start({ dir, runId: 's1', services })
-  assert.deepEqual(services.calls.map((c) => c.name), ['task', 'manifest', 'init', 'resetOracle'])
+  assert.deepEqual(services.calls.map((c) => c.name), ['tasks', 'manifest', 'init', 'resetOracle'])
   assert.equal(services.calls[2].body.package_dir, services.packageDir)
+  assert.equal(services.calls[2].body.method, undefined) // 没指定方法就用决策模块的默认
+  assert.deepEqual(services.calls[3].body, { task_id: 'fake-task', batch_size: 3 })
   assert.equal(readJson(join(dir, 'task.json')).n_candidates, 20)
   assert.equal(run.state.format, 2)
   assert.equal(run.state.candidateIds.length, 20)
@@ -50,6 +52,41 @@ test('start hands the task package to the decision module, resets the oracle and
   assert.equal(started.type, 'run/started')
   assert.equal(started.data.method, 'coverage')
   assert.deepEqual(started.data.budget, { rounds: 3, batch_size: 3, allow_repeats: true })
+  assert.deepEqual(run.state.setup, { method: null, package_budget: { rounds: 3, batch_size: 3, allow_repeats: true }, proposal: null })
+})
+
+test('start takes the chosen task, method and budget, and the oracle gets the task id each round', async () => {
+  const services = fakeServices({ otherTask: true })
+  const proposal = { task_id: 'other-task', method: 'coverage', rounds: 2, batch_size: 4, rationale: '用户要少跑几轮' }
+  const run = await Run.start({ dir, runId: 's1', services, setup: { task_id: 'other-task', method: 'coverage', rounds: 2, batch_size: 4 }, proposal })
+  assert.equal(services.calls[2].body.method, 'coverage')
+  assert.deepEqual(services.calls[3].body, { task_id: 'other-task', batch_size: 4 })
+  assert.equal(run.state.task.task_id, 'other-task')
+  assert.deepEqual(run.state.task.budget, { rounds: 2, batch_size: 4, allow_repeats: true })
+  assert.deepEqual(run.state.setup.package_budget, { rounds: 3, batch_size: 3, allow_repeats: true })
+  assert.equal(run.state.setup.proposal, proposal)
+  assert.equal(readJson(join(dir, 'task.json')).budget.rounds, 3) // task.json 是任务包的原卡片
+  const started = readJsonl(join(dir, 'events.jsonl'))[0].data
+  assert.deepEqual([started.budget.rounds, started.package_budget.rounds, started.requested_method, started.proposed], [2, 3, 'coverage', true])
+  assert.match(run.brief(), /共 2 轮，每轮正好 4 个/)
+  assert.match(run.brief(), /任务包原定 3 轮、每轮 3 个/)
+  const res = await playRound(run, services)
+  assert.equal(res.results.length, 4)
+  assert.equal(services.calls.find((c) => c.name === 'run').body.task_id, 'other-task')
+})
+
+test('start checks the setup and lists every problem at once', async () => {
+  const services = fakeServices({ otherTask: true })
+  const start = (setup) => Run.start({ dir, runId: 's1', services, setup })
+  await assert.rejects(start({}), /有 2 个任务包，要指定 task_id/)
+  await assert.rejects(start({ task_id: 'nope' }), /没有 task_id 为 nope 的任务包；可选：fake-task, other-task/)
+  await assert.rejects(
+    start({ task_id: 'fake-task', method: 'bogus', rounds: 51, batch_size: 21 }),
+    (e) => /没有方法 bogus/.test(e.message) && /rounds 要是 1–50/.test(e.message) && /batch_size 要是 1–20/.test(e.message),
+  )
+  await assert.rejects(start({ task_id: 'fake-task', rounds: 1.5 }), /rounds 要是 1–50 的整数/)
+  await assert.rejects(start({ task_id: 'fake-task', method: 'gp-ucb' }), /方法 gp-ucb 需要的输入任务包里没有：candidate_features\/embedding/)
+  assert.equal(services.calls.filter((c) => c.name === 'init').length, 0)
 })
 
 test('start refuses a decision module whose required inputs the task package lacks', async () => {

@@ -44,6 +44,7 @@ export function createServices({ oracleUrl, decisionUrl, fetch = globalThis.fetc
   const decision = (method, path, body, signal) => call('decision', decisionUrl, method, path, body, signal)
   return {
     task: (signal) => oracle('GET', '/task', undefined, signal),
+    tasks: (signal) => oracle('GET', '/tasks', undefined, signal),
     run: (body, signal) => oracle('POST', '/run', body, signal),
     resetOracle: (body, signal) => oracle('POST', '/reset', body, signal),
     manifest: (signal) => decision('GET', '/manifest', undefined, signal),

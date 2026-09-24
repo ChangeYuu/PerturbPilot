@@ -2,7 +2,7 @@
 # 配置项见 index.js 里的 Config；要改服务地址或运行目录，在 profile 自己的 cordis.patch.yml 里按 id 覆盖这一行。
 #
 # 同时把 web 端改成 PerturbPilot 专用：
-# - 只留一个"科学发现"模式（智能体预设）。它不带 shell、文件读写、子 agent、计划模式、技能，
+# - 只留一个"科学发现"模式（智能体预设）。它带查文献和向用户提问（ask_user_question），不带 shell、文件读写、子 agent、计划模式、技能，
 #   也不读工作区里的 AGENTS.md / CLAUDE.md，所以工作区里的开发文件不会进科学 agent 的上下文。
 #   pp_* 工具和角色提示由 perturbpilot 这一行在宿主层注册，所有会话都看得到。
 # - 关掉 web 端自带的 4 个模式和模式选择器，关掉计划模式开关、预设设置页和插件设置页。
@@ -25,6 +25,9 @@
             config:
               prefix: 你是 PerturbPilot 的科学发现 agent，由 {{model}} 模型驱动。
               suffix: ''
+          # 开任务前的指引问答：agent 用 ask_user_question 问用户、给推荐选项（DSH web 端自带问答卡片）。
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
           # 查文献用的 web_search / web_fetch：宿主层的 tool-web 被 web 端关掉了，这里按 web 端预设的写法在预设里挂一份。
           # 调用只记录（runs/<id>/retrieval/），不拦截。
           - id: tool-web

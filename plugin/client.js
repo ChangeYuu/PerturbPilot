@@ -1,5 +1,6 @@
 // PerturbPilot 的浏览器端：
-// - DSH web 端右侧栏的一个页面型 tab，显示当前会话里这次任务的状态，并提供暂停 / 继续 / 结束。
+// - DSH web 端右侧栏的一个页面型 tab：还没开始任务时选任务包、决策方法和预算（或确认 agent 的提议）后开始；
+//   开始后显示这次任务的状态，并提供暂停 / 继续 / 结束。
 // - 主区的"科学台账"页（左侧栏有入口）：列出所有任务，选一个看全部轮次、读数、假设历史、笔记、分析和审计。
 // - 设置里的 PerturbPilot 一页：只读显示插件配置、服务连不连得上、服务令牌设没设。
 //   数据都来自宿主侧挂在同源 web 服务上的 /perturbpilot/api（见 lib/panel.js）。
@@ -68,7 +69,7 @@ window.__ModuleLoader__.load({
 			const base = `${API}/sessions/${encodeURIComponent(sessionId)}`;
 			return {
 				get: (signal) => fetch(base, { signal, cache: "no-store" }).then(parse),
-				start: () => post(`${base}/start`, {}),
+				start: (setup) => post(`${base}/start`, setup ?? {}),
 				control: (action) => post(`${base}/control`, { action }),
 			};
 		}
@@ -84,7 +85,7 @@ window.__ModuleLoader__.load({
 		const globalApi = {
 			list: (signal) => fetch(`${API}/sessions`, { signal, cache: "no-store" }).then(parse),
 			status: (signal) => fetch(`${API}/status`, { signal, cache: "no-store" }).then(parse),
-			task: (signal) => fetch(`${API}/task`, { signal, cache: "no-store" }).then(parse),
+			tasks: (signal) => fetch(`${API}/tasks`, { signal, cache: "no-store" }).then(parse),
 			run: apiFor,
 		};
 
@@ -196,30 +197,86 @@ window.__ModuleLoader__.load({
 					`第 ${e.round} 轮 ${e.type}`))));
 		}
 
-		/** 还没开始任务时：服务当前载入的任务卡片和“开始任务”按钮。task 为 undefined 表示还在读，null 表示读不到。 */
-		function startCard(task, busy, onStart) {
-			const card = task === undefined ? h("p", { className: "pp-empty" }, "正在读取任务…")
-				: task === null ? h("p", { className: "pp-empty" }, "读不到任务卡片，先确认服务在运行（设置页可以检查）")
-					: h("div", null,
-						h("div", { className: "pp-title" }, task.title, task.synthetic ? h("span", { className: "pp-tag" }, "合成数据") : null),
+		/** 任务包里有没有方法要的全部输入（requires 是 [{role, modality}]）。 */
+		function methodFits(task, needs) {
+			const cards = task?.data_cards ?? [];
+			return (needs ?? []).every((n) => cards.some((dc) => dc.role === n.role && dc.modality === n.modality));
+		}
+
+		/** 按任务包的预算（或 agent 的提议）填好的表单：字段都是字符串，method 为空表示用决策模块的默认方法。 */
+		function initialForm(catalog, proposal) {
+			const tasks = catalog?.tasks ?? [];
+			const task = tasks.find((t) => t.task_id === proposal?.task_id) ?? tasks[0];
+			if (!task) return null;
+			const fromProposal = proposal?.task_id === task.task_id;
+			return {
+				task_id: task.task_id,
+				method: (fromProposal && proposal.method) || "",
+				rounds: String((fromProposal && proposal.rounds) || task.budget.rounds),
+				batch_size: String((fromProposal && proposal.batch_size) || task.budget.batch_size),
+			};
+		}
+
+		/** 表单 → POST /start 的请求体；数字格式不对的原样交给宿主去检查和报错。 */
+		function setupFromForm(form) {
+			const n = (x) => (/^\d+$/.test(x.trim()) ? Number(x) : x);
+			const setup = { task_id: form.task_id, rounds: n(form.rounds), batch_size: n(form.batch_size) };
+			if (form.method) setup.method = form.method;
+			return setup;
+		}
+
+		function field(label, control) {
+			return h("label", { className: "pp-field" }, h("span", { className: "pp-field-label" }, label), control);
+		}
+
+		/**
+		 * 还没开始任务时：选任务包、决策方法和预算，然后开始。
+		 * catalog 是宿主 /tasks 的结果，undefined 表示还在读，null 表示读不到；
+		 * proposal 是 agent 用 pp_propose_task 提的设置（没有为 null）；form 来自 initialForm，改动经 onForm 交回。
+		 */
+		function startCard({ catalog, proposal, form, onForm, busy, onStart }) {
+			if (catalog === undefined) return section("开始任务", h("p", { className: "pp-empty" }, "正在读取任务列表…"));
+			if (catalog === null) return section("开始任务", h("p", { className: "pp-empty" }, "读不到任务列表，先确认服务在运行（设置页可以检查）"));
+			if (!catalog.tasks.length || !form) return section("开始任务", h("p", { className: "pp-empty" }, "服务里没有任务包"));
+			const task = catalog.tasks.find((t) => t.task_id === form.task_id) ?? catalog.tasks[0];
+			const { decision, limits } = catalog;
+			const set = (key) => (e) => onForm({ ...form, [key]: e.target.value });
+			const pickTask = (e) => onForm(initialForm(catalog, { task_id: e.target.value }));
+			const proposed = proposal ? h("div", { className: "pp-proposal" },
+				h("div", { className: "pp-sub" }, "agent 的提议（已填进下面，可以改）"),
+				h("p", null, proposal.rationale)) : null;
+			return section(proposal ? "确认开始任务" : "开始任务",
+				proposed,
+				h("div", { className: "pp-form" },
+					field("任务", h("select", { className: "pp-input", value: task.task_id, onChange: pickTask, disabled: busy },
+						...catalog.tasks.map((t) => h("option", { key: t.task_id, value: t.task_id }, `${t.title}（${t.task_id}）`)))),
+					h("div", { className: "pp-task" },
+						task.synthetic ? h("span", { className: "pp-tag" }, "合成数据") : null,
 						h("ul", { className: "pp-list" },
 							h("li", null, `扰动：${task.action?.type ?? "—"}${task.action?.description ? `，${task.action.description}` : ""}`),
 							h("li", null, `目标：${task.objective_text}`),
-							h("li", null, `共 ${task.budget.rounds} 轮，每轮 ${task.budget.batch_size} 个；候选 ${task.n_candidates} 个${task.budget.allow_repeats ? "，可以重复测" : ""}`)));
-			return section("开始任务",
-				card,
-				h("button", { className: "pp-button pp-start", disabled: busy || !task, onClick: onStart }, busy ? "正在开始…" : "开始任务"),
-				h("p", { className: "pp-legend" }, "开始后第 1 轮自动进行；随时可以在对话里插话，或在这里暂停、结束。"));
+							h("li", null, `任务包原定 ${task.budget.rounds} 轮，每轮 ${task.budget.batch_size} 个；候选 ${task.n_candidates} 个${task.budget.allow_repeats ? "，可以重复测" : ""}`))),
+					field("决策方法", h("select", { className: "pp-input", value: form.method, onChange: set("method"), disabled: busy },
+						h("option", { value: "" }, `默认（${decision.default_method}）`),
+						...Object.entries(decision.methods ?? {}).map(([m, text]) => {
+							const fits = methodFits(task, decision.requires?.[m]);
+							return h("option", { key: m, value: m, disabled: !fits }, `${m}${text ? ` · ${text}` : ""}${fits ? "" : "（任务包缺它要的特征）"}`);
+						}))),
+					h("div", { className: "pp-form-row" },
+						field(`轮数（${limits.rounds[0]}–${limits.rounds[1]}）`, h("input", { className: "pp-input", type: "number", min: limits.rounds[0], max: limits.rounds[1], value: form.rounds, onChange: set("rounds"), disabled: busy })),
+						field(`每轮个数（1–${task.n_candidates}）`, h("input", { className: "pp-input", type: "number", min: 1, max: task.n_candidates, value: form.batch_size, onChange: set("batch_size"), disabled: busy })))),
+				h("button", { className: "pp-button pp-start", disabled: busy, onClick: () => onStart(setupFromForm(form)) }, busy ? "正在开始…" : proposal ? "确认开始" : "开始任务"),
+				h("p", { className: "pp-legend" }, "也可以直接在对话里说想发现什么，agent 会问清楚后提议一个任务。开始后第 1 轮自动进行；随时可以插话，或在这里暂停、结束。"));
 		}
 
-		/** 面板的全部内容。view 为 undefined 表示加载中，null 表示这个会话还没开始任务（这时 task 是任务卡片预览）。 */
-		function renderPanel({ view, task, error, busy, onControl, onStart }) {
+		/** 面板的全部内容。view 为 undefined 表示加载中，null 表示这个会话还没开始任务（这时显示 startCard，参数见那里）。 */
+		function renderPanel({ view, catalog, proposal = null, form = null, onForm = () => {}, error, busy, onControl, onStart }) {
 			const banner = error ? h("div", { className: "pp-error" }, `出错了：${error}`) : null;
 			if (view === undefined) return h("div", { className: "pp-panel" }, banner, h("p", { className: "pp-empty" }, "加载中…"));
 			if (view === null) {
 				return h("div", { className: "pp-panel" }, banner,
 					h("p", { className: "pp-empty" }, "这个会话还没有开始任务。"),
-					startCard(task, busy, onStart));
+					startCard({ catalog, proposal, form, onForm, busy, onStart }));
 			}
 			return h("div", { className: "pp-panel" }, banner,
 				header(view, busy, onControl),
@@ -526,7 +583,7 @@ window.__ModuleLoader__.load({
 		function serviceLine(label, s) {
 			if (!s) return h("li", null, `${label}：—`);
 			return h("li", null, `${label}：`, s.ok
-				? h("span", { className: "pp-pass" }, `连得上 ${s.task_id ?? ""}${s.name ? `${s.name} ${s.version}${s.method ? ` · ${s.method}` : ""}` : ""}${s.synthetic ? "（合成数据）" : ""}`)
+				? h("span", { className: "pp-pass" }, `连得上 ${s.tasks ? `${s.tasks.length} 个任务包（${s.tasks.join(", ")}）${s.active ? `，当前 ${s.active}` : ""}` : ""}${s.name ? `${s.name} ${s.version}${s.method ? ` · ${s.method}` : ""}` : ""}${s.synthetic ? "（合成数据）" : ""}`)
 				: h("span", { className: "pp-fail" }, `连不上：${s.error}`));
 		}
 
@@ -552,6 +609,8 @@ window.__ModuleLoader__.load({
 		// ---- 对话区里 pp_* 工具调用的卡片（只看这次调用自己的参数和结果，回放时也一样） ----
 
 		const TOOL_TITLE = {
+			pp_list_tasks: "查看任务列表",
+			pp_propose_task: "提议任务",
 			pp_get_decision: "决策模块推荐",
 			pp_submit_selection: "提交本轮选择",
 			pp_update_hypothesis: "更新假设",
@@ -594,6 +653,16 @@ window.__ModuleLoader__.load({
 		}
 
 		const TOOL_BODY = {
+			pp_list_tasks: (args, r) => r && h("div", null,
+				h("p", { className: "pp-sub" }, `${r.tasks.length} 个任务包 · 决策模块方法 ${Object.keys(r.decision?.methods ?? {}).join(", ") || "—"}`),
+				table(["任务", "目标", "候选", "预算"], r.tasks.map((t) => [t.title, t.objective_text, num(t.n_candidates), `${t.budget.rounds} 轮 × ${t.budget.batch_size}`]))),
+			pp_propose_task: (args, r) => h("div", null,
+				r?.effective ? h("ul", { className: "pp-list" },
+					h("li", null, `任务：${r.effective.title}（${r.effective.task_id}）`),
+					h("li", null, `决策方法：${r.effective.method}`),
+					h("li", null, `预算：${r.effective.budget.rounds} 轮，每轮 ${r.effective.budget.batch_size} 个；候选 ${r.effective.n_candidates} 个`)) : null,
+				args?.rationale ? h("p", null, args.rationale) : null,
+				r ? h("p", { className: "pp-sub" }, "到右侧 PerturbPilot 面板确认开始（可以先改设置）") : null),
 			pp_get_decision: (args, r) => {
 				if (!r) return null;
 				// 方法不同，给的数值列也不同：有哪些列就显示哪些。
@@ -660,6 +729,7 @@ window.__ModuleLoader__.load({
 			const [view, setView] = react.useState(undefined);
 			const [error, setError] = react.useState(null);
 			const [busy, setBusy] = react.useState(false);
+			const [proposal, setProposal] = react.useState(null);
 			react.useEffect(() => {
 				if (!visible) return;
 				const controller = new AbortController();
@@ -668,6 +738,7 @@ window.__ModuleLoader__.load({
 					try {
 						const body = await api.get(controller.signal);
 						setView(body.run);
+						setProposal(body.proposal ?? null);
 						setError(null);
 					} catch (e) {
 						if (!controller.signal.aborted) setError(e.message);
@@ -692,23 +763,28 @@ window.__ModuleLoader__.load({
 					setBusy(false);
 				}
 			}, [api]);
-			// 还没开始任务时读一次任务卡片给预览。
-			const [task, setTask] = react.useState(undefined);
+			// 还没开始任务时读一次任务列表给表单；agent 的提议随会话一起轮询，提议变了就重新填表。
+			const [catalog, setCatalog] = react.useState(undefined);
+			const [form, setForm] = react.useState(null);
 			const waiting = view === null;
 			react.useEffect(() => {
 				if (!waiting) return;
 				const controller = new AbortController();
-				globalApi.task(controller.signal).then((body) => setTask(body.task), (e) => {
+				globalApi.tasks(controller.signal).then(setCatalog, (e) => {
 					if (controller.signal.aborted) return;
-					setTask(null);
+					setCatalog(null);
 					setError(e.message);
 				});
 				return () => controller.abort();
 			}, [waiting]);
-			const onStart = react.useCallback(async () => {
+			const proposalAt = proposal?.at ?? null;
+			react.useEffect(() => {
+				if (catalog) setForm(initialForm(catalog, proposal));
+			}, [catalog, proposalAt]);
+			const onStart = react.useCallback(async (setup) => {
 				setBusy(true);
 				try {
-					const body = await api.start();
+					const body = await api.start(setup);
 					setView(body.run);
 					setError(null);
 				} catch (e) {
@@ -717,7 +793,7 @@ window.__ModuleLoader__.load({
 					setBusy(false);
 				}
 			}, [api]);
-			return renderPanel({ view, task, error, busy, onControl, onStart });
+			return renderPanel({ view, catalog, proposal, form, onForm: setForm, error, busy, onControl, onStart });
 		}
 
 		function PanelGlyph(props) {
@@ -733,6 +809,7 @@ window.__ModuleLoader__.load({
 		const LOGO_MARK = { x: 1, y: 11, w: 205, h: 278 };
 		const LOGO_NAME = { x: 267, y: 70, w: 1478, h: 182 };
 		const HERO_TAGLINE = "提出假设 · 挑选实验 · 从每一轮读数里学习";
+		const HERO_GUIDE = "用自然语言说说想发现什么，说得模糊也行，比如“哪些基因敲掉后 T 细胞的 IL-2 会变少”。agent 会先问清楚，推荐任务、决策方法和预算，你在右侧面板确认后才开始。";
 
 		/** 原图里 part 那一块，按高度 height 显示。 */
 		function logoPart(part, height, className) {
@@ -770,7 +847,8 @@ window.__ModuleLoader__.load({
 				logoPart(LOGO_MARK, 56),
 				h("span", { className: "pp-hero-text" },
 					h("span", { className: "pp-hero-title" }, "PerturbPilot"),
-					h("span", { className: "pp-hero-tagline" }, HERO_TAGLINE)));
+					h("span", { className: "pp-hero-tagline" }, HERO_TAGLINE),
+					h("span", { className: "pp-hero-guide" }, HERO_GUIDE)));
 		}
 
 		/** 定时取一次数据；fetcher 变了就重新开始。返回最近一次的数据和错误。 */
@@ -942,6 +1020,16 @@ window.__ModuleLoader__.load({
 .pp-hero-text{display:flex;flex-direction:column;gap:2px}
 .pp-hero-title{font-size:26px;font-weight:600;line-height:32px}
 .pp-hero-tagline{font-size:14px;font-weight:400;line-height:20px;opacity:.65}
+.pp-hero-guide{font-size:13px;font-weight:400;line-height:19px;opacity:.55;max-width:440px;margin-top:6px}
+.pp-form{display:flex;flex-direction:column;gap:8px;margin:8px 0}
+.pp-form-row{display:flex;gap:8px}
+.pp-form-row>.pp-field{flex:1;min-width:0}
+.pp-field{display:flex;flex-direction:column;gap:3px;font-size:12px}
+.pp-field-label{opacity:.7}
+.pp-input{font:inherit;font-size:13px;padding:4px 6px;border:1px solid rgba(127,127,127,.35);border-radius:6px;background:transparent;color:inherit;min-width:0}
+.pp-input option{color:initial}
+.pp-proposal{border-left:3px solid rgba(80,130,230,.7);padding:4px 8px;margin:6px 0;background:rgba(80,130,230,.06);border-radius:4px}
+.pp-proposal p{margin:2px 0 0}
 [class*="_headline"]>[class*="_titleGroup"]{display:none}
 `;
 
@@ -1019,6 +1107,7 @@ window.__ModuleLoader__.load({
 		exports.BrandName = BrandName;
 		exports.HeroBrand = HeroBrand;
 		exports.TOOL_NAMES = TOOL_NAMES;
+		exports.HERO_GUIDE = HERO_GUIDE;
 		exports.ToolCard = ToolCard;
 		exports.apply = apply;
 		exports.inject = inject;

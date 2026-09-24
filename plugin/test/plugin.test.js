@@ -12,6 +12,7 @@ import { fakeServices } from './fake-services.js'
 
 const ROUTES = {
   'GET /task': 'task',
+  'GET /tasks': 'tasks',
   'GET /manifest': 'manifest',
   'POST /init': 'init',
   'POST /reset': 'resetOracle',
@@ -123,15 +124,31 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   const runDir = join(dir, 'sess-1')
 
   assert.deepEqual(Object.keys(host.tools).sort(), [
-    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
+    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_list_tasks', 'pp_propose_task', 'pp_run_python', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
   ])
   assert.equal(host.sections[0].name, 'perturbpilot:role')
   const brief = () => host.contexts[0].text({ agent })
   assert.equal(brief(), '') // 没有任务时不注入
 
-  await assert.rejects(host.tools.pp_get_decision.execute({}, exec(agent)), /面板上点"开始任务"/)
+  await assert.rejects(host.tools.pp_get_decision.execute({}, exec(agent)), /先用 pp_list_tasks/)
 
-  // 面板路由：先预览任务卡片；点"开始任务"后框架建运行记录，会话空闲就马上开第 1 轮
+  // 开任务前：agent 看任务列表，提议设置；提议不合法就报错，合法就存下来等用户确认，本 turn 结束
+  const listed = await host.tools.pp_list_tasks.execute({}, exec(agent))
+  assert.deepEqual(listed.tasks.map((x) => x.task_id), ['fake-task'])
+  assert.equal(listed.tasks[0].package_dir, undefined)
+  assert.equal(listed.decision.default_method, 'coverage')
+  assert.deepEqual(Object.keys(listed.decision.methods), ['coverage', 'gp-ucb'])
+  assert.deepEqual(listed.limits.rounds, [1, 50])
+  assert.equal(listed.started, false)
+  await assert.rejects(host.tools.pp_propose_task.execute({ task_id: 'fake-task', method: 'gp-ucb', rationale: 'x' }, exec(agent)), /candidate_features\/embedding/)
+  await assert.rejects(host.tools.pp_propose_task.execute({ task_id: 'fake-task', rounds: 0, rationale: 'x' }, exec(agent)), /rounds 要是 1–50/)
+  const proposeExec = exec(agent)
+  const proposed = await host.tools.pp_propose_task.execute({ task_id: 'fake-task', method: 'coverage', rationale: '只有这一个任务，要素都对得上' }, proposeExec)
+  assert.equal(proposeExec.concluded, true)
+  assert.deepEqual(proposed.effective, { task_id: 'fake-task', title: '测试任务', method: 'coverage', budget: { rounds: 3, batch_size: 3, allow_repeats: true }, n_candidates: 20 })
+  assert.equal(agent.followups.length, 0) // 提议不会开始任务
+
+  // 面板路由：先看任务列表和等确认的提议；用户确认开始后框架建运行记录，会话空闲就马上开第 1 轮
   assert.equal(host.routes.length, 1)
   assert.equal(host.routes[0].kind, 'prefix')
   assert.equal(host.routes[0].path, '/perturbpilot/api')
@@ -141,12 +158,25 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   const apiBase = `http://127.0.0.1:${panel.address().port}/perturbpilot/api`
   const panelBase = `${apiBase}/sessions/sess-1`
   const panelPost = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-perturbpilot': '1' }, body: JSON.stringify(body) })
-  const preview = (await (await fetch(`${apiBase}/task`)).json()).task
-  assert.equal(preview.title, '测试任务')
-  assert.equal(preview.package_dir, undefined)
+  const catalog = await (await fetch(`${apiBase}/tasks`)).json()
+  assert.equal(catalog.tasks[0].title, '测试任务')
+  assert.equal(catalog.tasks[0].package_dir, undefined)
+  assert.equal(catalog.decision.requires['gp-ucb'][0].modality, 'embedding')
+  const pending = await (await fetch(panelBase)).json()
+  assert.equal(pending.run, null)
+  assert.equal(pending.proposal.rationale, '只有这一个任务，要素都对得上')
   assert.equal((await panelPost(`${apiBase}/sessions/ghost/start`, {})).status, 404)
-  const started = await (await panelPost(`${panelBase}/start`, {})).json()
+  const started = await (await panelPost(`${panelBase}/start`, { task_id: 'fake-task', method: 'coverage' })).json()
   assert.equal(started.run.status, 'active')
+  assert.equal(JSON.parse(readFileSync(join(runDir, 'state.json'), 'utf8')).setup.proposal.task_id, 'fake-task')
+  assert.equal((await (await fetch(panelBase)).json()).proposal, null)
+  await assert.rejects(host.tools.pp_propose_task.execute({ task_id: 'fake-task', rationale: 'x' }, exec(agent)), /已经开始了任务/)
+  assert.equal((await host.tools.pp_list_tasks.execute({}, exec(agent))).started, true)
+  // 决策模块和 oracle 同一时间只跑一个任务：别的会话开不了
+  host.addAgent('sess-2')
+  const blocked = await panelPost(`${apiBase}/sessions/sess-2/start`, {})
+  assert.equal(blocked.status, 400)
+  assert.match((await blocked.json()).error, /会话 sess-1 的任务还没结束（进行中）/)
   assert.match(brief(), /第 1\/3 轮/)
   assert.equal(agent.followups.length, 1)
   assert.equal((await panelPost(`${panelBase}/start`, {})).status, 400)
@@ -224,7 +254,7 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
     assert.equal(status.token_set, true)
     assert.ok(!JSON.stringify(status).includes('tok-1')) // 只报有没有设，不报值
     assert.equal(status.config.runsDir, dir)
-    assert.deepEqual(status.services.oracle, { ok: true, task_id: 'fake-task', synthetic: true })
+    assert.deepEqual(status.services.oracle, { ok: true, tasks: ['fake-task'], active: 'fake-task' })
     assert.deepEqual(status.services.decision, { ok: true, name: 'fake', version: 'fake/0', method: 'coverage' })
     const view = (await (await fetch(panelBase)).json()).run
     assert.equal(view.status, 'paused')

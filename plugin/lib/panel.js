@@ -1,5 +1,6 @@
 // 浏览器面板的宿主侧：把一次任务的状态整理成面板要显示的视图，并挂一个 HTTP 路由给面板读和控制。
 // 路由挂在 DSH 自己的 web 服务上（同源），只读 runs/ 里已有的状态，写操作只有开始任务和暂停 / 继续 / 结束。
+// 开始任务前，面板列出服务里所有的任务包让用户选；agent 用 pp_propose_task 提过设置的，面板上预先填好等用户确认。
 // 右侧栏按当前会话读一个任务；主区的科学台账页不绑会话，先列出 runs/ 下所有任务再选。
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
@@ -21,7 +22,7 @@ export class PanelError extends Error {
   }
 }
 
-/** 开始任务前给面板预览的任务卡片：去掉服务本机的路径。 */
+/** 开始任务前给面板和 agent 预览的任务卡片：去掉服务本机的路径。 */
 export function taskPreview(card) {
   const { package_dir, ...rest } = card
   return { ...rest, objective_text: objectiveText(card.objective), goal: lowerIsBetter(card.objective) ? 'low' : 'high' }
@@ -135,21 +136,23 @@ export function listRuns(runsDir) {
 /**
  * 面板路由的处理函数。
  *   GET  <PANEL_ROUTE>/sessions                    → { runs: 摘要列表 }（科学台账页用）
- *   GET  <PANEL_ROUTE>/sessions/<会话 id>          → { run: 视图 | null }
- *   POST <PANEL_ROUTE>/sessions/<会话 id>/start    body {} → { run: 视图 }（开始任务，第 1 轮随后由框架开）
+ *   GET  <PANEL_ROUTE>/sessions/<会话 id>          → { run: 视图 | null, proposal: agent 提的设置 | null }
+ *   POST <PANEL_ROUTE>/sessions/<会话 id>/start    body { task_id?, method?, rounds?, batch_size? } → { run: 视图 }
+ *                                                  （开始任务，第 1 轮随后由框架开；省略的项用默认）
  *   POST <PANEL_ROUTE>/sessions/<会话 id>/control  body { action } → { run: 视图 }
- *   GET  <PANEL_ROUTE>/task                        → { task: 任务卡片预览 }（开始任务前显示）
+ *   GET  <PANEL_ROUTE>/tasks                       → { tasks: 任务卡片预览列表, active, decision: 方法和各自需要的输入, limits }
  *   GET  <PANEL_ROUTE>/status                      → 插件配置和服务是否连得上（设置页用）
  *   GET  <PANEL_ROUTE>/logo                        → assets/logo.png
  * POST 要求 content-type 为 application/json 且带 x-perturbpilot 头，别的网页没法跨站伪造（会触发预检，这里不答预检）。
  * @param deps.getRun - (sessionId) => Run | undefined
  * @param deps.control - (sessionId, action) => void，执行控制并在需要时推动回合
- * @param deps.start - async (sessionId) => void，开始任务并推动第 1 轮；会话不存在抛 PanelError(404)
- * @param deps.task - async () => 任务卡片预览
+ * @param deps.start - async (sessionId, setup) => void，开始任务并推动第 1 轮；会话不存在抛 PanelError(404)
+ * @param deps.proposal - (sessionId) => 等用户确认的设置 | null
+ * @param deps.tasks - async () => 任务列表和决策模块的方法
  * @param deps.listRuns - () => 摘要列表
  * @param deps.status - async () => 状态对象
  */
-export function createPanelHandler({ getRun, control, start, task, listRuns = () => [], status = async () => ({}), logger }) {
+export function createPanelHandler({ getRun, control, start, proposal = () => null, tasks, listRuns = () => [], status = async () => ({}), logger }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost')
@@ -159,9 +162,9 @@ export function createPanelHandler({ getRun, control, start, task, listRuns = ()
         res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-cache' })
         return res.end(readFileSync(LOGO_PATH))
       }
-      if (rest.length === 1 && (rest[0] === 'sessions' || rest[0] === 'status' || rest[0] === 'task')) {
+      if (rest.length === 1 && (rest[0] === 'sessions' || rest[0] === 'status' || rest[0] === 'tasks')) {
         if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' })
-        if (rest[0] === 'task') return send(res, 200, { task: await task() })
+        if (rest[0] === 'tasks') return send(res, 200, await tasks())
         return send(res, 200, rest[0] === 'sessions' ? { runs: listRuns() } : await status())
       }
       if (rest[0] !== 'sessions' || !SESSION_ID.test(rest[1] ?? '') || rest.length > 3) return send(res, 404, { error: 'not found' })
@@ -169,7 +172,7 @@ export function createPanelHandler({ getRun, control, start, task, listRuns = ()
       if (rest.length === 2) {
         if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' })
         const run = getRun(sessionId)
-        return send(res, 200, { run: run ? panelView(run) : null })
+        return send(res, 200, { run: run ? panelView(run) : null, proposal: run ? null : proposal(sessionId) })
       }
       if (rest[2] !== 'control' && rest[2] !== 'start') return send(res, 404, { error: 'not found' })
       if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
@@ -179,7 +182,8 @@ export function createPanelHandler({ getRun, control, start, task, listRuns = ()
       const body = JSON.parse(await readBody(req))
       if (rest[2] === 'start') {
         if (getRun(sessionId)) return send(res, 400, { error: '这个会话已经开始过任务' })
-        await start(sessionId)
+        const { task_id, method, rounds, batch_size } = body ?? {}
+        await start(sessionId, { task_id, method, rounds, batch_size })
         return send(res, 200, { run: panelView(getRun(sessionId)) })
       }
       if (!CONTROL_ACTIONS.includes(body?.action)) return send(res, 400, { error: `action 必须是 ${CONTROL_ACTIONS.join('/')} 之一` })

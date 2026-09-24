@@ -4,6 +4,8 @@
 任务卡片的 readout.noise_sd 大于 0 时（合成任务），每次读数加上确定性的测量噪声：
 噪声只由 (任务, 候选, 第几次测) 决定，与提交顺序、批次划分无关，从任意一轮分叉重放结果一致。
 没有 noise_sd 的任务（例如从已有筛选数据转换来的）每次读数都等于表里的值。
+
+OracleHub 装着多个任务包，同一时间只有一个任务在跑：/reset 带 task_id 切换，/run 带的 task_id 必须是当前的。
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ class Oracle:
         self.card = package.card
         self.fields = [f["name"] for f in self.card["readout"]["fields"]]
         self.noise_sd = float(self.card["readout"].get("noise_sd") or 0.0)
-        self.batch_size = int(self.card["budget"]["batch_size"])
+        self.batch_size = int(self.card["budget"]["batch_size"])  # 本次任务的批量上限，/reset 可以改
         self.allow_repeats = bool(self.card["budget"].get("allow_repeats", False))
         self.known = set(package.ids)
 
@@ -90,11 +92,17 @@ class Oracle:
         return {"oracle_version": ORACLE_VERSION, **entry}
 
     def reset(self, body: dict[str, Any]) -> dict[str, Any]:
-        """恢复到给定的已测次数（用于分叉重放）；不传则清零。"""
+        """恢复到给定的已测次数（用于分叉重放）；不传则清零。batch_size 改本次任务的批量上限，不传用任务卡片的。"""
         reps = body.get("replicates") or {}
+        size = body.get("batch_size")
+        if size is None:
+            size = self.card["budget"]["batch_size"]
+        if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= len(self.known):
+            raise HttpError(400, f"batch_size must be an integer between 1 and {len(self.known)}")
+        self.batch_size = size
         self.replicates = {str(k): int(v) for k, v in reps.items()}
         self.log = []
-        return {"ok": True}
+        return {"ok": True, "task_id": self.card["task_id"], "batch_size": size}
 
     def routes(self) -> dict[tuple[str, str], Any]:
         return {
@@ -102,4 +110,68 @@ class Oracle:
             ("POST", "/run"): self.run,
             ("POST", "/reset"): self.reset,
             ("GET", "/health"): lambda _b: {"ok": True, "oracle_version": ORACLE_VERSION},
+        }
+
+
+class OracleHub:
+    """多个任务包的 oracle。只有一个任务时它一开始就是当前任务；多个时要先 /reset 带 task_id 选一个。"""
+
+    def __init__(self, oracles: list[Oracle]):
+        if not oracles:
+            raise TaskError("no task packages")
+        self.oracles: dict[str, Oracle] = {}
+        for o in oracles:
+            tid = o.card["task_id"]
+            if tid in self.oracles:
+                raise TaskError(f"duplicate task_id {tid!r} ({self.oracles[tid].package.root} and {o.package.root})")
+            self.oracles[tid] = o
+        self.active: str | None = next(iter(self.oracles)) if len(self.oracles) == 1 else None
+
+    @classmethod
+    def from_dirs(cls, tasks_root: str | Path, hidden_root: str | Path) -> tuple["OracleHub", list[tuple[str, str]]]:
+        """tasks_root 下每个带 task.json 的子目录是一个任务包，隐藏数据在 hidden_root 下的同名子目录。
+        读不了的跳过，和原因一起返回。"""
+        tasks_root, hidden_root = Path(tasks_root), Path(hidden_root)
+        oracles, skipped = [], []
+        for d in sorted(p for p in tasks_root.iterdir() if p.is_dir()):
+            if not (d / "task.json").exists():
+                continue
+            try:
+                oracles.append(Oracle(Package.load(d), hidden_root / d.name))
+            except (OSError, TaskError, ValueError, KeyError) as e:
+                skipped.append((d.name, str(e)))
+        return cls(oracles), skipped
+
+    def current(self) -> Oracle:
+        if self.active is None:
+            raise HttpError(409, "no task selected, call /reset with task_id first")
+        return self.oracles[self.active]
+
+    def tasks(self, _body: dict[str, Any]) -> dict[str, Any]:
+        return {"tasks": [o.package.public_card() for o in self.oracles.values()], "active": self.active}
+
+    def reset(self, body: dict[str, Any]) -> dict[str, Any]:
+        tid = body.get("task_id")
+        if tid is None:
+            return self.current().reset(body)
+        if tid not in self.oracles:
+            raise HttpError(400, f"unknown task_id {tid!r}")
+        out = self.oracles[tid].reset(body)
+        self.active = tid
+        return out
+
+    def run(self, body: dict[str, Any]) -> dict[str, Any]:
+        oracle = self.current()
+        tid = body.get("task_id")
+        if tid is not None and tid != self.active:
+            raise HttpError(409, f"task {tid!r} is not the current task ({self.active!r})")
+        return oracle.run(body)
+
+    def routes(self) -> dict[tuple[str, str], Any]:
+        return {
+            ("GET", "/tasks"): self.tasks,
+            ("GET", "/task"): lambda _b: self.current().package.public_card(),
+            ("POST", "/run"): self.run,
+            ("POST", "/reset"): self.reset,
+            ("GET", "/health"): lambda _b: {"ok": True, "oracle_version": ORACLE_VERSION, "active": self.active},
         }

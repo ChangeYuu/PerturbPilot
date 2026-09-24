@@ -1,5 +1,5 @@
 // PerturbPilot 的 DSH 插件：把"一次科学任务"接进 DSH 的一个会话里。
-// 任务由用户在面板上点"开始任务"发起，框架建好运行记录后开第 1 轮。
+// 任务由用户在面板上确认开始（自己选任务，或确认 agent 用 pp_propose_task 提的设置），框架建好运行记录后开第 1 轮。
 // 一轮 = 一个 DSH turn；本轮提交后由框架用 followup 开下一轮。
 // agent 负责选（参考决策模块的推荐，按依据分组写理由），框架负责提交给 oracle 并把读数回灌给决策模块。
 // agent 用 DSH 自带的 web_search / web_fetch 查文献，这里只记录检索，不拦截。
@@ -14,6 +14,7 @@ import { installFetchCapture } from './lib/capture.js'
 import { CONTROL_ACTIONS, HYPOTHESIS_STATUSES, RETRIEVAL_TOOLS, Run, RunError, SOURCES } from './lib/run.js'
 import { createServices } from './lib/services.js'
 import { PANEL_ROUTE, PanelError, createPanelHandler, listRuns, taskPreview } from './lib/panel.js'
+import { MAX_ROUNDS, checkSetup } from './lib/setup.js'
 import { ROLE_PROMPT, roundPrompt, steerPrompt } from './lib/prompts.js'
 
 export const name = 'perturbpilot'
@@ -40,6 +41,7 @@ export function apply(ctx, config) {
   const runs = new Map() // agent.id -> Run
   const retrievalCalls = new Map() // callId -> 还没回来的 web_search / web_fetch 调用 {agent_id, name, arguments}
   const driven = new Map() // agent.id -> 由框架发起、正在进行的轮次号
+  const proposals = new Map() // agent.id -> agent 用 pp_propose_task 提的、等用户确认的设置
   let lastRequest = null // 最近一次 agent/request 的 {agent_id, turn, step}，用来给模型调用记录挂上归属
 
   const capture = installFetchCapture({
@@ -78,26 +80,51 @@ export function apply(ctx, config) {
   function requireRun(exec) {
     if (!exec.agent) throw new RunError('PerturbPilot 工具只能在会话里用')
     const run = runFor(exec.agent)
-    if (!run) throw new RunError('这个会话还没有开始任务；任务由用户在 PerturbPilot 面板上点"开始任务"发起')
+    if (!run) throw new RunError('这个会话还没有开始任务。先用 pp_list_tasks 看有哪些任务，和用户确认后用 pp_propose_task 提议，用户在面板上确认后框架才开始。')
     return run
+  }
+
+  /** 能选的任务、决策模块的方法和预算范围：pp_list_tasks 和面板的任务选择用同一份。 */
+  async function catalog(api = services, signal) {
+    const [{ tasks, active }, manifest] = await Promise.all([api.tasks(signal), api.manifest(signal)])
+    return {
+      tasks: tasks.map(taskPreview),
+      active,
+      decision: {
+        name: manifest.name,
+        default_method: manifest.method,
+        methods: Array.isArray(manifest.methods) ? Object.fromEntries(manifest.methods.map((m) => [m, ''])) : manifest.methods ?? {},
+        requires: manifest.requires ?? {},
+      },
+      limits: { rounds: [1, MAX_ROUNDS], batch_size: [1, 'n_candidates'] },
+    }
   }
 
   const starting = new Set() // 正在开始任务的会话，防止连点开出两个
 
-  /** 面板上点"开始任务"：建运行记录，然后由框架开第 1 轮（会话正忙时等它空下来再开）。 */
-  async function startTask(sessionId) {
+  /**
+   * 面板上确认开始：按 setup（{task_id, method, rounds, batch_size}）建运行记录，然后由框架开第 1 轮（会话正忙时等它空下来再开）。
+   * 决策模块和 oracle 同一时间只跑一个任务，别的会话里还有没结束的任务时不开。
+   */
+  async function startTask(sessionId, setup = {}) {
     const agent = ctx.agents.get(sessionId)
     if (!agent) throw new PanelError(404, '找不到这个会话')
     if (runById(sessionId)) throw new RunError('这个会话已经开始过任务')
     const dir = join(runsDir, sessionId)
     if (Run.isLegacy(dir)) throw new RunError('这个会话里有旧格式的任务记录，不能再开任务；新开一个会话。')
-    if (starting.has(sessionId)) throw new RunError('正在开始任务')
+    if (starting.size) throw new RunError('正在开始任务')
+    for (const [id, other] of runs) {
+      if (id !== sessionId && !other.closed) {
+        throw new RunError(`会话 ${id} 的任务还没结束（${other.state.status === 'paused' ? '已暂停' : '进行中'}）。决策模块和 oracle 同一时间只跑一个任务，先在那个会话里结束它。`)
+      }
+    }
     starting.add(sessionId)
     try {
-      runs.set(sessionId, await Run.start({ dir, runId: sessionId, services }))
+      runs.set(sessionId, await Run.start({ dir, runId: sessionId, services, setup, proposal: proposals.get(sessionId) ?? null }))
     } finally {
       starting.delete(sessionId)
     }
+    proposals.delete(sessionId)
     drive(agent)
   }
 
@@ -126,6 +153,43 @@ export function apply(ctx, config) {
   // ---- 工具 ----
 
   const tool = (options) => ctx.tools.register(defineTool({ output: JSON_OUTPUT, ...options }))
+
+  tool({
+    name: 'pp_list_tasks',
+    description: '开任务前用：列出能跑的任务包（每个的扰动、读数字段、目标、预算、候选数和带的数据）、决策模块的方法（每个方法需要的输入）和预算能调的范围。只能从这里列出的任务里选。',
+    parameters: {},
+    async execute(_args, exec) {
+      return { ...(await catalog(services, exec.signal)), started: Boolean(exec.agent && runFor(exec.agent)) }
+    },
+  })
+
+  tool({
+    name: 'pp_propose_task',
+    description: '和用户问清楚要跑什么之后，提议这个会话要开始的任务设置。框架检查设置能不能跑，然后在对话和面板上显示确认卡片；用户点确认后框架才开始第 1 轮，你不能自己开始。method、rounds、batch_size 省略表示用默认（决策模块的默认方法、任务包的预算）。提议后本 turn 结束；用户改主意就重新提议，新的覆盖旧的。',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'pp_list_tasks 里的 task_id' },
+      method: { type: 'string', description: '决策模块的方法；省略用默认' },
+      rounds: { type: 'integer', description: `轮数，1–${MAX_ROUNDS}；省略用任务包的` },
+      batch_size: { type: 'integer', description: '每轮个数，1 到候选数；省略用任务包的' },
+      rationale: { type: 'string', required: true, description: '为什么选这个任务、方法和预算；用户的描述里有哪些要素和任务对不上，也写在这里' },
+    },
+    async execute(args, exec) {
+      if (!exec.agent) throw new RunError('PerturbPilot 工具只能在会话里用')
+      if (runFor(exec.agent)) throw new RunError('这个会话已经开始了任务，不能再提议')
+      const { tasks } = await services.tasks(exec.signal)
+      const manifest = await services.manifest(exec.signal)
+      const setup = { task_id: args.task_id, method: args.method ?? null, rounds: args.rounds ?? null, batch_size: args.batch_size ?? null }
+      const { card, method, budget } = checkSetup(tasks, manifest, setup)
+      const proposal = { ...setup, rationale: args.rationale, at: new Date().toISOString() }
+      proposals.set(exec.agent.id, proposal)
+      exec.concludeTurn()
+      return {
+        proposal,
+        effective: { task_id: card.task_id, title: card.title, method: method ?? manifest.method, budget, n_candidates: card.n_candidates },
+        next: '已显示确认卡片，等用户确认；用户确认后框架开始第 1 轮。',
+      }
+    },
+  })
 
   tool({
     name: 'pp_get_decision',
@@ -257,11 +321,12 @@ export function apply(ctx, config) {
         if (action === 'resume' && agent) drive(agent)
       },
       start: startTask,
-      task: async () => taskPreview(await probe.task()),
+      proposal: (sessionId) => proposals.get(sessionId) ?? null,
+      tasks: () => catalog(probe),
       listRuns: () => listRuns(runsDir),
       async status() {
         const [oracle, decision] = await Promise.all([
-          check(probe.task, (x) => ({ task_id: x.task_id, synthetic: x.synthetic })),
+          check(probe.tasks, (x) => ({ tasks: x.tasks.map((t) => t.task_id), active: x.active })),
           check(probe.manifest, (x) => ({ name: x.name, version: x.version, method: x.method })),
         ])
         return {
@@ -365,6 +430,7 @@ export function apply(ctx, config) {
 
     ctx.on('agent/disposed', ({ agent }) => {
       runs.delete(agent.id)
+      proposals.delete(agent.id)
       driven.delete(agent.id)
     })
 

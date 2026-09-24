@@ -115,6 +115,15 @@ class Coverage:
         return {"order": "seeded_random"}
 
 
+METHOD_TEXT = {
+    "auto": "有嵌入特征用 gp-ucb，否则 coverage",
+    "gp-ucb": "嵌入特征上的高斯过程 + UCB",
+    "coreset": "MC-dropout MLP 隐层表示上的 farthest-first（GeneDisco CoreSet 设置）",
+    "top-uncertain": "MC-dropout MLP 预测标准差最大的先测（GeneDisco TopUncertain 设置）",
+    "coverage": "按固定种子的随机顺序覆盖未测候选",
+}
+
+
 class DecisionService:
     def __init__(self, method: str = "auto"):
         if method not in METHODS:
@@ -152,12 +161,9 @@ class DecisionService:
             "name": "ppsvc-baseline",
             "version": DECISION_VERSION,
             "method": self.requested if self.model is None else self.model.name,
-            "methods": {
-                "gp-ucb": "嵌入特征上的高斯过程 + UCB",
-                "coreset": "MC-dropout MLP 隐层表示上的 farthest-first（GeneDisco CoreSet 设置）",
-                "top-uncertain": "MC-dropout MLP 预测标准差最大的先测（GeneDisco TopUncertain 设置）",
-                "coverage": "按固定种子的随机顺序覆盖未测候选",
-            },
+            "methods": METHOD_TEXT,
+            # 每个方法必需的输入；/init 可以带 method 另选（auto 有嵌入特征用 gp-ucb，否则 coverage）。
+            "requires": {m: [FEATURES] if m in FEATURE_METHODS else [] for m in METHODS},
             "inputs": {"required": required, "optional": optional},
         }
 
@@ -173,15 +179,18 @@ class DecisionService:
         task = body.get("task") or {}
         if task.get("task_id") not in (None, pkg.card["task_id"]):
             raise HttpError(400, "task.task_id does not match the package")
-        if self.requested in FEATURE_METHODS and feats is None:
+        method = body.get("method") or self.requested
+        if method not in METHODS:
+            raise HttpError(400, f"method must be one of {', '.join(METHODS)}")
+        if method in FEATURE_METHODS and feats is None:
             raise HttpError(400, "missing required input candidate_features/embedding")
         self.package = pkg
         self.ids = pkg.ids
         self.index = {cid: i for i, cid in enumerate(self.ids)}
         self.objective = pkg.card["objective"]
         self.sign = target_sign(self.objective)
-        if feats is not None and self.requested != "coverage":
-            self.model = self._feature_model(feats, pkg)
+        if feats is not None and method != "coverage":
+            self.model = self._feature_model(feats, pkg, method)
             self.rows = feats.rows
             self.inputs_used = [FEATURES]
         else:
@@ -193,11 +202,11 @@ class DecisionService:
         self._refit()
         return {"ok": True, "decision_version": DECISION_VERSION, "method": self.model.name, "inputs_used": self.inputs_used}
 
-    def _feature_model(self, feats: Features, pkg: Package) -> Any:
-        if self.requested in ("coreset", "top-uncertain"):
+    def _feature_model(self, feats: Features, pkg: Package, method: str) -> Any:
+        if method in ("coreset", "top-uncertain"):
             from .neural import CoreSet, TopUncertain  # torch 只在用到这两个方法时才加载
 
-            return (CoreSet if self.requested == "coreset" else TopUncertain)(feats.X, pkg.card["task_id"])
+            return (CoreSet if method == "coreset" else TopUncertain)(feats.X, pkg.card["task_id"])
         noise = pkg.card["readout"].get("noise_sd")
         return GpUcb(feats.X, float(noise) if noise else None)
 
