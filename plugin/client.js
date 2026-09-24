@@ -3,6 +3,7 @@
 // - 主区的"科学台账"页（左侧栏有入口）：列出所有任务，选一个看全部轮次、读数、假设历史、笔记、分析和审计。
 // - 设置里的 PerturbPilot 一页：只读显示插件配置、服务连不连得上、服务令牌设没设。
 //   数据都来自宿主侧挂在同源 web 服务上的 /perturbpilot/api（见 lib/panel.js）。
+// - 左上角和新会话中间的 logo（占 DSH 的品牌插槽，图由 /perturbpilot/api/logo 给）。
 // - 对话区里每个 pp_* 工具调用的卡片（推荐表、替换理由和读数、假设、笔记、分析），代替通用的参数/结果行。
 // 不经过构建：直接按 DSH 浏览器模块的注册格式手写，只用平台自带的 react。
 window.__ModuleLoader__.load({
@@ -622,6 +623,53 @@ window.__ModuleLoader__.load({
 				h("path", { d: "M2.5 13.5h11M4 11V8M7 11V4.5M10 11V6.5M13 11V3" }));
 		}
 
+		// ---- 品牌：左上角和新会话中间的 logo ----
+		// 图是 assets/logo.png（1753×307，左边螺旋、右边 DeepAutonomy 字样），经 <API>/logo 取；
+		// 两部分用背景图裁出来，下面是它们在原图里的像素范围。
+		const LOGO = { url: `${API}/logo`, width: 1753, height: 307 };
+		const LOGO_MARK = { x: 1, y: 11, w: 205, h: 278 };
+		const LOGO_NAME = { x: 267, y: 70, w: 1478, h: 182 };
+		const HERO_TAGLINE = "提出假设 · 挑选实验 · 从每一轮读数里学习";
+
+		/** 原图里 part 那一块，按高度 height 显示。 */
+		function logoPart(part, height, className) {
+			const k = height / part.h;
+			return h("span", {
+				className,
+				"aria-hidden": true,
+				style: {
+					display: "inline-block",
+					flex: "none",
+					width: `${part.w * k}px`,
+					height: `${height}px`,
+					backgroundImage: `url("${LOGO.url}")`,
+					backgroundRepeat: "no-repeat",
+					backgroundSize: `${LOGO.width * k}px ${LOGO.height * k}px`,
+					backgroundPosition: `${-part.x * k}px ${-part.y * k}px`,
+				},
+			});
+		}
+
+		/** 侧栏的图标位：螺旋，放在 size×size 的方框中间。 */
+		function BrandMark(props) {
+			const size = props?.size ?? 24;
+			return h("span", { className: "pp-brand-mark", style: { width: `${size}px`, height: `${size}px` } }, logoPart(LOGO_MARK, size));
+		}
+
+		/** 侧栏的名字位：DeepAutonomy 字样。 */
+		function BrandName() {
+			return logoPart(LOGO_NAME, 15, "pp-brand-name");
+		}
+
+		/** 新会话中间：螺旋 + 两行字。DSH 自带的“探索未至之境”标题由样式藏起来。 */
+		function HeroBrand() {
+			return h("span", { className: "pp-hero" },
+				logoPart(LOGO_MARK, 56),
+				h("span", { className: "pp-hero-text" },
+					h("span", { className: "pp-hero-title" }, "PerturbPilot"),
+					h("span", { className: "pp-hero-tagline" }, HERO_TAGLINE)));
+		}
+
 		/** 定时取一次数据；fetcher 变了就重新开始。返回最近一次的数据和错误。 */
 		function usePoll(fetcher) {
 			const [data, setData] = react.useState(undefined);
@@ -785,6 +833,13 @@ window.__ModuleLoader__.load({
 .pp-fold{margin:16px 0;padding:8px 14px;border:1px solid var(--pp-line);border-radius:10px}
 .pp-fold>summary{font-weight:600}.pp-fold[open]>summary{margin-bottom:8px}
 .pp-settings{font-size:13px;line-height:1.5}
+.pp-brand-mark{display:inline-flex;align-items:center;justify-content:center}
+.pp-brand-name{vertical-align:middle}
+.pp-hero{display:inline-flex;align-items:center;gap:14px;text-align:left}
+.pp-hero-text{display:flex;flex-direction:column;gap:2px}
+.pp-hero-title{font-size:26px;font-weight:600;line-height:32px}
+.pp-hero-tagline{font-size:14px;font-weight:400;line-height:20px;opacity:.65}
+[class*="_headline"]>[class*="_titleGroup"]{display:none}
 `;
 
 		// ---- 插件 ----
@@ -840,6 +895,10 @@ window.__ModuleLoader__.load({
 				order: 90,
 				label: () => "PerturbPilot",
 			}, SettingsSection)), "perturbpilot: settings section");
+			// 品牌位：DSH 自带的 ui-brand-official 在 cordis.patch.yml 里关掉了，这几个插槽由我们占。
+			ctx.effect(() => ctx.slots.inject("sidebar.brand.mark", () => ctx.slots.register({ name: "sidebar.brand.mark" }, BrandMark)), "perturbpilot: brand mark");
+			ctx.effect(() => ctx.slots.inject("sidebar.brand.name", () => ctx.slots.register({ name: "sidebar.brand.name" }, BrandName)), "perturbpilot: brand name");
+			ctx.effect(() => ctx.slots.inject("conversation.hero.brand.mark", () => ctx.slots.register({ name: "conversation.hero.brand.mark" }, HeroBrand)), "perturbpilot: hero brand");
 		}
 
 		exports.PANEL_ID = PANEL_ID;
@@ -853,6 +912,9 @@ window.__ModuleLoader__.load({
 		exports.LedgerPage = LedgerPage;
 		exports.SettingsSection = SettingsSection;
 		exports.PanelGlyph = PanelGlyph;
+		exports.BrandMark = BrandMark;
+		exports.BrandName = BrandName;
+		exports.HeroBrand = HeroBrand;
 		exports.TOOL_NAMES = TOOL_NAMES;
 		exports.ToolCard = ToolCard;
 		exports.apply = apply;

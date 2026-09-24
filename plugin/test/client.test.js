@@ -101,7 +101,7 @@ test('bundle registers under the package name with a page tab type and a session
   assert.equal(types[0].patterns, undefined) // 页面型 tab，按 kind 打开
   assert.equal(types[0].title(), 'PerturbPilot')
   assert.equal(types[0].guide.length, 1)
-  assert.equal(slots.length, 1 + exports.TOOL_NAMES.length + 3)
+  assert.equal(slots.length, 1 + exports.TOOL_NAMES.length + 6)
   assert.equal(slots[0].opts.name, 'sidebar.right.pane.tab')
   assert.equal(slots[0].opts.key, exports.PANEL_ID)
   assert.equal(slots[0].component, exports.PanelBody)
@@ -116,11 +116,15 @@ test('bundle registers under the package name with a page tab type and a session
     'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_start_task', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
   ])
   // 主区的科学台账页、左侧栏入口（id 对上主区的 key）、设置页
-  const [page, entry, settings] = slots.slice(1 + exports.TOOL_NAMES.length)
+  const [page, entry, settings, mark, name, hero] = slots.slice(1 + exports.TOOL_NAMES.length)
   assert.deepEqual([page.opts.name, page.opts.key, page.component], ['main', exports.LEDGER_ID, exports.LedgerPage])
   assert.deepEqual([entry.opts.name, entry.opts.id, entry.opts.label(), entry.component], ['sidebar.panellist', exports.LEDGER_ID, '科学台账', exports.PanelGlyph])
   assert.deepEqual([settings.opts.name, settings.opts.id, settings.opts.label(), settings.component], ['settings.section', exports.SETTINGS_ID, 'PerturbPilot', exports.SettingsSection])
   assert.equal(exports.PanelGlyph({ size: 18 }).props.width, 18)
+  // 品牌位：左上角的图标和名字、新会话中间
+  assert.deepEqual([mark, name, hero].map((s) => [s.opts.name, s.component]), [
+    ['sidebar.brand.mark', exports.BrandMark], ['sidebar.brand.name', exports.BrandName], ['conversation.hero.brand.mark', exports.HeroBrand],
+  ])
 })
 
 // 按 DSH 工具块的形状包一次调用：start 只有参数，result 带 call 和 content（插件工具的输出是 JSON 文本）。
@@ -403,4 +407,27 @@ test('ledger page and settings section talk to the real host routes', async () =
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test('brand pieces crop the mark and the name out of the one logo image', () => {
+  const { exports } = loadClient(fakeReact())
+  const [box] = [exports.BrandMark({ size: 24 })]
+  assert.deepEqual(box.props.style, { width: '24px', height: '24px' })
+  // 螺旋在原图里是 205×278（从 1,11 开始），按高 24 显示
+  const k = 24 / 278
+  const mark = box.children[0].props.style
+  assert.equal(mark.height, '24px')
+  assert.equal(mark.width, `${205 * k}px`)
+  assert.equal(mark.backgroundImage, 'url("/perturbpilot/api/logo")')
+  assert.equal(mark.backgroundSize, `${1753 * k}px ${307 * k}px`)
+  assert.equal(mark.backgroundPosition, `${-1 * k}px ${-11 * k}px`)
+  // 名字只取 DeepAutonomy 字样那一块
+  const name = exports.BrandName().props.style
+  assert.equal(name.height, '15px')
+  const n = 15 / 182
+  assert.equal(name.backgroundPosition, `${-267 * n}px ${-70 * n}px`)
+  // 新会话中间：螺旋加两行字
+  const hero = exports.HeroBrand()
+  assert.equal(hero.children[0].props.style.height, '56px')
+  assert.deepEqual(find(hero, (n) => n.props.className?.startsWith?.('pp-hero-')).slice(1).map(text), ['PerturbPilot', '提出假设 · 挑选实验 · 从每一轮读数里学习'])
 })

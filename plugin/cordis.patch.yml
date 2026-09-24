@@ -63,3 +63,5 @@
   disabled: true
 - id: ui-settings-plugins
   disabled: true
+- id: ui-brand-official
+  disabled: true

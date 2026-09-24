@@ -1,12 +1,12 @@
 // 面板路由测试：真实的 Run（oracle 和决策模块用替身）+ 真实的 HTTP 处理函数，检查视图内容、防伪造、控制动作。
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
-import { PANEL_ROUTE, createPanelHandler, listRuns, panelView } from '../lib/panel.js'
+import { LOGO_PATH, PANEL_ROUTE, createPanelHandler, listRuns, panelView } from '../lib/panel.js'
 import { Run } from '../lib/run.js'
 import { fakeServices } from './fake-services.js'
 
@@ -133,6 +133,12 @@ test('run list and status routes', async () => {
       assert.deepEqual(await (await fetch(`${b}/status`)).json(), { token_set: false })
       assert.equal((await fetch(`${b}/sessions`, { method: 'POST' })).status, 405)
       assert.equal((await fetch(`${b}/status/x`)).status, 404)
+      const logo = await fetch(`${b}/logo`)
+      assert.equal(logo.headers.get('content-type'), 'image/png')
+      const bytes = Buffer.from(await logo.arrayBuffer())
+      assert.deepEqual(bytes, readFileSync(LOGO_PATH))
+      assert.deepEqual([...bytes.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47])
+      assert.equal((await fetch(`${b}/logo`, { method: 'POST' })).status, 405)
     } finally {
       s.close()
     }

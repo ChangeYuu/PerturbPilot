@@ -4,12 +4,15 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { auditRun } from './audit.js'
 import { CONTROL_ACTIONS, RunError } from './run.js'
 
 export const PANEL_ROUTE = '/perturbpilot/api'
 const SESSION_ID = /^[A-Za-z0-9_.:-]{1,200}$/
 const MAX_BODY = 4096
+// 左上角和新会话中间的 logo，由 client.js 的品牌插槽显示。
+export const LOGO_PATH = fileURLToPath(new URL('../assets/logo.png', import.meta.url))
 
 /** 面板显示用的视图：状态、每轮的推荐 / 选择 / 读数 / 审计、读数排名、假设（含历次更新）、笔记、分析、最近的事件。 */
 export function panelView(run, { events = 40 } = {}) {
@@ -102,6 +105,7 @@ export function listRuns(runsDir) {
  *   GET  <PANEL_ROUTE>/sessions/<会话 id>          → { run: 视图 | null }
  *   POST <PANEL_ROUTE>/sessions/<会话 id>/control  body { action } → { run: 视图 }
  *   GET  <PANEL_ROUTE>/status                      → 插件配置和服务是否连得上（设置页用）
+ *   GET  <PANEL_ROUTE>/logo                        → assets/logo.png
  * POST 要求 content-type 为 application/json 且带 x-perturbpilot 头，别的网页没法跨站伪造（会触发预检，这里不答预检）。
  * @param deps.getRun - (sessionId) => Run | undefined
  * @param deps.control - (sessionId, action) => void，执行控制并在需要时推动回合
@@ -113,6 +117,11 @@ export function createPanelHandler({ getRun, control, listRuns = () => [], statu
     try {
       const url = new URL(req.url, 'http://localhost')
       const rest = url.pathname.slice(PANEL_ROUTE.length).split('/').filter(Boolean)
+      if (rest.length === 1 && rest[0] === 'logo') {
+        if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' })
+        res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-cache' })
+        return res.end(readFileSync(LOGO_PATH))
+      }
       if (rest.length === 1 && (rest[0] === 'sessions' || rest[0] === 'status')) {
         if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' })
         return send(res, 200, rest[0] === 'sessions' ? { runs: listRuns() } : await status())
