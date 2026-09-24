@@ -1,35 +1,98 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
 import { Run, RunError } from '../lib/run.js'
-import { fakeServices } from './fake-services.js'
+import { fakeServices as makeServices } from './fake-services.js'
 
 let dir
+let packages
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'pp-run-'))
+  packages = []
 })
-afterEach(() => rmSync(dir, { recursive: true, force: true }))
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true })
+  for (const p of packages) rmSync(p, { recursive: true, force: true })
+})
+
+function fakeServices(options) {
+  const services = makeServices(options)
+  packages.push(services.packageDir)
+  return services
+}
 
 const readJsonl = (path) => readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
 const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'))
 
-async function playRound(run, services, { replace = [] } = {}) {
+/** 照推荐交一轮；extra = [{id, source, reason}] 把推荐的最后几个换成推荐以外的候选。 */
+async function playRound(run, services, { extra = [] } = {}) {
   const d = await run.getDecision(services)
-  const outs = new Set(replace.map((x) => x.out))
-  const accept = d.recommendations.map((x) => x.id).filter((id) => !outs.has(id))
-  return run.submitSelection({ accept, replace }, services)
+  const recs = d.recommendations.map((x) => x.id)
+  const batch = [...recs.slice(0, recs.length - extra.length), ...extra.map((x) => x.id)]
+  const groups = extra.map((x) => ({ ids: [x.id], source: x.source, reason: x.reason }))
+  return run.submitSelection({ batch, groups }, services)
 }
 
-test('start resets both services and writes the task card', async () => {
+test('start hands the task package to the decision module, resets the oracle and writes the card', async () => {
   const services = fakeServices()
   const run = await Run.start({ dir, runId: 's1', services })
-  assert.deepEqual(services.calls.map((c) => c.name), ['task', 'manifest', 'resetOracle', 'restore'])
-  assert.equal(services.calls[3].body.snapshot.observations.length, 0)
-  assert.equal(readJson(join(dir, 'task.json')).candidates.length, 20)
+  assert.deepEqual(services.calls.map((c) => c.name), ['tasks', 'manifest', 'init', 'resetOracle'])
+  assert.equal(services.calls[2].body.package_dir, services.packageDir)
+  assert.equal(services.calls[2].body.method, undefined) // 没指定方法就用决策模块的默认
+  assert.deepEqual(services.calls[3].body, { task_id: 'fake-task', batch_size: 3 })
+  assert.equal(readJson(join(dir, 'task.json')).n_candidates, 20)
+  assert.equal(run.state.format, 2)
+  assert.equal(run.state.candidateIds.length, 20)
+  assert.deepEqual(run.state.decision, { name: 'fake', version: 'fake/0', method: 'coverage', inputs_used: [] })
   assert.equal(run.state.round, 1)
   assert.equal(run.nextRoundToDrive(), 1)
+  const started = readJsonl(join(dir, 'events.jsonl'))[0]
+  assert.equal(started.type, 'run/started')
+  assert.equal(started.data.method, 'coverage')
+  assert.deepEqual(started.data.budget, { rounds: 3, batch_size: 3, allow_repeats: true })
+  assert.deepEqual(run.state.setup, { method: null, package_budget: { rounds: 3, batch_size: 3, allow_repeats: true }, proposal: null })
+})
+
+test('start takes the chosen task, method and budget, and the oracle gets the task id each round', async () => {
+  const services = fakeServices({ otherTask: true })
+  const proposal = { task_id: 'other-task', method: 'coverage', rounds: 2, batch_size: 4, rationale: '用户要少跑几轮' }
+  const run = await Run.start({ dir, runId: 's1', services, setup: { task_id: 'other-task', method: 'coverage', rounds: 2, batch_size: 4 }, proposal })
+  assert.equal(services.calls[2].body.method, 'coverage')
+  assert.deepEqual(services.calls[3].body, { task_id: 'other-task', batch_size: 4 })
+  assert.equal(run.state.task.task_id, 'other-task')
+  assert.deepEqual(run.state.task.budget, { rounds: 2, batch_size: 4, allow_repeats: true })
+  assert.deepEqual(run.state.setup.package_budget, { rounds: 3, batch_size: 3, allow_repeats: true })
+  assert.equal(run.state.setup.proposal, proposal)
+  assert.equal(readJson(join(dir, 'task.json')).budget.rounds, 3) // task.json 是任务包的原卡片
+  const started = readJsonl(join(dir, 'events.jsonl'))[0].data
+  assert.deepEqual([started.budget.rounds, started.package_budget.rounds, started.requested_method, started.proposed], [2, 3, 'coverage', true])
+  assert.match(run.brief(), /共 2 轮，每轮正好 4 个/)
+  assert.match(run.brief(), /任务包原定 3 轮、每轮 3 个/)
+  const res = await playRound(run, services)
+  assert.equal(res.results.length, 4)
+  assert.equal(services.calls.find((c) => c.name === 'run').body.task_id, 'other-task')
+})
+
+test('start checks the setup and lists every problem at once', async () => {
+  const services = fakeServices({ otherTask: true })
+  const start = (setup) => Run.start({ dir, runId: 's1', services, setup })
+  await assert.rejects(start({}), /有 2 个任务包，要指定 task_id/)
+  await assert.rejects(start({ task_id: 'nope' }), /没有 task_id 为 nope 的任务包；可选：fake-task, other-task/)
+  await assert.rejects(
+    start({ task_id: 'fake-task', method: 'bogus', rounds: 51, batch_size: 21 }),
+    (e) => /没有方法 bogus/.test(e.message) && /rounds 要是 1–50/.test(e.message) && /batch_size 要是 1–20/.test(e.message),
+  )
+  await assert.rejects(start({ task_id: 'fake-task', rounds: 1.5 }), /rounds 要是 1–50 的整数/)
+  await assert.rejects(start({ task_id: 'fake-task', method: 'gp-ucb' }), /方法 gp-ucb 需要的输入任务包里没有：candidate_features\/embedding/)
+  assert.equal(services.calls.filter((c) => c.name === 'init').length, 0)
+})
+
+test('start refuses a decision module whose required inputs the task package lacks', async () => {
+  const services = fakeServices({ required: [{ role: 'candidate_features', modality: 'embedding' }] })
+  await assert.rejects(Run.start({ dir, runId: 's1', services }), /candidate_features\/embedding/)
+  assert.equal(services.calls.filter((c) => c.name === 'init').length, 0)
 })
 
 test('full closed loop: rounds advance, audit passes, records written', async () => {
@@ -38,19 +101,26 @@ test('full closed loop: rounds advance, audit passes, records written', async ()
   for (let r = 1; r <= 3; r++) {
     run.markDriven(r)
     if (r > 1) run.updateHypothesis({ text: `假设${r}`, status: 'proposed', cites: [run.state.rounds[r - 1].submission.batch[0]] })
-    const res = await playRound(run, services, r === 2 ? { replace: [{ out: 'G004', in: 'G000', reason_type: 'data_quality', reason: '复测 G000' }] } : {})
+    const res = await playRound(run, services, r === 2 ? { extra: [{ id: 'G000', source: 'data_quality', reason: '复测 G000' }] } : {})
     assert.equal(res.round, r)
   }
   assert.equal(run.state.status, 'finished')
   assert.equal(run.state.observations.length, 9)
-  // 第 2 轮换进来的 G000 是第二次测
-  assert.equal(run.state.rounds[2].results.find((x) => x.id === 'G000').replicate, 1)
+  // 第 2 轮推荐以外进来的 G000 是第二次测
+  const again = run.state.rounds[2].results.find((x) => x.id === 'G000')
+  assert.equal(again.replicate, 1)
+  assert.equal(again.readout.score, 0.01)
+  const sub = run.state.rounds[2].submission
+  assert.deepEqual(sub.outside, ['G000'])
+  assert.equal(sub.from_recommendation, 2)
+  assert.deepEqual(sub.by_source, { decision: 2, data_quality: 1 })
 
   const audit = readJson(join(dir, 'audit.json'))
   const byRound = Object.fromEntries(audit.rounds.map((x) => [x.round, x.checks]))
   for (const r of [1, 2, 3]) {
     assert.equal(byRound[r].decision_called.result, 'pass')
     assert.equal(byRound[r].selection_submitted.result, 'pass')
+    assert.equal(byRound[r].literature_backed.result, 'n/a')
     assert.equal(byRound[r].receipt_complete.result, 'pass')
   }
   assert.equal(byRound[1].state_carried.result, 'pass')
@@ -70,7 +140,21 @@ test('full closed loop: rounds advance, audit passes, records written', async ()
   assert.equal(readJson(join(dir, 'decision', '02-snapshot.json')).state_version, 2)
   assert.equal(readJson(join(dir, 'oracle', '03-run.json')).results.length, 3)
   assert.equal(readJson(join(dir, 'memory.json')).hypotheses.length, 2)
+  assert.equal(run.state.rounds[1].proposals[0].file, 'decision/01-propose-1.json')
+  assert.equal(readJson(join(dir, 'decision', '01-propose-1.json')).pool.length, 20)
   assert.throws(() => run.writeNote({ text: 'x', cites: [] }), RunError)
+})
+
+test('the decision is asked for the batch plus alternatives and returns the method and numbers', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  const d = await run.getDecision(services)
+  assert.equal(services.calls.at(-1).body.k, 3 + 8)
+  assert.equal(d.method, 'coverage')
+  assert.equal(d.batch_size, 3)
+  assert.equal(d.rounds, 3)
+  assert.deepEqual(d.recommendations[0], { id: 'G000', rank: 1, score: 1 })
+  assert.equal(d.alternatives.length, 8)
 })
 
 test('audit fails uncited readings once the run is stopped early', async () => {
@@ -85,22 +169,61 @@ test('audit fails uncited readings once the run is stopped early', async () => {
   assert.equal(checks.cited_later.result, 'fail')
 })
 
-test('submission is rejected without a decision call or with bad coverage', async () => {
+test('submission is rejected without a decision call, with the wrong size or without reasons', async () => {
   const services = fakeServices()
   const run = await Run.start({ dir, runId: 's1', services })
-  await assert.rejects(run.submitSelection({ accept: ['G000'], replace: [] }, services), /pp_get_decision/)
+  const submit = (batch, groups = []) => run.submitSelection({ batch, groups }, services)
+  await assert.rejects(submit(['G000', 'G001', 'G002']), /pp_get_decision/)
   await run.getDecision(services)
-  await assert.rejects(run.submitSelection({ accept: ['G000'], replace: [] }, services), /既没有 accept/)
-  await assert.rejects(run.submitSelection({ accept: ['G000', 'G001', 'G009'], replace: [] }, services), /不在本轮推荐/)
+  await assert.rejects(submit(['G000', 'G001']), /正好交 3 个/)
+  await assert.rejects(submit(['G000', 'G001', 'G002', 'G003']), /正好交 3 个/)
+  await assert.rejects(submit(['G000', 'G001', 'G019']), /G019 不在本轮推荐里，要放进一个写了理由的组/)
+  await assert.rejects(submit(['G000', 'G001', 'G019'], [{ ids: ['G019'], source: 'decision', reason: 'x' }]), /source 不能是 decision/)
+  await assert.rejects(submit(['G000', 'G001', 'G001']), /重复/)
   await assert.rejects(
-    run.submitSelection({ accept: ['G000', 'G001'], replace: [{ out: 'G002', in: 'G001', reason_type: 'exploration', reason: 'x' }] }, services),
-    /重复/,
+    submit(['G000', 'G001', 'NOPE'], [{ ids: ['NOPE', 'G005'], source: 'bogus', reason: '' }]),
+    (e) => /NOPE 不是候选/.test(e.message) && /source 必须是/.test(e.message) && /缺少理由/.test(e.message) && /G005 不在 batch 里/.test(e.message),
   )
   await assert.rejects(
-    run.submitSelection({ accept: ['G000', 'G001'], replace: [{ out: 'G002', in: 'NOPE', reason_type: 'bogus', reason: '' }] }, services),
-    (e) => /不是候选/.test(e.message) && /reason_type/.test(e.message) && /缺少理由/.test(e.message),
+    submit(['G000', 'G001', 'G019'], [{ ids: ['G019'], source: 'literature', reason: 'a' }, { ids: ['G019'], source: 'analysis', reason: 'b' }]),
+    /不止一个组/,
   )
   assert.equal(services.calls.filter((c) => c.name === 'run').length, 0)
+  // 推荐里的候选也可以分组写理由；推荐以外的放进非 decision 的组就合法。
+  const res = await submit(['G000', 'G001', 'G019'], [
+    { ids: ['G000', 'G001'], source: 'decision', reason: '照推荐' },
+    { ids: ['G019'], source: 'prior_knowledge', reason: '已知通路成员' },
+  ])
+  assert.equal(res.results.length, 3)
+  assert.deepEqual(res.results.map((x) => x.recommended), [true, true, false])
+})
+
+test('without repeats a measured candidate is refused and the last batch shrinks to what is left', async () => {
+  const services = fakeServices({ n: 5, batchSize: 3, rounds: 3, allowRepeats: false })
+  const run = await Run.start({ dir, runId: 's1', services })
+  await playRound(run, services)
+  await run.getDecision(services)
+  assert.equal(run.expectedBatchSize(), 2)
+  await assert.rejects(run.submitSelection({ batch: ['G003', 'G000'], groups: [{ ids: ['G000'], source: 'data_quality', reason: '复测' }] }, services), /不能重复测/)
+  const res = await run.submitSelection({ batch: ['G003', 'G004'], groups: [] }, services)
+  assert.deepEqual(res.next, { finished: true })
+  assert.equal(run.state.status, 'finished')
+  const finished = readJsonl(join(dir, 'events.jsonl')).find((e) => e.type === 'run/finished')
+  assert.deepEqual(finished.data, { rounds: 2, reason: 'candidates_exhausted' })
+})
+
+test('empty readouts are rejected by the decision module and the receipt still checks out', async () => {
+  const services = fakeServices({ empty: ['G001'] })
+  const run = await Run.start({ dir, runId: 's1', services })
+  const res = await playRound(run, services)
+  assert.deepEqual(res.empty, ['G001'])
+  assert.equal(res.problem, null)
+  assert.equal(res.results.find((x) => x.id === 'G001').readout, null)
+  assert.equal(run.state.status, 'active')
+  const checks = readJson(join(dir, 'audit.json')).rounds[0].checks
+  assert.equal(checks.receipt_complete.result, 'pass')
+  assert.deepEqual(checks.receipt_complete.empty, ['G001'])
+  assert.match(run.brief(), /其中 1 次读数为空/)
 })
 
 test('citations must refer to measured candidates', async () => {
@@ -124,6 +247,63 @@ test('receipt mismatch pauses the run and fails the audit', async () => {
   const audit = readJson(join(dir, 'audit.json'))
   assert.equal(audit.rounds[0].checks.receipt_complete.result, 'fail')
   assert.deepEqual(audit.rounds[0].checks.receipt_complete.missing, ['G001'])
+})
+
+test('retrievals are recorded with their full text and back literature reasons in the audit', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  const literature = [{ id: 'G019', source: 'literature', reason: '文献说 G019 在同一通路' }]
+
+  // 第 1 轮：说依据文献，但没查过 → 审计不通过（只审不拦，提交照常进行）。
+  await playRound(run, services, { extra: literature })
+  let checks = readJson(join(dir, 'audit.json')).rounds[0].checks
+  assert.equal(checks.literature_backed.result, 'fail')
+
+  // 第 2 轮：先查（一次出错的不算），再提交；检索结果里提到了 G018 → 通过。
+  // DSH 的 tool/call 事件里参数是 JSON 字符串，记录时解析成对象。
+  run.recordRetrieval({ name: 'web_fetch', arguments: '{"url": "https://example.org/x"}' }, { message: { isError: true, content: [{ type: 'text', text: '404 G018' }] }, meta: { statusCode: 404 } })
+  const search = run.recordRetrieval(
+    { name: 'web_search', arguments: JSON.stringify({ queries: ['G018 pathway'] }) },
+    { message: { isError: false, content: [{ type: 'text', text: '搜索结果：g018 属于同一通路；G0011 无关' }] }, meta: { sources: [{ url: 'https://example.org/a', title: 'A' }] } },
+  )
+  assert.equal(search.id, 'R2')
+  await playRound(run, services, { extra: [{ id: 'G018', source: 'literature', reason: '查到 G018 的报道' }] })
+  checks = readJson(join(dir, 'audit.json')).rounds[1].checks
+  assert.deepEqual(checks.literature_backed, { result: 'pass', groups: 1, retrievals: ['R2'], unbacked: [], unlabelled: [] })
+
+  const saved = readJson(join(dir, 'retrieval', 'R2.json'))
+  assert.equal(saved.text, '搜索结果：g018 属于同一通路；G0011 无关')
+  assert.deepEqual(saved.arguments, { queries: ['G018 pathway'] })
+  assert.equal(saved.round, 2)
+  const events = readJsonl(join(dir, 'events.jsonl'))
+  const fetched = events.find((e) => e.type === 'retrieval/fetched')
+  assert.deepEqual(fetched.data, { id: 'R1', url: 'https://example.org/x', status: 404, chars: 8, is_error: true, file: 'retrieval/R1.json' })
+  const searched = events.find((e) => e.type === 'retrieval/searched')
+  assert.deepEqual(searched.data.queries, ['G018 pathway'])
+  assert.deepEqual(searched.data.results, [{ title: 'A', url: 'https://example.org/a' }])
+  assert.equal(searched.source, 'model')
+  assert.equal(run.ledger().retrievals.length, 2)
+
+  // 第 3 轮：查过，但检索内容里没有 G017（G001 只是 G0011 的一部分，不算提到）；
+  // 照推荐选进来的 G000 被提到了，记成没标文献的参考。审计从磁盘上的检索记录重新读全文。
+  run.recordRetrieval({ name: 'web_search', arguments: { queries: ['x'] } }, { message: { isError: false, content: [{ type: 'text', text: 'G000 and G0011 only' }] }, meta: {} })
+  const reloaded = Run.load(dir, 's1')
+  await playRound(reloaded, services, { extra: [{ id: 'G017', source: 'literature', reason: '文献说 G017 有关' }] })
+  checks = readJson(join(dir, 'audit.json')).rounds[2].checks
+  assert.equal(checks.literature_backed.result, 'fail')
+  assert.deepEqual(checks.literature_backed.unbacked, ['G017'])
+  assert.deepEqual(checks.literature_backed.retrievals, ['R3'])
+  const batch = reloaded.state.rounds[3].submission.batch
+  assert.deepEqual(checks.literature_backed.unlabelled, batch.includes('G000') ? ['G000'] : [])
+})
+
+test('literature check applies when a round searched but claimed no literature', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  run.recordRetrieval({ name: 'web_search', arguments: '{"queries": ["G000"]}' }, { message: { isError: false, content: [{ type: 'text', text: 'about G000' }] }, meta: {} })
+  await playRound(run, services)
+  const check = readJson(join(dir, 'audit.json')).rounds[0].checks.literature_backed
+  assert.deepEqual(check, { result: 'pass', groups: 0, retrievals: ['R1'], unbacked: [], unlabelled: ['G000'] })
 })
 
 test('driver bookkeeping: steer limit, stall, pause and resume', async () => {
@@ -162,13 +342,28 @@ test('a run reloads from disk with the same state', async () => {
   assert.deepEqual(seqs, seqs.map((_, i) => i + 1))
 })
 
-test('brief mentions round, synthetic flag and readings', async () => {
+test('a legacy run is recognised and not opened', () => {
+  writeFileSync(join(dir, 'state.json'), JSON.stringify({ runId: 'old', task: { max_rounds: 3 } }), 'utf8')
+  assert.equal(Run.exists(dir), true)
+  assert.equal(Run.isLegacy(dir), true)
+  assert.throws(() => Run.load(dir, 'old'), /旧格式/)
+})
+
+test('brief describes the task generically and shows the objective field', async () => {
   const services = fakeServices()
   const run = await Run.start({ dir, runId: 's1', services })
-  assert.match(run.brief(), /第 1\/3 轮：还没调用 pp_get_decision/)
-  assert.match(run.brief(), /合成数据/)
+  let text = run.brief()
+  assert.match(text, /第 1\/3 轮：还没调用 pp_get_decision/)
+  assert.match(text, /合成数据/)
+  assert.match(text, /扰动：knockout，CRISPR 敲除/)
+  assert.match(text, /目标：找效应最强的基因（看 score，越高越好）/)
+  assert.match(text, /读数字段：score（效应（有符号））；absolute_effect/)
+  assert.match(text, /共 3 轮，每轮正好 3 个；候选 20 个，可以重复测/)
+  assert.match(text, /方法 coverage，没用任何候选特征/)
+  assert.match(text, /任务包的数据：expr（candidate_features\/expression，data\/expr\.csv，pp_run_python 的目录里也有）/)
   await playRound(run, services)
-  const text = run.brief()
+  text = run.brief()
   assert.match(text, /第 2\/3 轮/)
-  assert.match(text, /上一轮（第 1 轮）读数：G000=0，G001=0\.8415/)
+  assert.match(text, /上一轮（第 1 轮）测了 3 个，最好的：G002=0\.9093，G001=0\.8415，G000=0/)
+  assert.match(text, /G002 score=0\.9093（第 1 轮）/)
 })

@@ -1,8 +1,20 @@
 """启动 oracle 和决策模块两个 HTTP 服务。
 
 用法：
-  python -m ppsvc --seed 0
-  python -m ppsvc --seed 0 --oracle-port 8701 --decision-port 8702
+  python -m ppsvc                                  # 合成任务（种子 0）
+  python -m ppsvc --seed 3 --rounds 8 --batch-size 6
+  python -m ppsvc --task D:\\pp-tasks\\il2 --hidden D:\\pp-tasks-hidden\\il2   # 任务包和它的隐藏数据
+  python -m ppsvc --task <目录> --hidden <目录> --decision coverage
+  python -m ppsvc --tasks D:\\pp-tasks --hidden-root D:\\pp-tasks-hidden      # 目录下的所有任务包
+
+隐藏数据（scores.csv 等）放在任务包外面；给了 --task 就必须给 --hidden。
+--tasks 下每个带 task.json 的子目录是一个任务包，它的隐藏数据是 --hidden-root 下的同名子目录；
+读不了的任务包跳过并打印原因。多个任务时同一时间只跑一个，插件开任务时用 /reset 选。
+
+--decision：默认方法。auto（默认，有嵌入特征用 gp-ucb，否则 coverage）、gp-ucb、coreset、top-uncertain、coverage。
+开任务时 /init 可以另选方法。
+gp-ucb、coreset、top-uncertain 要任务包里有候选特征；coreset 和 top-uncertain 还要装 torch。
+决策模块启动时还没读任务，插件开任务时调 /init 把任务包交给它。
 
 设了环境变量 PERTURBPILOT_SERVICE_TOKEN 时，两个服务都只接受带同一个值的
 x-perturbpilot-token 请求头的请求（插件从同名环境变量读，分析用的 Python 子进程拿不到）。
@@ -13,29 +25,55 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 import threading
+from pathlib import Path
 
-from .decision import GpUcbDecision
+from .decision import METHODS, DecisionService
 from .jsonhttp import make_server
-from .oracle import Oracle, TaskConfig
+from .oracle import Oracle, OracleHub
+from .task import Package, write_synthetic_package
 
 TOKEN_ENV = "PERTURBPILOT_SERVICE_TOKEN"
 
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="ppsvc")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--task", help="任务包目录；不给就生成合成任务")
+    p.add_argument("--hidden", help="任务包的隐藏数据目录（在任务包外面）；给了 --task 就必须给")
+    p.add_argument("--tasks", help="放多个任务包的目录，每个子目录一个")
+    p.add_argument("--hidden-root", help="放隐藏数据的目录，子目录和 --tasks 下的任务包同名；给了 --tasks 就必须给")
+    p.add_argument("--decision", choices=METHODS, default="auto")
+    p.add_argument("--seed", type=int, default=0, help="合成任务的种子")
+    p.add_argument("--rounds", type=int, default=10, help="合成任务的轮数")
+    p.add_argument("--batch-size", type=int, default=6, help="合成任务每轮的批量")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--oracle-port", type=int, default=8701)
     p.add_argument("--decision-port", type=int, default=8702)
-    p.add_argument("--rounds", type=int, default=TaskConfig.max_rounds)
-    p.add_argument("--batch-size", type=int, default=TaskConfig.batch_size)
     args = p.parse_args(argv)
 
-    cfg = TaskConfig(seed=args.seed, max_rounds=args.rounds, batch_size=args.batch_size)
-    oracle = Oracle(cfg)
-    card = oracle.task.card()
-    decision = GpUcbDecision(card["candidates"], noise_sd=cfg.noise_sd)
+    skipped: list[tuple[str, str]] = []
+    if args.tasks:
+        if args.task or args.hidden:
+            p.error("--tasks does not go with --task/--hidden")
+        if not args.hidden_root:
+            p.error("--tasks needs --hidden-root (the directory with each package's hidden scores)")
+        oracle, skipped = OracleHub.from_dirs(args.tasks, args.hidden_root)
+    elif args.hidden_root:
+        p.error("--hidden-root only goes with --tasks")
+    elif args.task:
+        if not args.hidden:
+            p.error("--task needs --hidden (the directory with the hidden scores, outside the task package)")
+        root, hidden = Path(args.task), Path(args.hidden)
+    else:
+        if args.hidden:
+            p.error("--hidden only goes with --task")
+        root = Path(tempfile.mkdtemp(prefix="pp-synthetic-"))
+        hidden = Path(tempfile.mkdtemp(prefix="pp-synthetic-hidden-"))
+        write_synthetic_package(root, hidden, seed=args.seed, max_rounds=args.rounds, batch_size=args.batch_size)
+    if not args.tasks:
+        oracle = OracleHub([Oracle(Package.load(root), hidden)])
+    decision = DecisionService(args.decision)
 
     token = os.environ.get(TOKEN_ENV) or None
     servers = [
@@ -44,8 +82,13 @@ def main(argv: list[str] | None = None) -> None:
     ]
     for s in servers:
         threading.Thread(target=s.serve_forever, daemon=True).start()
-    print(f"oracle   http://{args.host}:{args.oracle_port}  ({card['task_id']}, synthetic)", flush=True)
-    print(f"decision http://{args.host}:{args.decision_port}", flush=True)
+    print(f"oracle   http://{args.host}:{args.oracle_port}  ({len(oracle.oracles)} task(s))", flush=True)
+    for tid, o in oracle.oracles.items():
+        kind = "synthetic" if o.card.get("synthetic") else "task package"
+        print(f"         {tid}: {kind}, {len(o.package.ids)} candidates, {o.package.root}", flush=True)
+    for name, why in skipped:
+        print(f"warning: skipped task package {name}: {why}", file=sys.stderr, flush=True)
+    print(f"decision http://{args.host}:{args.decision_port}  (method {args.decision})", flush=True)
     if token is None:
         print(f"warning: {TOKEN_ENV} is not set, the services accept requests from anyone on this machine", file=sys.stderr, flush=True)
     try:

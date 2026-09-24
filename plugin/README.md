@@ -2,17 +2,22 @@
 
 PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 的一个会话里：
 
-- 一个会话跑一个任务，一轮就是一个 DSH turn。本轮提交后，框架用 followup 开下一轮。
-- agent 调 `pp_get_decision` 拿决策模块的推荐，再用 `pp_submit_selection` 接受或替换（替换要写理由）。之后由框架把这一批交给 oracle 测量，并把读数回灌给决策模块。
+- 一个会话跑一个任务，由用户在右侧栏的 PerturbPilot 面板上确认开始。开始的方式有两种：直接在面板上选任务包、决策方法和预算；或者在对话里用自然语言说想发现什么（可以很模糊），agent 先用 `pp_list_tasks` 看有哪些任务包，用 DSH 的 `ask_user_question` 问清楚、给推荐，再用 `pp_propose_task` 提议一个设置，面板上出现填好的表单和 agent 的理由，用户确认后才开始。没有对得上的任务包时，agent 要照实说哪里对不上、列出最接近的几个，不许编一个任务。一轮就是一个 DSH turn；开始后框架开第 1 轮，本轮提交后再用 followup 开下一轮。
+- 开始时可以改的：任务包（`task_id`）、决策方法（决策模块 manifest 里列的方法，任务包缺某个方法要的特征时不能选）、轮数（1–50）、每轮个数（1–候选数）。都不填就用任务包的预算和决策模块的默认方法。开始后不能再改；要换就新开一个会话。
+- 决策模块和 oracle 同一时间只跑一个任务：别的会话里还有没结束（进行中或已暂停）的任务时，不能开新任务。
+- 每轮 agent 必须先调 `pp_get_decision` 拿决策模块的推荐（带方法名和各候选的数值），再用 `pp_submit_selection` 直接交一批 `batch` 和分组理由 `groups`。批量必须正好等于任务的 `batch_size`；不许重复测时，候选不够一整批的最后一轮交剩下的全部。推荐以外的候选必须放进一个写了理由的组，`source` 取 decision / prior_knowledge / literature / analysis / hypothesis_test / exploration / data_quality，推荐以外的不能标 decision。之后由框架把这一批交给 oracle 测量，并把读数回灌给决策模块。
+- 任务是通用的：扰动方式、读数字段、目标（在哪个字段上取高或取低）、预算、候选表和公开数据都来自任务包（见下面“任务包”）。读数可以有多个字段，也可以为空（空读数照常记录，决策模块在回执里拒收）。
+- 查文献：“科学发现”模式挂了 DSH 的 `web_search` / `web_fetch`。插件只记录这些调用（`retrieval/`），不拦截；审计里的“文献核对”事后检查：写了 `literature` 理由的候选，本轮提交前成功的检索结果全文里有没有提到它的 id。
 - 科学状态（读数、假设、笔记）存在会话之外，每一步通过 `systemPrompt.context` 注入 `<perturbpilot_state>` 简报，所以上下文压缩后也不会丢。
 - 本轮快结束还没提交时，框架最多催 `maxSteers` 次；催完仍没交，就暂停等人处理。
-- 浏览器面板：DSH web 端右侧栏里的 “PerturbPilot 任务” 页（点右侧栏的 “+” 打开），每 2 秒刷新本会话的任务状态、各轮推荐 / 选择 / 读数 / 审计、读数排名、假设、笔记和最近事件，并有暂停 / 继续 / 结束按钮。对话照常在 DSH 的对话区进行。
-- 科学台账页：左侧栏的 “科学台账” 入口打开一个占满主区的页面。左边列出 `runs/` 下所有任务（最近更新的在前，默认选第一个），右边是选中任务的记录，从上往下：总览（目标、当前最佳、已测多少、agent 改了多少推荐、审计，加一张每轮读数和至今最佳的进展图）；当前结论（每条假设的最新状态，可展开看历次更新）；逐轮记录（每轮一张卡片，按“决策模块推荐 → 分析与判断 → 本轮测的和替换理由 → 读数 → 审计和回执”排）；最后折叠着全部读数排名和最近事件。也有暂停 / 继续 / 结束按钮。
+- 浏览器面板：DSH web 端右侧栏里的 “PerturbPilot 任务” 页（点右侧栏的 “+” 打开），每 2 秒刷新本会话的任务状态、各轮推荐 / 选择 / 读数 / 审计、读数排名、假设、笔记、检索和最近事件，并有暂停 / 继续 / 结束按钮。会话还没有任务时，这一页是开始任务的表单：选任务包（下面显示它的扰动、目标、原定预算和候选数）、决策方法、轮数和每轮个数；agent 提议过的话，表单按提议填好，上面显示提议的理由，按钮是“确认开始”。对话照常在 DSH 的对话区进行。
+- 科学台账页：左侧栏的 “科学台账” 入口打开一个占满主区的页面。左边列出 `runs/` 下所有任务（最近更新的在前，默认选第一个；早期格式的记录标“旧格式”，只列出、点不开），右边是选中任务的记录，从上往下：总览（目标、当前最佳、已测多少、推荐以外的有多少、审计，加一张每轮读数和至今最佳的进展图）；当前结论（每条假设的最新状态，可展开看历次更新）；逐轮记录（每轮一张卡片，按“决策模块推荐 → 分析与判断（含检索） → 本轮测的和分组理由 → 读数 → 审计和回执”排）；最后折叠着全部读数排名和最近事件。也有暂停 / 继续 / 结束按钮。
 - 设置里的 “PerturbPilot” 一页：oracle 和决策模块连不连得上、服务令牌设了没有、插件当前的配置。这一页只读。
-- 数据分析：agent 可以调 `pp_run_python(code, purpose)`，在这次分析自己的目录里跑一段 Python（numpy 可用）。目录里事先导出了 `observations.csv`（id, round, value, replicate）和 `candidates.csv`（id, f0, f1, …）。这个工具不能测量新候选：两个服务都要求 `x-perturbpilot-token` 头，令牌只有框架有，Python 子进程拿到的环境变量是白名单里的那几项，不含令牌和模型密钥。
+- 数据分析：agent 可以调 `pp_run_python(code, purpose)`，在这次分析自己的目录里跑一段 Python（numpy 可用）。目录里事先导出了 `observations.csv`（id, round, replicate, 再加每个读数字段一列，空读数留空）、`candidates.csv`（任务包的候选表原样）、`data/`（任务包里公开的数据文件）和 `decision.csv`（本轮决策模块给的全候选池：id, measured, 再加方法给的数值列）。这个工具不能测量新候选：两个服务都要求 `x-perturbpilot-token` 头，令牌只有框架有，Python 子进程拿到的环境变量是白名单里的那几项，不含令牌和模型密钥。
   - **Windows 上没有沙箱。** 子进程能读写本机文件，包括 oracle 的源码；令牌只防它直接调服务测量。所有代码和输出都记录下来，可以事后查。
-- 对话区里每个 `pp_*` 工具调用显示成卡片：推荐表（预测均值 / 不确定度 / 得分）、本轮接受和替换（带理由）、读数表、假设和笔记，不再是原始 JSON。
-- 专用模式：插件的 bundle patch（`cordis.patch.yml`）只留一个“科学发现”模式。这个模式只有 `pp_*` 工具和上下文压缩，没有 shell、文件读写、子 agent、计划模式、技能，也不读工作区里的 AGENTS.md / CLAUDE.md。web 端自带的 4 个模式、模式选择器、计划模式开关、预设设置页和插件设置页都关掉了。
+- 对话区里每个 `pp_*` 工具调用显示成卡片：任务列表、提议的任务设置和理由、推荐表（按方法给的数值列显示）、本轮提交的批次和分组理由、读数表、假设和笔记，不再是原始 JSON。
+- 新会话页中间的 logo 下面有一段指引，告诉用户可以用自然语言描述想发现什么。
+- 专用模式：插件的 bundle patch（`cordis.patch.yml`）只留一个“科学发现”模式。这个模式只有 `pp_*` 工具、`ask_user_question`、`web_search` / `web_fetch` 和上下文压缩，没有 shell、文件读写、子 agent、计划模式、技能，也不读工作区里的 AGENTS.md / CLAUDE.md。web 端自带的 4 个模式、模式选择器、计划模式开关、预设设置页和插件设置页都关掉了。
 
 ## 运行记录 `runs/<会话 id>/`
 
@@ -22,9 +27,10 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 | `llm_calls.jsonl` | 发往模型服务的原始请求体和响应体，挂在最近一次 `agent/request` 的 turn/step 上。**不存请求头和响应头**，URL 去掉 query |
 | `decision/NN-propose-K.json`、`NN-observe.json`、`NN-snapshot.json` | 决策模块的原始往返：推荐（含全候选池）、回执、可恢复快照 |
 | `oracle/NN-run.json` | oracle 的原始读数 |
-| `state.json` / `memory.json` | 完整运行状态 / 假设和笔记 |
-| `analysis/A<N>/` | 第 N 次 `pp_run_python`：`code.py`、导出的 `observations.csv` 和 `candidates.csv`、`stdout.txt`、`stderr.txt`，以及脚本自己写出的文件。每次对应一条 `analysis/executed` 事件（`id, purpose, exit_code, timed_out, duration_ms, dir, files`） |
-| `audit.json` | 配对审计，每轮检查四项：调用了决策模块 → 提交了选择 → 回执完整且版本号 +1 → 下一轮用的状态版本对得上。另外还查后面是否有假设或笔记引用了本轮的读数 |
+| `state.json` / `memory.json` | 完整运行状态（`format: 2`；没有这个字段的是早期格式，面板标“旧格式”，插件不再打开）/ 假设和笔记 |
+| `retrieval/R<N>.json` | 第 N 次 `web_search` / `web_fetch`：参数、结果全文、所在轮。每次对应一条 `retrieval/searched` 或 `retrieval/fetched` 事件 |
+| `analysis/A<N>/` | 第 N 次 `pp_run_python`：`code.py`、导出的 `observations.csv`、`candidates.csv`、`data/`、`decision.csv`、`stdout.txt`、`stderr.txt`，以及脚本自己写出的文件。每次对应一条 `analysis/executed` 事件（`id, purpose, exit_code, timed_out, duration_ms, dir, files`） |
+| `audit.json` | 配对审计，每轮检查：调用了决策模块 → 提交了选择 → 文献核对（literature 组里的候选 id 按整词、不分大小写，在本轮提交前成功的检索结果全文里找；没找到的列在 `unbacked`，有一个就不通过；本批里没标 literature、但检索里提到了的列在 `unlabelled`，只作参考；本轮既没有 literature 组也没有成功的检索时为 n/a）→ 回执完整（收下的加拒收的对得上本轮读数）且版本号 +1 → 下一轮用的状态版本对得上。另外还查后面是否有假设或笔记引用了本轮的读数 |
 
 ## 启动
 
@@ -38,9 +44,14 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 
 ```powershell
 # 1. 起 oracle 和决策模块（另开一个窗口，常驻）。令牌随便取一个随机串，这个窗口和第 4 步的窗口要设成同一个值
+#    --tasks 指向放任务包的目录（每个带 task.json 的子目录是一个任务包），--hidden-root 指向放隐藏数据的目录（子目录和任务包同名，在任务包外面），两个要一起给；面板和 agent 从这些任务包里选。
+#    只跑一个任务包时也可以用 --task <任务包目录> --hidden <隐藏数据目录>；什么都不加就用合成任务。
+#    --decision 是默认方法（auto / gp-ucb / coreset / top-uncertain / coverage，auto 在任务包有候选特征时用 gp-ucb、没有时用 coverage；coreset 和 top-uncertain 要装 torch），开始任务时可以另选。
 $env:PERTURBPILOT_SERVICE_TOKEN = '<随机串>'
 cd D:\internwork\科学发现智能体系统\services
-..\.venv\Scripts\python -m ppsvc --seed 0
+..\.venv\Scripts\python -m ppsvc --tasks D:\internwork\pp-tasks --hidden-root D:\internwork\pp-tasks-hidden
+# 或：..\.venv\Scripts\python -m ppsvc --task D:\internwork\pp-tasks\il2 --hidden D:\internwork\pp-tasks-hidden\il2
+# 或：..\.venv\Scripts\python -m ppsvc --seed 0
 
 # 2. 密钥只放进环境变量，不写进任何文件；DSH_HOME 用单独的目录，不和日常用的 DSH 共用会话、工作区和设置
 $env:DEEPSEEK_API_KEY = (Get-Content <密钥文件> -Raw).Trim()
@@ -58,9 +69,39 @@ cd D:\internwork\科学发现智能体系统
 & $node $dsh --profile perturbpilot
 ```
 
-面板的数据走同源路由 `/perturbpilot/api`：`GET /sessions` 列出所有任务，`GET /status` 返回配置和服务是否连得上（不返回令牌本身），`/sessions/<会话 id>`（GET 读视图，`POST .../control` 带 `{"action": "pause"|"resume"|"stop"}` 控制；POST 要求 `content-type: application/json` 和 `x-perturbpilot: 1` 头）。只有带 web 服务的组合（web 模板）才挂这个路由。
+面板的数据走同源路由 `/perturbpilot/api`：`GET /sessions` 列出所有任务，`GET /status` 返回配置和服务是否连得上（不返回令牌本身），`GET /tasks` 返回开始任务用的目录 `{tasks: [任务卡片预览，不含 package_dir], active, decision: {name, default_method, methods: {方法: 说明}, requires: {方法: [{role, modality}]}}, limits: {rounds: [1, 50], batch_size: [1, "n_candidates"]}}`，`/sessions/<会话 id>`（GET 读 `{run: 视图, proposal}`，`proposal` 是还没开始时 agent 提的设置 `{task_id, method, rounds, batch_size, rationale, at}`、没有为 null；`POST .../start` 带 `{task_id?, method?, rounds?, batch_size?}` 开始任务，只有一个任务包时 `task_id` 可以省，`POST .../control` 带 `{"action": "pause"|"resume"|"stop"}` 控制；POST 要求 `content-type: application/json` 和 `x-perturbpilot: 1` 头）。只有带 web 服务的组合（web 模板）才挂这个路由。
 
-会话里对 agent 说"开始任务"，它会调用 `pp_start_task`，之后按轮自动推进。随时可以插话；"暂停 / 继续 / 结束"由 agent 调用 `pp_control` 执行。
+新建一个会话，在右侧栏打开 “PerturbPilot 任务” 页，选好任务包、方法和预算后点“开始任务”（或者先在对话里说想发现什么，等 agent 提议后点“确认开始”）：框架检查设置，把任务包和方法交给决策模块、用 `task_id` 和 `batch_size` 重置 oracle、建好 `runs/<会话 id>/`（`state.json` 里的 `task.budget` 是生效的预算，`setup` 记下 `{method, package_budget, proposal}`；`run/started` 事件多了 `package_budget, requested_method, proposed`；`task.json` 仍是任务包的原卡片），然后自动开第 1 轮，之后按轮推进。会话正忙时，第 1 轮等它空下来再开。随时可以在对话里插话；暂停 / 继续 / 结束可以点面板上的按钮，也可以对 agent 说，由它调用 `pp_control`。
+
+### 任务包
+
+任务包是仓库外的一个目录，oracle 和决策模块共同读取。agent 能看到任务包里的所有文件（分析工具会把公开数据拷进分析目录，脚本也能列出任务包），所以隐藏读数单独放在任务包外面的另一个目录，只有 oracle 读：
+
+```
+<任务包>/
+  task.json        公开的任务卡片：task_id, title, synthetic, brief, action, readout.fields, objective{kind, field, direction, description}, budget{rounds, batch_size, allow_repeats}, data_cards
+  candidates.csv   id + 公开属性列
+  data/            data_cards 里列出的公开数据文件；role 为 candidate_features 的表是 id + 数值列，可以只覆盖部分候选
+
+<隐藏数据目录>/     服务启动时用 --hidden 指定；用 --tasks 时是 --hidden-root 下和任务包同名的子目录
+  scores.csv       id + 各读数字段
+  hits.txt         命中名单，可选；运行时不读，事后评估用
+```
+
+gp-ucb、coreset、top-uncertain 要任务包里有候选特征。特征表只覆盖部分候选时，没有特征的候选决策模块不推荐（它给的候选池里这些候选只有 id 和 measured），它们的读数照收但不进模型；它们仍是候选，agent 写理由就能选。每一步的简报里有一行“任务包的数据”，列出数据卡片。
+
+任务包里还有 `hidden/` 目录（早期布局）时，服务拒绝启动；隐藏数据目录在任务包里面时也拒绝。
+
+PerturbTrace（ptbench）的任务可以转换过来（转换器用到 pyyaml，只有它用）：
+
+```powershell
+cd D:\internwork\科学发现智能体系统\services
+..\.venv\Scripts\python -m ppsvc.import_ptbench <ptbench 任务目录> D:\internwork\pp-tasks\<名字> D:\internwork\pp-tasks-hidden\<名字>
+```
+
+基因任务可以加 `--features <STRING Mashup 目录>`（目录里要有 `string_human_genes.txt` 和 `string_human_mashup_vectors_d800.txt`），转换器按 PerturbTrace 基线的做法把 800 维 Mashup 向量用种子 2022 的高斯矩阵投影到 64 维再逐行归一化，写成 `data/string_mashup64.csv` 和一张数据卡片；不在 STRING 里的基因不写特征（不用哈希之类的办法补），任务简报里写明覆盖了多少个。药物等非基因任务不加这个参数，就没有特征。
+
+转换只搬可以给 agent 看的字段；数据集来源、原始列名、命中名单都不进 `task.json`，读数表和命中名单写进第三个参数给的隐藏数据目录。任务包和隐藏数据目录都不要提交进仓库。
 
 ### 配置
 

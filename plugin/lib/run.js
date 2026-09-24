@@ -1,14 +1,20 @@
-// 一次任务（run）的科学状态：轮次、决策模块的推荐、agent 的选择、读数、假设和笔记。
+// 一次任务（run）的科学状态：轮次、决策模块的推荐、agent 的选择、读数、假设、笔记和检索记录。
 // 这里不依赖 DSH，工具和回合驱动都只是调用这里的方法；状态每次变动都落盘到 runs/<run_id>/。
+// 任务的形态（做什么扰动、读数有哪些字段、目标是什么、能不能重复测）都来自任务卡片，这里不写死。
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { auditRun } from './audit.js'
+import { auditRun, checkReceipt } from './audit.js'
 import { RunRecorder, roundFile } from './records.js'
+import { checkSetup } from './setup.js'
+import { lowerIsBetter, objectiveText, objectiveValue, readCandidateIds } from './task.js'
 
-export const REASON_TYPES = ['hypothesis_test', 'exploration', 'data_quality', 'other']
+/** 一组候选被选进来的依据。decision = 照决策模块的推荐。 */
+export const SOURCES = ['decision', 'prior_knowledge', 'literature', 'analysis', 'hypothesis_test', 'exploration', 'data_quality']
 export const HYPOTHESIS_STATUSES = ['proposed', 'supported', 'weakened', 'rejected']
 export const CONTROL_ACTIONS = ['pause', 'resume', 'stop']
+export const RETRIEVAL_TOOLS = ['web_search', 'web_fetch']
+export const STATE_FORMAT = 2
 const ALTERNATIVES = 8
 
 export class RunError extends Error {}
@@ -18,26 +24,45 @@ export class Run {
     return existsSync(join(dir, 'state.json'))
   }
 
-  static load(dir, runId) {
-    const recorder = new RunRecorder(dir, runId)
-    return new Run(recorder, recorder.readJson('state.json'))
+  /** 早期版本（读数只有一个 value、按 accept/replace 提交）留下的记录：只列出，不再打开。 */
+  static isLegacy(dir) {
+    try {
+      return JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).format !== STATE_FORMAT
+    } catch {
+      return false
+    }
   }
 
-  static async start({ dir, runId, services, signal }) {
-    const card = await services.task(signal)
+  static load(dir, runId) {
+    const recorder = new RunRecorder(dir, runId)
+    const state = recorder.readJson('state.json')
+    if (state.format !== STATE_FORMAT) throw new RunError('这个会话里是旧格式的任务记录，不能继续；新开一个会话再开始任务。')
+    return new Run(recorder, state)
+  }
+
+  /**
+   * 开始一次任务。setup = { task_id, method, rounds, batch_size }（都可以省略，见 setup.js），
+   * proposal 是 agent 用 pp_propose_task 提的、用户确认前还在等的那份提议（没有就省略），原样记进 state.setup。
+   */
+  static async start({ dir, runId, services, setup = {}, proposal = null, signal }) {
+    const { tasks } = await services.tasks(signal)
     const manifest = await services.manifest(signal)
-    // 服务进程里可能残留上一次任务的状态，开跑前清空：oracle 的重复测量计数、决策模块的观测。
-    await services.resetOracle({}, signal)
-    await services.restore({ snapshot: { decision_version: manifest.version, state_version: 0, observations: [] } }, signal)
+    const { card, method, budget } = checkSetup(tasks, manifest, setup)
+    // /init 把任务包交给决策模块并清空它的观测；oracle 切到这个任务、定本次的批量，清空重复测量计数。
+    const init = await services.init({ task: card, package_dir: card.package_dir, ...(method ? { method } : {}) }, signal)
+    await services.resetOracle({ task_id: card.task_id, batch_size: budget.batch_size }, signal)
+    const candidateIds = readCandidateIds(card.package_dir)
+    if (candidateIds.length !== card.n_candidates) throw new RunError('任务包的 candidates.csv 和 oracle 报的候选数对不上')
 
     const recorder = new RunRecorder(dir, runId)
     recorder.writeJson('task.json', card)
-    const { candidates, ...rest } = card
     const state = {
+      format: STATE_FORMAT,
       runId,
-      task: { ...rest, n_candidates: candidates.length },
-      candidateIds: candidates.map((c) => c.id),
-      decision: { name: manifest.name, version: manifest.version },
+      task: { ...card, budget },
+      setup: { method, package_budget: card.budget, proposal },
+      candidateIds,
+      decision: { name: manifest.name, version: init.decision_version, method: init.method, inputs_used: init.inputs_used },
       status: 'active',
       round: 1,
       lastDrivenRound: 0,
@@ -46,15 +71,22 @@ export class Run {
       hypotheses: [],
       notes: [],
       citations: [],
+      retrievals: [],
     }
     const run = new Run(recorder, state)
     recorder.event('run/started', 'framework', 1, {
       task_id: card.task_id,
       synthetic: card.synthetic,
-      max_rounds: card.max_rounds,
-      batch_size: card.batch_size,
-      decision_version: manifest.version,
-      oracle_task: card.task_id,
+      action: card.action.type,
+      objective: card.objective,
+      budget,
+      package_budget: card.budget,
+      n_candidates: card.n_candidates,
+      decision_version: init.decision_version,
+      method: init.method,
+      inputs_used: init.inputs_used,
+      requested_method: method,
+      proposed: proposal !== null,
     })
     run.save()
     return run
@@ -64,6 +96,11 @@ export class Run {
     this.recorder = recorder
     this.state = state
     this.candidateSet = new Set(state.candidateIds)
+    this.retrievalTexts = new Map() // 检索编号 -> 结果全文；检索记录写了就不再变
+  }
+
+  get budget() {
+    return this.state.task.budget
   }
 
   get closed() {
@@ -79,39 +116,66 @@ export class Run {
     if (this.closed) throw new RunError(`任务已${this.state.status === 'finished' ? '完成' : '停止'}，不能再操作。`)
   }
 
+  measuredIds() {
+    return new Set(this.state.observations.map((o) => o.id))
+  }
+
+  /** 本轮必须交几个：正好 batch_size；不许重复测时，未测的候选不够了就是剩下的全部。 */
+  expectedBatchSize() {
+    const k = this.budget.batch_size
+    if (this.budget.allow_repeats) return k
+    return Math.min(k, this.state.candidateIds.length - this.measuredIds().size)
+  }
+
+  /** 最近一次推荐的原始文件（相对运行目录，用 /），分析工作区导出 decision.csv 用。 */
+  latestProposalFile() {
+    for (let r = this.state.round; r >= 1; r--) {
+      const file = this.state.rounds[r]?.proposals.at(-1)?.file
+      if (file) return file
+    }
+    return null
+  }
+
   // ---- 决策模块 ----
 
   async getDecision(services, signal) {
     this.requireOpen()
     const r = this.state.round
-    const k = this.state.task.batch_size
+    const k = this.expectedBatchSize()
     const proposal = await services.propose({ round: r, k: k + ALTERNATIVES }, signal)
     const rec = this.roundRecord(r)
     const index = rec.proposals.length + 1
-    this.recorder.writeJson(join('decision', roundFile(`propose-${index}`, r)), proposal)
+    const name = roundFile(`propose-${index}`, r)
+    this.recorder.writeJson(join('decision', name), proposal)
     const recommendations = proposal.recommendations.slice(0, k)
     const alternatives = proposal.recommendations.slice(k)
     rec.proposals.push({
       at: new Date().toISOString(),
+      method: proposal.method,
       state_version: proposal.state_version,
       n_observations: proposal.n_observations,
       recommendations: recommendations.map((x) => x.id),
       alternatives: alternatives.map((x) => x.id),
+      file: `decision/${name}`,
     })
     this.recorder.event('decision/proposed', 'decision', r, {
       call: index,
       decision_version: proposal.decision_version,
+      method: proposal.method,
       state_version: proposal.state_version,
       recommendations: recommendations.map((x) => x.id),
       alternatives: alternatives.map((x) => x.id),
-      file: `decision/${roundFile(`propose-${index}`, r)}`,
+      file: `decision/${name}`,
     })
     this.save()
-    const view = (x) => ({ id: x.id, rank: x.rank, mu: round4(x.mu), sigma: round4(x.sigma), score: round4(x.score) })
     return {
       round: r,
-      max_rounds: this.state.task.max_rounds,
+      rounds: this.budget.rounds,
       batch_size: k,
+      method: proposal.method,
+      decision_version: proposal.decision_version,
+      inputs_used: proposal.inputs_used,
+      params: proposal.params,
       state_version: proposal.state_version,
       n_observations: proposal.n_observations,
       recommendations: recommendations.map(view),
@@ -125,30 +189,60 @@ export class Run {
     const r = this.state.round
     const rec = this.state.rounds[r]
     if (!rec || rec.proposals.length === 0) throw new RunError(`第 ${r} 轮还没有调用 pp_get_decision，先拿决策模块的推荐。`)
-    const recs = rec.proposals[rec.proposals.length - 1].recommendations
-    const accept = args.accept ?? []
-    const replace = args.replace ?? []
+    const recs = rec.proposals.at(-1).recommendations
+    const recSet = new Set(recs)
+    const batch = Array.isArray(args.batch) ? args.batch : []
+    const groups = Array.isArray(args.groups) ? args.groups : []
     const problems = []
-    const outs = replace.map((x) => x.out)
-    const ins = replace.map((x) => x.in)
-    for (const id of accept) if (!recs.includes(id)) problems.push(`accept 里的 ${id} 不在本轮推荐里`)
-    for (const id of outs) if (!recs.includes(id)) problems.push(`replace.out 里的 ${id} 不在本轮推荐里`)
-    const covered = [...accept, ...outs]
-    for (const id of recs) {
-      const n = covered.filter((x) => x === id).length
-      if (n === 0) problems.push(`推荐 ${id} 既没有 accept 也没有被 replace`)
-      if (n > 1) problems.push(`推荐 ${id} 出现了 ${n} 次`)
-    }
-    for (const x of replace) {
-      if (!this.candidateSet.has(x.in)) problems.push(`replace.in 里的 ${x.in} 不是候选`)
-      if (!REASON_TYPES.includes(x.reason_type)) problems.push(`reason_type 必须是 ${REASON_TYPES.join('/')} 之一`)
-      if (typeof x.reason !== 'string' || x.reason.trim() === '') problems.push(`替换 ${x.out}→${x.in} 缺少理由`)
-    }
-    const batch = [...accept, ...ins]
+
+    const expected = this.expectedBatchSize()
+    if (batch.length !== expected) problems.push(`这一轮要正好交 ${expected} 个候选，交了 ${batch.length} 个`)
+    for (const id of batch) if (!this.candidateSet.has(id)) problems.push(`${id} 不是候选`)
     const dup = batch.filter((id, i) => batch.indexOf(id) !== i)
     if (dup.length) problems.push(`批次里有重复：${[...new Set(dup)].join(', ')}`)
+    if (!this.budget.allow_repeats) {
+      const measured = this.measuredIds()
+      const again = batch.filter((id) => measured.has(id))
+      if (again.length) problems.push(`这个任务不能重复测，这些已经测过：${again.join(', ')}`)
+    }
+
+    const inBatch = new Set(batch)
+    const grouped = new Map() // id -> 所在组的 source
+    for (const [i, g] of groups.entries()) {
+      const label = `groups[${i}]`
+      if (!SOURCES.includes(g?.source)) problems.push(`${label}.source 必须是 ${SOURCES.join('/')} 之一`)
+      if (typeof g?.reason !== 'string' || g.reason.trim() === '') problems.push(`${label} 缺少理由`)
+      const ids = Array.isArray(g?.ids) ? g.ids : []
+      if (ids.length === 0) problems.push(`${label}.ids 不能为空`)
+      for (const id of ids) {
+        if (!inBatch.has(id)) problems.push(`${label} 里的 ${id} 不在 batch 里`)
+        else if (grouped.has(id)) problems.push(`${id} 出现在不止一个组里`)
+        else grouped.set(id, g.source)
+      }
+    }
+    // 推荐以外的候选必须写明为什么选它。
+    for (const id of new Set(batch)) {
+      if (recSet.has(id) || !this.candidateSet.has(id)) continue
+      const source = grouped.get(id)
+      if (source === undefined) problems.push(`${id} 不在本轮推荐里，要放进一个写了理由的组`)
+      else if (source === 'decision') problems.push(`${id} 不在本轮推荐里，它所在组的 source 不能是 decision`)
+    }
     if (problems.length) throw new RunError(`选择不合法：\n- ${problems.join('\n- ')}`)
-    return { accept, replace, batch, recommendations: recs }
+
+    const bySource = {}
+    for (const id of batch) {
+      const source = grouped.get(id) ?? 'decision'
+      bySource[source] = (bySource[source] ?? 0) + 1
+    }
+    const outside = batch.filter((id) => !recSet.has(id))
+    return {
+      batch,
+      groups: groups.map((g) => ({ ids: g.ids, source: g.source, reason: g.reason })),
+      recommendations: recs,
+      from_recommendation: batch.length - outside.length,
+      outside,
+      by_source: bySource,
+    }
   }
 
   async submitSelection(args, services, signal) {
@@ -158,27 +252,27 @@ export class Run {
     const rec = this.roundRecord(r)
     rec.submission = { at: new Date().toISOString(), ...selection }
     this.recorder.event('selection/submitted', 'model', r, {
-      accept: selection.accept,
-      replace: selection.replace,
       batch: selection.batch,
+      groups: selection.groups,
+      from_recommendation: selection.from_recommendation,
+      outside: selection.outside,
       forced: rec.steers > 0,
     })
 
-    const run = await services.run({ round: r, batch: selection.batch }, signal)
+    const run = await services.run({ task_id: this.state.task.task_id, round: r, batch: selection.batch }, signal)
     this.recorder.writeJson(join('oracle', roundFile('run', r)), run)
     rec.results = run.results
-    for (const x of run.results) this.state.observations.push({ id: x.id, value: x.value, replicate: x.replicate, round: r })
+    for (const x of run.results) this.state.observations.push({ id: x.id, round: r, replicate: x.replicate, readout: x.readout })
     this.recorder.event('oracle/results', 'environment', r, { oracle_version: run.oracle_version, results: run.results })
 
+    const objective = this.state.task.objective
     let failure = null
     try {
-      const receipt = await services.observe({ round: r, observations: run.results.map((x) => ({ id: x.id, value: x.value })) }, signal)
+      const receipt = await services.observe({ round: r, observations: run.results.map((x) => ({ id: x.id, readout: x.readout })) }, signal)
       this.recorder.writeJson(join('decision', roundFile('observe', r)), receipt)
       rec.receipt = receipt
       this.recorder.event('decision/observed', 'decision', r, receipt)
-      const accepted = new Set(receipt.accepted)
-      const complete = selection.batch.every((id) => accepted.has(id)) && receipt.rejected.length === 0
-      if (!complete || receipt.state_version_after !== receipt.state_version_before + 1) {
+      if (!checkReceipt(run.results, receipt, objective).ok) {
         failure = '决策模块的回执和提交的读数对不上'
         this.recorder.event('receipt/mismatch', 'framework', r, { batch: selection.batch, receipt })
       }
@@ -189,10 +283,11 @@ export class Run {
       this.recorder.event('decision/observe-failed', 'framework', r, { error: error.message })
     }
 
-    const finished = r >= this.state.task.max_rounds
+    const exhausted = !this.budget.allow_repeats && this.measuredIds().size >= this.state.candidateIds.length
+    const finished = r >= this.budget.rounds || exhausted
     if (finished) {
       this.state.status = 'finished'
-      this.recorder.event('run/finished', 'framework', r, { rounds: r })
+      this.recorder.event('run/finished', 'framework', r, { rounds: r, ...(exhausted && r < this.budget.rounds ? { reason: 'candidates_exhausted' } : {}) })
     } else {
       this.state.round = r + 1
     }
@@ -203,23 +298,80 @@ export class Run {
     this.save()
 
     const recommended = new Set(selection.recommendations)
+    const empty = run.results.filter((x) => objectiveValue(x.readout, objective) === null).map((x) => x.id)
     return {
       round: r,
-      results: run.results.map((x) => ({ id: x.id, value: round4(x.value), replicate: x.replicate, recommended: recommended.has(x.id) })),
+      results: run.results.map((x) => ({ id: x.id, replicate: x.replicate, readout: roundReadout(x.readout), recommended: recommended.has(x.id) })),
+      empty,
       receipt: rec.receipt && {
         accepted: rec.receipt.accepted.length,
         rejected: rec.receipt.rejected,
         state_version_after: rec.receipt.state_version_after,
       },
       problem: failure,
-      next: finished ? { finished: true } : { round: r + 1, max_rounds: this.state.task.max_rounds, status: this.state.status },
+      next: finished ? { finished: true } : { round: r + 1, rounds: this.budget.rounds, status: this.state.status },
     }
+  }
+
+  // ---- 检索记录（web_search / web_fetch 由 DSH 执行，这里只记下来，不拦截） ----
+
+  /**
+   * 记一次检索。call 是会话里 tool/call 的 {name, arguments}，result 是 tool/result 的
+   * {message: {isError, content}, meta}。原文落到 retrieval/R<N>.json，事件和状态里只放摘要。
+   * 任务结束后查的也记（事后审计要看得到），所以不检查状态。
+   */
+  recordRetrieval(call, result) {
+    this.state.retrievals ??= []
+    const id = `R${this.state.retrievals.length + 1}`
+    const r = this.state.round
+    const text = (result.message?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
+    const isError = Boolean(result.message?.isError)
+    const file = `retrieval/${id}.json`
+    const args = parseArguments(call.arguments)
+    this.recorder.writeJson(join('retrieval', `${id}.json`), {
+      id,
+      round: r,
+      tool: call.name,
+      arguments: args,
+      is_error: isError,
+      meta: result.meta ?? null,
+      text,
+    })
+    this.retrievalTexts.set(id, text)
+    const entry = { id, round: r, at: new Date().toISOString(), tool: call.name, is_error: isError }
+    this.state.retrievals.push(entry)
+    if (call.name === 'web_search') {
+      const queries = args?.queries ?? (args?.query ? [args.query] : [])
+      const results = (result.meta?.sources ?? []).map((x) => ({ title: x.title ?? null, url: x.url }))
+      this.recorder.event('retrieval/searched', 'model', r, { id, queries, results, is_error: isError, file })
+    } else {
+      const url = args?.url ?? result.meta?.url ?? null
+      this.recorder.event('retrieval/fetched', 'model', r, { id, url, status: result.meta?.statusCode ?? null, chars: text.length, is_error: isError, file })
+    }
+    this.save()
+    return entry
+  }
+
+  /** 第 id 次检索的结果全文（文献核对用）；记录读不到时当作空文本。 */
+  retrievalText(id) {
+    if (!this.retrievalTexts.has(id)) {
+      let text = ''
+      try {
+        text = this.recorder.readJson(join('retrieval', `${id}.json`)).text ?? ''
+      } catch {}
+      this.retrievalTexts.set(id, text)
+    }
+    return this.retrievalTexts.get(id)
+  }
+
+  audit() {
+    return auditRun(this.state, (id) => this.retrievalText(id))
   }
 
   // ---- 假设与笔记 ----
 
   checkCites(cites) {
-    const measured = new Set(this.state.observations.map((o) => o.id))
+    const measured = this.measuredIds()
     const unknown = cites.filter((id) => !measured.has(id))
     if (unknown.length) throw new RunError(`cites 只能引用已经测过的候选，这些还没测过：${unknown.join(', ')}`)
   }
@@ -266,9 +418,11 @@ export class Run {
     return {
       round: this.state.round,
       status: this.state.status,
-      observations: this.state.observations.map((o) => ({ ...o, value: round4(o.value) })),
+      objective: this.state.task.objective,
+      observations: this.state.observations.map((o) => ({ ...o, readout: roundReadout(o.readout) })),
       hypotheses: this.state.hypotheses.map(({ history, ...h }) => h),
       notes: this.state.notes,
+      retrievals: this.state.retrievals ?? [],
     }
   }
 
@@ -295,7 +449,7 @@ export class Run {
   /** 空闲时该自动开始的轮次；没有则返回 null。 */
   nextRoundToDrive() {
     const s = this.state
-    if (s.status !== 'active' || s.round > s.task.max_rounds || s.lastDrivenRound >= s.round) return null
+    if (s.status !== 'active' || s.round > s.task.budget.rounds || s.lastDrivenRound >= s.round) return null
     return s.round
   }
 
@@ -346,29 +500,51 @@ export class Run {
   save() {
     this.recorder.writeJson('state.json', this.state)
     this.recorder.writeJson('memory.json', { hypotheses: this.state.hypotheses, notes: this.state.notes })
-    this.recorder.writeJson('audit.json', auditRun(this.state))
+    this.recorder.writeJson('audit.json', this.audit())
   }
 
   // ---- 每轮注入给模型的简报 ----
 
   brief() {
     const s = this.state
+    const t = s.task
+    const b = t.budget
+    const objective = t.objective
     const lines = []
     lines.push('<perturbpilot_state>')
-    lines.push(`任务：${s.task.title}（${s.task.task_id}${s.task.synthetic ? '，合成数据，不是真实实验' : ''}）`)
-    lines.push(`目标：${s.task.objective.name}，${s.task.objective.direction === 'maximize' ? '越大越好' : '越小越好'}；每轮 ${s.task.batch_size} 个，共 ${s.task.max_rounds} 轮`)
+    lines.push(`任务：${t.title}（${t.task_id}${t.synthetic ? '，合成数据，不是真实实验' : ''}）`)
+    lines.push(`扰动：${t.action.type}${t.action.description ? `，${t.action.description}` : ''}`)
+    lines.push(`目标：${objectiveText(objective)}`)
+    lines.push(`读数字段：${t.readout.fields.map((f) => `${f.name}（${f.description ?? ''}）`).join('；')}`)
+    lines.push(`预算：共 ${b.rounds} 轮，每轮正好 ${b.batch_size} 个；候选 ${t.n_candidates} 个，${b.allow_repeats ? '可以重复测' : '不能重复测'}`)
+    const pb = s.setup?.package_budget
+    if (pb && (pb.rounds !== b.rounds || pb.batch_size !== b.batch_size)) lines.push(`（任务包原定 ${pb.rounds} 轮、每轮 ${pb.batch_size} 个，开始时改成了上面的预算）`)
+    const used = s.decision.inputs_used ?? []
+    lines.push(`决策模块：${s.decision.name}，方法 ${s.decision.method}，${used.length ? `用到 ${used.map((x) => `${x.role}/${x.modality}`).join(', ')}` : '没用任何候选特征'}`)
+    const cards = t.data_cards ?? []
+    lines.push(cards.length
+      ? `任务包的数据：${cards.map((dc) => `${dc.name}（${dc.role}/${dc.modality}，${dc.visibility === 'public' ? `${dc.file}，pp_run_python 的目录里也有` : '只给决策模块'}）`).join('；')}`
+      : '任务包的数据：没有，候选只有标识符')
     const statusText = { active: '进行中', paused: '已暂停（不会自动开始下一轮）', stopped: '已停止', finished: '已完成' }[s.status]
     lines.push(`状态：${statusText}`)
     if (!this.closed) {
       const rec = s.rounds[s.round]
       const step = !rec || rec.proposals.length === 0 ? '还没调用 pp_get_decision' : rec.submission ? '已提交' : '已拿到推荐，还没提交 pp_submit_selection'
-      lines.push(`当前第 ${s.round}/${s.task.max_rounds} 轮：${step}`)
+      lines.push(`当前第 ${s.round}/${b.rounds} 轮：${step}`)
     }
-    const obs = [...s.observations].sort((a, b) => b.value - a.value)
-    lines.push(`已测 ${obs.length} 次读数${obs.length ? '，按读数从高到低（前 15）：' : ''}`)
-    for (const o of obs.slice(0, 15)) lines.push(`  ${o.id} = ${round4(o.value)}（第 ${o.round} 轮${o.replicate ? `，第 ${o.replicate + 1} 次测` : ''}）`)
+    const sign = lowerIsBetter(objective) ? 1 : -1
+    const valued = s.observations.map((o) => ({ ...o, v: objectiveValue(o.readout, objective) })).filter((o) => o.v !== null)
+    valued.sort((x, y) => sign * (x.v - y.v))
+    const empties = s.observations.length - valued.length
+    lines.push(`已测 ${s.observations.length} 次${empties ? `（其中 ${empties} 次读数为空）` : ''}${valued.length ? `，${objective.field} 最好的前 10：` : ''}`)
+    for (const o of valued.slice(0, 10)) lines.push(`  ${o.id} ${objective.field}=${round4(o.v)}（第 ${o.round} 轮${o.replicate ? `，第 ${o.replicate + 1} 次测` : ''}）`)
     const last = s.rounds[s.round - 1]
-    if (last?.results) lines.push(`上一轮（第 ${s.round - 1} 轮）读数：${last.results.map((x) => `${x.id}=${round4(x.value)}`).join('，')}`)
+    if (last?.results) {
+      const got = last.results.map((x) => ({ id: x.id, v: objectiveValue(x.readout, objective) }))
+      const ok = got.filter((x) => x.v !== null).sort((x, y) => sign * (x.v - y.v))
+      const none = got.length - ok.length
+      lines.push(`上一轮（第 ${s.round - 1} 轮）测了 ${got.length} 个${ok.length ? `，最好的：${ok.slice(0, 5).map((x) => `${x.id}=${round4(x.v)}`).join('，')}` : ''}${none ? `；${none} 个读数为空` : ''}`)
+    }
     if (s.hypotheses.length) {
       lines.push('假设：')
       for (const h of s.hypotheses) lines.push(`  ${h.id} [${h.status}] ${h.text}（引用 ${h.cites.join(', ') || '无'}）`)
@@ -377,11 +553,35 @@ export class Run {
       lines.push('最近笔记：')
       for (const n of s.notes.slice(-3)) lines.push(`  ${n.id}（第 ${n.round} 轮）${n.text}`)
     }
+    lines.push('全部读数用 pp_get_ledger 取；要算统计、看任务包里的数据用 pp_run_python。')
     lines.push('</perturbpilot_state>')
     return lines.join('\n')
   }
 }
 
-function round4(x) {
+/** 推荐里给模型看的一项：id、rank，加上决策模块给的数值（方法不同，字段不同），保留 4 位小数。 */
+function view(x) {
+  const out = { id: x.id, rank: x.rank }
+  for (const [k, v] of Object.entries(x)) if (k !== 'id' && k !== 'rank' && typeof v === 'number') out[k] = round4(v)
+  return out
+}
+
+/** 读数里的数值保留 4 位小数；空读数原样返回 null。 */
+export function roundReadout(readout) {
+  if (!readout) return null
+  return Object.fromEntries(Object.entries(readout).map(([k, v]) => [k, typeof v === 'number' ? round4(v) : v]))
+}
+
+export function round4(x) {
   return Math.round(x * 1e4) / 1e4
+}
+
+/** DSH 的 tool/call 事件里参数是 JSON 字符串；解析不了就原样保留。 */
+function parseArguments(value) {
+  if (typeof value !== 'string') return value ?? null
+  try {
+    return JSON.parse(value)
+  } catch {
+    return value
+  }
 }

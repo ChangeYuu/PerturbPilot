@@ -12,7 +12,9 @@ import { fakeServices } from './fake-services.js'
 
 const ROUTES = {
   'GET /task': 'task',
+  'GET /tasks': 'tasks',
   'GET /manifest': 'manifest',
+  'POST /init': 'init',
   'POST /reset': 'resetOracle',
   'POST /restore': 'restore',
   'POST /propose': 'propose',
@@ -24,9 +26,10 @@ const ROUTES = {
 let server
 let base
 let dir
+let services
 const tokens = [] // 服务替身收到的每个请求带的令牌头
 before(async () => {
-  const services = fakeServices()
+  services = fakeServices()
   server = createServer((req, res) => {
     let body = ''
     req.on('data', (c) => (body += c))
@@ -49,6 +52,7 @@ before(async () => {
 after(() => {
   server.close()
   rmSync(dir, { recursive: true, force: true })
+  rmSync(services.packageDir, { recursive: true, force: true })
 })
 
 function fakeHost() {
@@ -106,7 +110,7 @@ function exec(agent) {
 const tick = () => new Promise((r) => setTimeout(r, 20))
 const readJsonl = (path) => readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
 
-test('plugin drives rounds, steers, validates and records', async () => {
+test('plugin drives rounds, steers, validates and records', async (t) => {
   const originalFetch = globalThis.fetch
   const host = fakeHost()
   const config = new plugin.Config({ oracleUrl: base, decisionUrl: base, runsDir: dir, llmUrlPattern: '/llm/', serviceTokenEnv: 'PP_TEST_SERVICE_TOKEN' })
@@ -120,23 +124,62 @@ test('plugin drives rounds, steers, validates and records', async () => {
   const runDir = join(dir, 'sess-1')
 
   assert.deepEqual(Object.keys(host.tools).sort(), [
-    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_start_task', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
+    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_list_tasks', 'pp_propose_task', 'pp_run_python', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
   ])
   assert.equal(host.sections[0].name, 'perturbpilot:role')
   const brief = () => host.contexts[0].text({ agent })
   assert.equal(brief(), '') // 没有任务时不注入
 
-  await assert.rejects(host.tools.pp_get_decision.execute({}, exec(agent)), /pp_start_task/)
-  const start = exec(agent)
-  const started = await host.tools.pp_start_task.execute({}, start)
-  assert.equal(started.started, true)
-  assert.equal(start.concluded, true)
-  assert.match(brief(), /第 1\/3 轮/)
+  await assert.rejects(host.tools.pp_get_decision.execute({}, exec(agent)), /先用 pp_list_tasks/)
 
-  // 空闲 → 框架开第 1 轮
-  host.handlers['agent/status']({ agent, status: 'idle' })
-  await tick()
+  // 开任务前：agent 看任务列表，提议设置；提议不合法就报错，合法就存下来等用户确认，本 turn 结束
+  const listed = await host.tools.pp_list_tasks.execute({}, exec(agent))
+  assert.deepEqual(listed.tasks.map((x) => x.task_id), ['fake-task'])
+  assert.equal(listed.tasks[0].package_dir, undefined)
+  assert.equal(listed.decision.default_method, 'coverage')
+  assert.deepEqual(Object.keys(listed.decision.methods), ['coverage', 'gp-ucb'])
+  assert.deepEqual(listed.limits.rounds, [1, 50])
+  assert.equal(listed.started, false)
+  await assert.rejects(host.tools.pp_propose_task.execute({ task_id: 'fake-task', method: 'gp-ucb', rationale: 'x' }, exec(agent)), /candidate_features\/embedding/)
+  await assert.rejects(host.tools.pp_propose_task.execute({ task_id: 'fake-task', rounds: 0, rationale: 'x' }, exec(agent)), /rounds 要是 1–50/)
+  const proposeExec = exec(agent)
+  const proposed = await host.tools.pp_propose_task.execute({ task_id: 'fake-task', method: 'coverage', rationale: '只有这一个任务，要素都对得上' }, proposeExec)
+  assert.equal(proposeExec.concluded, true)
+  assert.deepEqual(proposed.effective, { task_id: 'fake-task', title: '测试任务', method: 'coverage', budget: { rounds: 3, batch_size: 3, allow_repeats: true }, n_candidates: 20 })
+  assert.equal(agent.followups.length, 0) // 提议不会开始任务
+
+  // 面板路由：先看任务列表和等确认的提议；用户确认开始后框架建运行记录，会话空闲就马上开第 1 轮
+  assert.equal(host.routes.length, 1)
+  assert.equal(host.routes[0].kind, 'prefix')
+  assert.equal(host.routes[0].path, '/perturbpilot/api')
+  const panel = createServer(host.routes[0].handler)
+  await new Promise((r) => panel.listen(0, '127.0.0.1', r))
+  t.after(() => panel.close())
+  const apiBase = `http://127.0.0.1:${panel.address().port}/perturbpilot/api`
+  const panelBase = `${apiBase}/sessions/sess-1`
+  const panelPost = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-perturbpilot': '1' }, body: JSON.stringify(body) })
+  const catalog = await (await fetch(`${apiBase}/tasks`)).json()
+  assert.equal(catalog.tasks[0].title, '测试任务')
+  assert.equal(catalog.tasks[0].package_dir, undefined)
+  assert.equal(catalog.decision.requires['gp-ucb'][0].modality, 'embedding')
+  const pending = await (await fetch(panelBase)).json()
+  assert.equal(pending.run, null)
+  assert.equal(pending.proposal.rationale, '只有这一个任务，要素都对得上')
+  assert.equal((await panelPost(`${apiBase}/sessions/ghost/start`, {})).status, 404)
+  const started = await (await panelPost(`${panelBase}/start`, { task_id: 'fake-task', method: 'coverage' })).json()
+  assert.equal(started.run.status, 'active')
+  assert.equal(JSON.parse(readFileSync(join(runDir, 'state.json'), 'utf8')).setup.proposal.task_id, 'fake-task')
+  assert.equal((await (await fetch(panelBase)).json()).proposal, null)
+  await assert.rejects(host.tools.pp_propose_task.execute({ task_id: 'fake-task', rationale: 'x' }, exec(agent)), /已经开始了任务/)
+  assert.equal((await host.tools.pp_list_tasks.execute({}, exec(agent))).started, true)
+  // 决策模块和 oracle 同一时间只跑一个任务：别的会话开不了
+  host.addAgent('sess-2')
+  const blocked = await panelPost(`${apiBase}/sessions/sess-2/start`, {})
+  assert.equal(blocked.status, 400)
+  assert.match((await blocked.json()).error, /会话 sess-1 的任务还没结束（进行中）/)
+  assert.match(brief(), /第 1\/3 轮/)
   assert.equal(agent.followups.length, 1)
+  assert.equal((await panelPost(`${panelBase}/start`, {})).status, 400)
   assert.deepEqual(agent.followups[0].source, { kind: 'perturbpilot', round: 1 })
   host.handlers['session/event'](agent.session, { type: 'user/message', data: agent.followups[0] })
 
@@ -154,17 +197,36 @@ test('plugin drives rounds, steers, validates and records', async () => {
   assert.equal(llm[0].step, 3)
   assert.ok(!JSON.stringify(llm).includes('sk-x'))
 
+  // 检索：web_search 的调用和结果经 session/event 到达，只记录；别的工具不记
+  host.handlers['session/event'](agent.session, { type: 'tool/call', data: { turn: 2, step: 3, callId: 'w1', name: 'web_search', arguments: '{"queries": ["G009 通路"]}' } })
+  host.handlers['session/event'](agent.session, { type: 'tool/call', data: { turn: 2, step: 3, callId: 'o1', name: 'pp_get_ledger', arguments: {} } })
+  host.handlers['session/event'](agent.session, { type: 'tool/result', data: { message: { toolCallId: 'o1', isError: false, content: [] }, meta: {} } })
+  host.handlers['session/event'](agent.session, {
+    type: 'tool/result',
+    data: { message: { toolCallId: 'w1', isError: false, content: [{ type: 'text', text: '搜到一篇，讲 G003' }] }, meta: { sources: [{ url: 'https://example.org/a', title: 'A' }] } },
+  })
+  assert.deepEqual(readJsonl(join(runDir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => [e.type, e.data.id]), [['retrieval/searched', 'R1']])
+  const saved = JSON.parse(readFileSync(join(runDir, 'retrieval', 'R1.json'), 'utf8'))
+  assert.equal(saved.text, '搜到一篇，讲 G003')
+  assert.deepEqual(saved.arguments, { queries: ['G009 通路'] }) // DSH 给的是 JSON 字符串，记录时解析
+
   const decision = await host.tools.pp_get_decision.execute({}, exec(agent))
+  assert.equal(decision.method, 'coverage')
   const ids = decision.recommendations.map((x) => x.id)
-  await assert.rejects(host.tools.pp_submit_selection.execute({ accept: ids }, exec(agent))) // 缺 replace，参数校验拒绝
+  await assert.rejects(host.tools.pp_submit_selection.execute({ batch: ids }, exec(agent))) // 缺 groups，参数校验拒绝
+  await assert.rejects(host.tools.pp_submit_selection.execute({ batch: ids, groups: [{ ids: [ids[0]], source: 'bogus', reason: 'x' }] }, exec(agent))) // source 不在枚举里
+  const extra = decision.alternatives[0].id
+  assert.equal(extra, 'G003')
   const submit = exec(agent)
   const result = await host.tools.pp_submit_selection.execute(
-    { accept: ids.slice(1), replace: [{ out: ids[0], in: decision.alternatives[0].id, reason_type: 'exploration', reason: '看看备选' }] },
+    { batch: [...ids.slice(1), extra], groups: [{ ids: [extra], source: 'literature', reason: '搜到的文章提到它' }] },
     submit,
   )
   assert.equal(submit.concluded, true)
   assert.equal(result.results.length, 3)
   assert.equal(result.results.filter((x) => !x.recommended).length, 1)
+  const audit = JSON.parse(readFileSync(join(runDir, 'audit.json'), 'utf8'))
+  assert.equal(audit.rounds[0].checks.literature_backed.result, 'pass')
 
   // 已经交了 → 不再催；空闲 → 开第 2 轮
   await host.handlers['agent/turn-stopping']({ agent, turn: 2 })
@@ -185,37 +247,24 @@ test('plugin drives rounds, steers, validates and records', async () => {
   assert.equal(agent.followups.length, 2)
 
   // 面板路由：读到暂停状态；从面板点"继续"，空闲的会话马上开下一轮
-  assert.equal(host.routes.length, 1)
-  assert.equal(host.routes[0].kind, 'prefix')
-  assert.equal(host.routes[0].path, '/perturbpilot/api')
-  const panel = createServer(host.routes[0].handler)
-  await new Promise((r) => panel.listen(0, '127.0.0.1', r))
-  const apiBase = `http://127.0.0.1:${panel.address().port}/perturbpilot/api`
-  const panelBase = `${apiBase}/sessions/sess-1`
-  try {
+  {
     const listed = (await (await fetch(`${apiBase}/sessions`)).json()).runs
     assert.deepEqual(listed.map((x) => [x.run_id, x.status, x.round]), [['sess-1', 'paused', 2]])
     const status = await (await fetch(`${apiBase}/status`)).json()
     assert.equal(status.token_set, true)
     assert.ok(!JSON.stringify(status).includes('tok-1')) // 只报有没有设，不报值
     assert.equal(status.config.runsDir, dir)
-    assert.deepEqual(status.services.oracle, { ok: true, task_id: 'fake-task', synthetic: true })
-    assert.deepEqual(status.services.decision, { ok: true, name: 'fake', version: 'fake/0' })
+    assert.deepEqual(status.services.oracle, { ok: true, tasks: ['fake-task'], active: 'fake-task' })
+    assert.deepEqual(status.services.decision, { ok: true, name: 'fake', version: 'fake/0', method: 'coverage' })
     const view = (await (await fetch(panelBase)).json()).run
     assert.equal(view.status, 'paused')
     assert.equal(view.round, 2)
     agent.inbox.nextTurn = []
-    const resumed = await fetch(`${panelBase}/control`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-perturbpilot': '1' },
-      body: JSON.stringify({ action: 'resume' }),
-    })
+    const resumed = await panelPost(`${panelBase}/control`, { action: 'resume' })
     assert.equal((await resumed.json()).run.status, 'active')
     await tick()
     assert.equal(agent.followups.length, 3)
     assert.equal(agent.followups[2].source.round, 2)
-  } finally {
-    panel.close()
   }
 
   // 每个服务请求（包括设置页的探测）都带了令牌

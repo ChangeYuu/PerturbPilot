@@ -2,12 +2,12 @@
 // 被测的注册逻辑、视图渲染、以及面板和宿主路由之间的请求照常运行（路由是真实的 createPanelHandler）。
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
-import { PANEL_ROUTE, createPanelHandler, listRuns, panelView } from '../lib/panel.js'
+import { PANEL_ROUTE, PanelError, createPanelHandler, listRuns, panelView, taskPreview } from '../lib/panel.js'
 import { Run } from '../lib/run.js'
 import { fakeServices } from './fake-services.js'
 
@@ -52,25 +52,40 @@ let dir
 let run
 let server
 let base
+let services
+let fresh // 面板上点"开始任务"后建的第二个任务，放在另一个目录，不进任务列表
+let freshDir
+let startedWith // 面板交给宿主的开始设置
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'pp-client-'))
-  const services = fakeServices()
+  freshDir = mkdtempSync(join(tmpdir(), 'pp-client-fresh-'))
+  services = fakeServices()
   run = await Run.start({ dir: join(dir, 'sess-1'), runId: 'sess-1', services })
   run.markDriven(1)
   const d = await run.getDecision(services)
-  await run.submitSelection({ accept: d.recommendations.map((x) => x.id), replace: [] }, services)
+  await run.submitSelection({ batch: d.recommendations.map((x) => x.id), groups: [] }, services)
   run.updateHypothesis({ text: 'G001 附近值高', status: 'proposed', cites: [run.state.observations[0].id] })
   run.updateHypothesis({ id: 'H1', status: 'weakened', cites: [], rationale: '复测后不高了' })
   run.writeNote({ text: '第一条笔记', cites: [] })
   run.recordAnalysis({ id: 'A1', purpose: '算特征相关', exit_code: 0, timed_out: false, duration_ms: 40, dir: 'analysis/A1', files: ['fig.txt'] })
   const handler = createPanelHandler({
-    getRun: (id) => (id === 'sess-1' ? run : undefined),
+    getRun: (id) => (id === 'sess-1' ? run : id === 'sess-2' ? fresh : undefined),
     control: (_id, action) => run.control(action, 'human'),
+    async start(id, setup) {
+      if (id !== 'sess-2') throw new PanelError(404, '找不到这个会话')
+      startedWith = setup
+      fresh = await Run.start({ dir: join(freshDir, 'sess-2'), runId: 'sess-2', services, setup })
+    },
+    proposal: (id) => (id === 'sess-2' && !fresh ? { task_id: 'fake-task', rounds: 2, rationale: '先少跑两轮看看', at: 't1' } : null),
+    tasks: async () => {
+      const [{ tasks, active }, m] = await Promise.all([services.tasks(), services.manifest()])
+      return { tasks: tasks.map(taskPreview), active, decision: { name: m.name, default_method: m.method, methods: m.methods, requires: m.requires }, limits: { rounds: [1, 50], batch_size: [1, 'n_candidates'] } }
+    },
     listRuns: () => listRuns(dir),
     status: async () => ({
       config: { oracleUrl: 'http://127.0.0.1:8701', serviceTokenEnv: 'PERTURBPILOT_SERVICE_TOKEN', pythonTimeoutMs: 60000 },
       token_set: false,
-      services: { oracle: { ok: true, task_id: 'fake-task', synthetic: true }, decision: { ok: false, error: 'decision /manifest failed: unreachable' } },
+      services: { oracle: { ok: true, tasks: ['fake-task'], active: null }, decision: { ok: false, error: 'decision /manifest failed: unreachable' } },
     }),
   })
   server = createServer(handler)
@@ -80,6 +95,8 @@ before(async () => {
 after(() => {
   server.close()
   rmSync(dir, { recursive: true, force: true })
+  rmSync(freshDir, { recursive: true, force: true })
+  rmSync(services.packageDir, { recursive: true, force: true })
 })
 
 test('bundle registers under the package name with a page tab type and a session-scoped body', () => {
@@ -113,7 +130,7 @@ test('bundle registers under the package name with a page tab type and a session
   const views = slots.slice(1, 1 + exports.TOOL_NAMES.length)
   assert.ok(views.every((s) => s.opts.name === 'tool.call.toolview' && s.component === exports.ToolCard))
   assert.deepEqual(views.map((s) => s.opts.key).sort(), [
-    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_start_task', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
+    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_list_tasks', 'pp_propose_task', 'pp_run_python', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
   ])
   // 主区的科学台账页、左侧栏入口（id 对上主区的 key）、设置页
   const [page, entry, settings, mark, name, hero] = slots.slice(1 + exports.TOOL_NAMES.length)
@@ -125,6 +142,9 @@ test('bundle registers under the package name with a page tab type and a session
   assert.deepEqual([mark, name, hero].map((s) => [s.opts.name, s.component]), [
     ['sidebar.brand.mark', exports.BrandMark], ['sidebar.brand.name', exports.BrandName], ['conversation.hero.brand.mark', exports.HeroBrand],
   ])
+  // 新会话中间有一段话，告诉用户可以用自然语言发起一个模糊的任务
+  assert.ok(text(exports.HeroBrand()).includes(exports.HERO_GUIDE))
+  assert.match(exports.HERO_GUIDE, /自然语言/)
 })
 
 // 按 DSH 工具块的形状包一次调用：start 只有参数，result 带 call 和 content（插件工具的输出是 JSON 文本）。
@@ -136,10 +156,10 @@ function settled(args, value, { isError = false, error } = {}) {
   return { phase: 'result', block: { kind: 'tool-result', callId: 'c1', call: { argsRaw: JSON.stringify(args) }, content: [{ type: 'text', text }], isError, error } }
 }
 
-test('tool cards show recommendations, replacements with reasons and readings from real tool results', async () => {
+test('tool cards show recommendations, grouped reasons and readings from real tool results', async () => {
   const { exports } = loadClient(fakeReact())
   const card = (toolName, props) => exports.ToolCard({ toolName, callId: 'c1', ...props })
-  const services = fakeServices()
+  const services = fakeServices({ empty: ['G002'] })
   const d2 = mkdtempSync(join(tmpdir(), 'pp-card-'))
   try {
     const r = await Run.start({ dir: d2, runId: 's2', services })
@@ -147,21 +167,22 @@ test('tool cards show recommendations, replacements with reasons and readings fr
     const tree = card('pp_get_decision', settled({}, decision))
     const all = text(tree)
     assert.match(all, /决策模块推荐/)
-    assert.match(all, /第 1\/3 轮/)
+    assert.match(all, /第 1\/3 轮 · 方法 coverage/)
+    assert.match(all, /推荐得分/) // 数值列按决策模块给的字段显示
     for (const x of decision.recommendations) assert.ok(all.includes(x.id))
     assert.equal(find(tree, (n) => n.type === 'tbody')[0].children.length, decision.recommendations.length)
 
     const ids = decision.recommendations.map((x) => x.id)
-    const args = { accept: ids.slice(1), replace: [{ out: ids[0], in: 'G009', reason_type: 'exploration', reason: '看看 G009 那一带' }] }
+    const args = { batch: [ids[1], ids[2], 'G009'], groups: [{ ids: ['G009'], source: 'exploration', reason: '看看 G009 那一带' }] }
     const running = text(card('pp_submit_selection', started(args)))
     assert.match(running, /进行中/)
-    assert.match(running, new RegExp(`${ids[0]} → G009`))
+    assert.match(running, /提交 3 个候选，分 1 组写了依据/)
+    assert.match(running, /G009探索看看 G009 那一带/)
     const result = await r.submitSelection(args, services)
     const done = text(card('pp_submit_selection', settled(args, result)))
-    assert.match(done, /接受 2 个推荐，替换 1 个/)
-    assert.match(done, /探索看看 G009 那一带/)
-    for (const x of result.results) assert.ok(done.includes(String(x.value)))
-    assert.match(done, /替换进来/)
+    assert.match(done, /G001score=0\.8415, absolute_effect=0\.8415推荐/)
+    assert.match(done, /G002空推荐/)
+    assert.match(done, /G009score=0\.4121, absolute_effect=0\.4121推荐以外/)
     assert.match(done, /下一轮：第 2\/3 轮/)
 
     const hArgs = { text: 'G009 附近值高', status: 'proposed', cites: ['G009'], rationale: '第 1 轮读数' }
@@ -180,9 +201,9 @@ test('tool cards show errors, interruptions and the preparing phase', () => {
   const { exports } = loadClient(fakeReact())
   const card = (toolName, props) => exports.ToolCard({ toolName, callId: 'c1', ...props })
   assert.match(text(card('pp_get_decision', { phase: 'preparing', block: { callId: 'c1' } })), /准备中/)
-  const err = card('pp_submit_selection', settled({ accept: [] }, '既没有 accept 也没有被替换：G000', { isError: true }))
+  const err = card('pp_submit_selection', settled({ batch: [] }, '这一轮要正好交 3 个候选，交了 0 个', { isError: true }))
   assert.equal(err.props.className, 'pp-tool pp-tool-error')
-  assert.match(text(err), /既没有 accept/)
+  assert.match(text(err), /正好交 3 个/)
   const stopped = card('pp_write_note', settled({ text: 'x', cites: [] }, [], { isError: true, error: { name: 'AbortError', code: 'interrupted' } }))
   assert.match(text(stopped), /已中断/)
   // 结果文本不是 JSON 时不报错，只是不显示结果部分
@@ -194,6 +215,58 @@ test('panel renders loading, empty, error and full states', () => {
   const render = (props) => exports.renderPanel({ busy: false, error: null, onControl: () => {}, ...props })
   assert.match(text(render({ view: undefined })), /加载中/)
   assert.match(text(render({ view: null })), /还没有开始任务/)
+  // 没开始任务：选任务、方法和预算的表单和“开始任务”按钮；任务列表还没读到或读不到时没有按钮
+  const startButtons = (props) => find(render({ view: null, ...props }), (n) => n.type === 'button')
+  assert.match(text(render({ view: null, catalog: undefined })), /正在读取任务列表/)
+  assert.equal(startButtons({ catalog: undefined }).length, 0)
+  assert.match(text(render({ view: null, catalog: null })), /读不到任务列表/)
+  assert.equal(startButtons({ catalog: null }).length, 0)
+  const preview = (id, title, extra = {}) => ({
+    task_id: id, title, synthetic: true, action: { type: 'knockout', description: 'CRISPR 敲除' }, objective_text: '找效应最强的基因',
+    budget: { rounds: 3, batch_size: 3, allow_repeats: true }, n_candidates: 20,
+    data_cards: [{ role: 'candidate_features', modality: 'expression' }], ...extra,
+  })
+  const catalog = {
+    tasks: [preview('t1', '测试任务'), preview('t2', '有嵌入的任务', { budget: { rounds: 8, batch_size: 5 }, n_candidates: 40, synthetic: false, data_cards: [{ role: 'candidate_features', modality: 'embedding' }] })],
+    active: null,
+    decision: { name: 'fake', default_method: 'coverage', methods: { coverage: '按顺序覆盖', 'gp-ucb': '高斯过程' }, requires: { coverage: [], 'gp-ucb': [{ role: 'candidate_features', modality: 'embedding' }] } },
+    limits: { rounds: [1, 50], batch_size: [1, 'n_candidates'] },
+  }
+  assert.match(text(render({ view: null, catalog: { ...catalog, tasks: [] } })), /服务里没有任务包/)
+  const forms = []
+  const starts = []
+  const form = { task_id: 't1', method: '', rounds: '3', batch_size: '3' }
+  const picker = (props) => render({ view: null, catalog, form, onForm: (f) => forms.push(f), onStart: (s) => starts.push(s), ...props })
+  const tree0 = picker()
+  const card = text(tree0)
+  for (const s of ['测试任务（t1）', '有嵌入的任务（t2）', '合成数据', '扰动：knockout，CRISPR 敲除', '目标：找效应最强的基因', '任务包原定 3 轮，每轮 3 个；候选 20 个，可以重复测', '默认（coverage）', '轮数（1–50）', '每轮个数（1–20）']) assert.ok(card.includes(s), s)
+  // 方法按任务包有没有它要的特征决定能不能选
+  const options = (t) => find(t, (n) => n.type === 'option' && ['coverage', 'gp-ucb'].includes(n.props.value))
+  assert.deepEqual(options(tree0).map((o) => [o.props.value, !!o.props.disabled]), [['coverage', false], ['gp-ucb', true]])
+  assert.match(text(options(tree0)[1]), /任务包缺它要的特征/)
+  const t2 = picker({ form: { ...form, task_id: 't2' } })
+  assert.deepEqual(options(t2).map((o) => !!o.props.disabled), [false, false])
+  // 换任务：表单按新任务包的预算重填；改轮数只改那一项
+  const [taskSelect, methodSelect] = find(tree0, (n) => n.type === 'select')
+  taskSelect.props.onChange({ target: { value: 't2' } })
+  assert.deepEqual(forms.at(-1), { task_id: 't2', method: '', rounds: '8', batch_size: '5' })
+  methodSelect.props.onChange({ target: { value: 'coverage' } })
+  assert.deepEqual(forms.at(-1), { ...form, method: 'coverage' })
+  find(tree0, (n) => n.type === 'input')[0].props.onChange({ target: { value: '12' } })
+  assert.deepEqual(forms.at(-1), { ...form, rounds: '12' })
+  // 开始：数字交数字，方法留空就不交；格式不对的原样交给宿主去报错
+  const [button] = find(tree0, (n) => n.type === 'button')
+  assert.equal(text(button), '开始任务')
+  button.props.onClick()
+  assert.deepEqual(starts.at(-1), { task_id: 't1', rounds: 3, batch_size: 3 })
+  find(picker({ form: { task_id: 't2', method: 'gp-ucb', rounds: '2.5', batch_size: '4' } }), (n) => n.type === 'button')[0].props.onClick()
+  assert.deepEqual(starts.at(-1), { task_id: 't2', method: 'gp-ucb', rounds: '2.5', batch_size: 4 })
+  assert.ok(find(picker({ busy: true }), (n) => n.type === 'button')[0].props.disabled)
+  // agent 提议过：显示理由，按钮变成“确认开始”
+  const proposed = picker({ proposal: { task_id: 't1', rounds: 2, rationale: '用户想先少跑几轮' } })
+  assert.match(text(proposed), /确认开始任务/)
+  assert.match(text(proposed), /agent 的提议.*用户想先少跑几轮/)
+  assert.equal(text(find(proposed, (n) => n.type === 'button')[0]), '确认开始')
   assert.match(text(render({ view: null, error: 'HTTP 500' })), /出错了：HTTP 500/)
 
   const view = panelView(run)
@@ -205,10 +278,10 @@ test('panel renders loading, empty, error and full states', () => {
   assert.match(all, /第 2\/3 轮/)
   assert.match(all, /G001 附近值高/)
   for (const r of view.rounds[0].results) assert.ok(all.includes(`${r.id}=${r.value}`))
-  // 第 1 轮前三项审计通过
+  // 第 1 轮：调用、提交通过；没写文献理由，文献核对不适用；回执通过
   const marks = find(tree, (n) => n.props.className?.startsWith?.('pp-check '))
-  assert.equal(marks.length, view.rounds.length * 5)
-  assert.deepEqual(marks.slice(0, 3).map((n) => n.props.className), ['pp-check pp-pass', 'pp-check pp-pass', 'pp-check pp-pass'])
+  assert.equal(marks.length, view.rounds.length * 6)
+  assert.deepEqual(marks.slice(0, 4).map((n) => n.props.className), ['pp-check pp-pass', 'pp-check pp-pass', 'pp-check pp-na', 'pp-check pp-pass'])
 
   const actions = []
   const buttons = find(render({ view, onControl: (a) => actions.push(a) }), (n) => n.type === 'button')
@@ -243,6 +316,20 @@ test('panel body talks to the real host route: poll, then pause', async () => {
     const missing = slots[0].inject('nobody').api
     assert.equal((await missing.get()).run, null)
     await assert.rejects(missing.control('pause'), /还没有开始任务/)
+    await assert.rejects(missing.start(), /找不到这个会话/)
+
+    // 开始任务：会话里带着 agent 的提议，按表单交设置，拿回新任务的视图
+    const second = slots[0].inject('sess-2').api
+    const pending = await second.get()
+    assert.equal(pending.run, null)
+    assert.equal(pending.proposal.rationale, '先少跑两轮看看')
+    const started = await second.start({ task_id: 'fake-task', rounds: 2, batch_size: 3 })
+    assert.deepEqual(startedWith, { task_id: 'fake-task', method: undefined, rounds: 2, batch_size: 3 })
+    assert.equal(started.run.run_id, 'sess-2')
+    assert.equal(started.run.round, 1)
+    assert.equal(fresh.state.task.budget.rounds, 2)
+    assert.equal((await second.get()).proposal, null)
+    await assert.rejects(second.start(), /已经开始过/)
 
     // 组件本身：一次渲染 + 执行它登记的轮询 effect，拿到的数据经 setState 送出
     const updates = []
@@ -250,11 +337,25 @@ test('panel body talks to the real host route: poll, then pause', async () => {
     react.effects.length = 0
     const tree = exports.PanelBody({ useTabInfo: () => ({ tab: { visible: true } }), api })
     assert.match(text(tree), /加载中/)
-    assert.equal(react.effects.length, 1)
+    assert.equal(react.effects.length, 3) // 轮询；还没开始任务时读任务列表；按列表和提议填表（view 初始是 undefined，后两个 effect 什么也不做）
     const cleanup = react.effects[0]()
     await new Promise((r) => setTimeout(r, 100))
     cleanup()
     assert.ok(updates.some((v) => v && v.run_id === 'sess-1' && v.status === 'stopped'))
+
+    // 还没开始任务的会话：组件读一次任务列表给表单（第一个 state 是视图，这里给 null）
+    updates.length = 0
+    let calls = 0
+    react.useState = (initial) => [calls++ === 0 ? null : initial, (v) => updates.push(v)]
+    react.effects.length = 0
+    const waiting = exports.PanelBody({ useTabInfo: () => ({ tab: { visible: true } }), api: missing })
+    assert.match(text(waiting), /还没有开始任务/)
+    react.effects[1]()
+    await new Promise((r) => setTimeout(r, 100))
+    const listed = updates.find((v) => v?.tasks)
+    assert.equal(listed.tasks[0].title, '测试任务')
+    assert.equal(listed.tasks[0].package_dir, undefined)
+    assert.deepEqual(Object.keys(listed.decision.methods), ['coverage', 'gp-ucb'])
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -291,12 +392,12 @@ test('ledger page renders the run list and the whole record of the selected run'
   assert.match(all, /科学台账/)
   assert.match(all, /测试任务/)
 
-  // 总览：目标、当前最佳、已测数量、改推荐的比例、审计
+  // 总览：目标、当前最佳、已测数量、推荐以外的比例、审计
   const best = view.observations[0]
-  assert.match(all, new RegExp(`目标：在 ${view.task.n_candidates} 个候选里找出`))
+  assert.match(all, new RegExp(`目标：找效应最强的基因（看 score，越高越好），候选 ${view.task.n_candidates} 个`))
   assert.match(all, new RegExp(`当前最佳${best.id} = ${best.value}第 1 轮测到`))
   assert.match(all, new RegExp(`已测3 / ${view.task.n_candidates}`))
-  assert.match(all, /agent 改了推荐0 \/ 3占 0%/)
+  assert.match(all, /推荐以外的0 \/ 3占 0%/)
   assert.match(all, /审计全部通过/)
   // 进展图每个读数一个点，本轮新的最佳单独标出
   const dots = find(tree, (n) => n.type === 'circle')
@@ -313,7 +414,7 @@ test('ledger page renders the run list and the whole record of the selected run'
   assert.equal(cards.length, 2)
   const [r1, r2] = cards.map(text)
   for (const id of view.rounds[0].recommendations) assert.ok(r1.includes(id))
-  assert.match(r1, /全部接受推荐/)
+  assert.match(r1, /全部照推荐/)
   assert.equal(find(cards[0], (n) => n.props.className === 'pp-bar-row').length, 3)
   assert.match(r1, new RegExp(`${best.id}.*${best.value}新的最佳`))
   assert.match(r1, /决策模块收下 3 条读数，状态版本 0 → 1/)
@@ -339,19 +440,35 @@ test('ledger page renders the run list and the whole record of the selected run'
   assert.match(text(render({ runs, selected: 'sess-1', view: null, error: 'HTTP 500' })), /出错了：HTTP 500.*读不到/)
 })
 
-test('ledger replacement reasons show up in the rounds table', async () => {
+test('ledger rounds show the groups outside the recommendation, retrievals and legacy runs', async () => {
   const { exports } = loadClient(fakeReact())
   const services = fakeServices()
   const d2 = mkdtempSync(join(tmpdir(), 'pp-ledger-'))
   try {
     const r = await Run.start({ dir: d2, runId: 's3', services })
+    r.recordRetrieval({ name: 'web_search', arguments: { queries: ['G009 通路'] } }, { message: { isError: false, content: [{ type: 'text', text: '综述：G009 和 G002 在同一通路' }] }, meta: { sources: [{ url: 'https://example.org/a', title: '一篇综述' }] } })
     const ids = (await r.getDecision(services)).recommendations.map((x) => x.id)
-    await r.submitSelection({ accept: ids.slice(1), replace: [{ out: ids[0], in: 'G009', reason_type: 'hypothesis_test', reason: '检验 H1' }] }, services)
-    const all = text(exports.renderLedger({ runs: listRuns(d2), selected: 's3', view: panelView(r), onSelect: () => {}, onControl: () => {} }))
-    assert.match(all, new RegExp(`${ids[0]} → G009`))
-    assert.match(all, /检验 H1/)
+    await r.submitSelection({ batch: [ids[1], ids[2], 'G009'], groups: [{ ids: ['G009'], source: 'literature', reason: '综述里 G009 在同一通路' }] }, services)
+    // 早期版本的记录：列出来但点不开
+    mkdirSync(join(d2, 'old'))
+    writeFileSync(join(d2, 'old', 'state.json'), JSON.stringify({ runId: 'old', status: 'finished', round: 3, task: { title: '旧任务', max_rounds: 3 } }), 'utf8')
+    const picked = []
+    const tree = exports.renderLedger({ runs: listRuns(d2), selected: 's3', view: panelView(r), onSelect: (id) => picked.push(id), onControl: () => {} })
+    const all = text(tree)
+    assert.match(all, /推荐以外 1 个/)
+    assert.match(all, /G009文献综述里 G009 在同一通路/)
+    assert.match(all, /检索R1 搜索 G009 通路 · 1 条结果/)
+    assert.match(all, /一篇综述/)
+    assert.match(all, /✓ 文献核对/)
+    assert.match(all, /检索里提到、没标文献：G002/)
+    assert.doesNotMatch(all, /标了文献、检索里没提到/)
+    const legacy = find(tree, (n) => n.type === 'button' && n.props.className?.includes?.('pp-run-legacy'))
+    assert.equal(legacy.length, 1)
+    assert.equal(legacy[0].props.disabled, true)
+    assert.match(text(legacy[0]), /旧格式/)
   } finally {
     rmSync(d2, { recursive: true, force: true })
+    rmSync(services.packageDir, { recursive: true, force: true })
   }
 })
 
@@ -361,12 +478,12 @@ test('settings page shows service reachability, the token and the config', () =>
   const status = {
     config: { oracleUrl: 'http://127.0.0.1:8701', serviceTokenEnv: 'PERTURBPILOT_SERVICE_TOKEN', pythonTimeoutMs: 60000 },
     token_set: false,
-    services: { oracle: { ok: true, task_id: 'fake-task', synthetic: true }, decision: { ok: false, error: 'unreachable' } },
+    services: { oracle: { ok: true, tasks: ['fake-task', 'il2'], active: 'il2' }, decision: { ok: false, error: 'unreachable' } },
   }
   const refreshed = []
   const tree = exports.renderSettings({ status, error: null, onRefresh: () => refreshed.push(1) })
   const all = text(tree)
-  assert.match(all, /oracle：连得上 fake-task（合成数据）/)
+  assert.match(all, /oracle：连得上 2 个任务包（fake-task, il2），当前 il2/)
   assert.match(all, /决策模块：连不上：unreachable/)
   assert.match(all, /没设.*PERTURBPILOT_SERVICE_TOKEN/)
   assert.match(all, /oracle 服务地址oracleUrlhttp:\/\/127\.0\.0\.1:8701/)
@@ -402,7 +519,7 @@ test('ledger page and settings section talk to the real host routes', async () =
     react.effects[0]()
     await new Promise((r) => setTimeout(r, 100))
     const status = updates.find((v) => v && v.services)
-    assert.equal(status.services.oracle.task_id, 'fake-task')
+    assert.deepEqual(status.services.oracle.tasks, ['fake-task'])
     assert.equal(status.token_set, false)
   } finally {
     globalThis.fetch = originalFetch
@@ -426,8 +543,8 @@ test('brand pieces crop the mark and the name out of the one logo image', () => 
   assert.equal(name.height, '15px')
   const n = 15 / 182
   assert.equal(name.backgroundPosition, `${-267 * n}px ${-70 * n}px`)
-  // 新会话中间：螺旋加两行字
+  // 新会话中间：螺旋、名字、一句口号和怎么开始的指引
   const hero = exports.HeroBrand()
   assert.equal(hero.children[0].props.style.height, '56px')
-  assert.deepEqual(find(hero, (n) => n.props.className?.startsWith?.('pp-hero-')).slice(1).map(text), ['PerturbPilot', '提出假设 · 挑选实验 · 从每一轮读数里学习'])
+  assert.deepEqual(find(hero, (n) => n.props.className?.startsWith?.('pp-hero-')).slice(1).map(text), ['PerturbPilot', '提出假设 · 挑选实验 · 从每一轮读数里学习', exports.HERO_GUIDE])
 })

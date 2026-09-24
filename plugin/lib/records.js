@@ -2,7 +2,7 @@
 // 所有文本都是 UTF-8、换行 \n、JSON 不转义中文。
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 export const EVENT_SOURCES = ['framework', 'model', 'environment', 'human', 'decision']
 
@@ -31,6 +31,7 @@ export class RunRecorder {
 
   writeJson(relPath, value) {
     const path = join(this.dir, relPath)
+    mkdirSync(dirname(path), { recursive: true })
     const tmp = path + '.tmp'
     writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', 'utf8')
     renameSync(tmp, path)

@@ -23,9 +23,12 @@ beforeEach(async () => {
   services = fakeServices()
   run = await Run.start({ dir, runId: 's1', services })
   const d = await run.getDecision(services)
-  await run.submitSelection({ accept: d.recommendations.map((x) => x.id), replace: [] }, services)
+  await run.submitSelection({ batch: d.recommendations.map((x) => x.id), groups: [] }, services)
 })
-afterEach(() => rmSync(dir, { recursive: true, force: true }))
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(services.packageDir, { recursive: true, force: true })
+})
 
 const readJsonl = (path) => readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
 const opts = (extra = {}) => ({ python, timeoutMs: 20000, ...extra })
@@ -35,8 +38,10 @@ test('script reads the exported ledger, output and files are recorded', async ()
     'import csv, os',
     'rows = list(csv.DictReader(open("observations.csv", encoding="utf-8")))',
     'cands = list(csv.DictReader(open("candidates.csv", encoding="utf-8")))',
-    'best = max(rows, key=lambda r: float(r["value"]))',
-    'print(len(rows), len(cands), best["id"], "最高")',
+    'expr = list(csv.DictReader(open("data/expr.csv", encoding="utf-8")))',
+    'dec = list(csv.DictReader(open("decision.csv", encoding="utf-8")))',
+    'best = max(rows, key=lambda r: float(r["score"]))',
+    'print(len(rows), len(cands), len(expr), sum(r["measured"] == "false" for r in dec), best["id"], "最高")',
     'os.makedirs("out", exist_ok=True)',
     'open("out/summary.txt", "w", encoding="utf-8").write("ok")',
   ].join('\n')
@@ -44,15 +49,20 @@ test('script reads the exported ledger, output and files are recorded', async ()
   assert.equal(res.id, 'A1')
   assert.equal(res.exit_code, 0, res.stderr)
   assert.equal(res.timed_out, false)
-  const best = [...run.state.observations].sort((a, b) => b.value - a.value)[0].id
-  assert.equal(res.stdout.trim(), `3 20 ${best} 最高`)
+  const best = [...run.state.observations].sort((a, b) => b.readout.score - a.readout.score)[0].id
+  // 决策模块的候选池是提交之前拿的，那时 20 个都没测过。
+  const line = `3 20 20 20 ${best} 最高`
+  assert.equal(res.stdout.trim(), line)
   assert.deepEqual(res.files, ['out/summary.txt'])
 
   const adir = join(dir, 'analysis', 'A1')
   assert.equal(readFileSync(join(adir, 'code.py'), 'utf8'), code)
-  assert.equal(readFileSync(join(adir, 'stdout.txt'), 'utf8').trim(), `3 20 ${best} 最高`)
-  assert.equal(readFileSync(join(adir, 'observations.csv'), 'utf8').split('\n')[0], 'id,round,value,replicate')
-  assert.equal(readFileSync(join(adir, 'candidates.csv'), 'utf8').split('\n')[0], 'id,f0')
+  assert.equal(readFileSync(join(adir, 'stdout.txt'), 'utf8').trim(), line)
+  const obs = readFileSync(join(adir, 'observations.csv'), 'utf8').split('\n')
+  assert.equal(obs[0], 'id,round,replicate,score,absolute_effect')
+  assert.equal(obs[1], 'G000,1,0,0,0')
+  assert.equal(readFileSync(join(adir, 'candidates.csv'), 'utf8').split('\n')[0], 'id,name')
+  assert.equal(readFileSync(join(adir, 'decision.csv'), 'utf8').split('\n')[0], 'id,measured,score')
 
   const event = readJsonl(join(dir, 'events.jsonl')).find((e) => e.type === 'analysis/executed')
   assert.equal(event.source, 'model')

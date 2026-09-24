@@ -1,27 +1,48 @@
 // 浏览器面板的宿主侧：把一次任务的状态整理成面板要显示的视图，并挂一个 HTTP 路由给面板读和控制。
-// 路由挂在 DSH 自己的 web 服务上（同源），只读 runs/ 里已有的状态，写操作只有暂停 / 继续 / 结束。
+// 路由挂在 DSH 自己的 web 服务上（同源），只读 runs/ 里已有的状态，写操作只有开始任务和暂停 / 继续 / 结束。
+// 开始任务前，面板列出服务里所有的任务包让用户选；agent 用 pp_propose_task 提过设置的，面板上预先填好等用户确认。
 // 右侧栏按当前会话读一个任务；主区的科学台账页不绑会话，先列出 runs/ 下所有任务再选。
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { auditRun } from './audit.js'
-import { CONTROL_ACTIONS, RunError } from './run.js'
+import { CONTROL_ACTIONS, RunError, STATE_FORMAT, roundReadout, round4 } from './run.js'
+import { ServiceError } from './services.js'
+import { lowerIsBetter, objectiveText, objectiveValue } from './task.js'
 
 export const PANEL_ROUTE = '/perturbpilot/api'
 const SESSION_ID = /^[A-Za-z0-9_.:-]{1,200}$/
 const MAX_BODY = 4096
+
+/** 面板路由要按指定状态码回的错误（比如会话不存在回 404）。 */
+export class PanelError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+/** 开始任务前给面板和 agent 预览的任务卡片：去掉服务本机的路径。 */
+export function taskPreview(card) {
+  const { package_dir, ...rest } = card
+  return { ...rest, objective_text: objectiveText(card.objective), goal: lowerIsBetter(card.objective) ? 'low' : 'high' }
+}
 // 左上角和新会话中间的 logo，由 client.js 的品牌插槽显示。
 export const LOGO_PATH = fileURLToPath(new URL('../assets/logo.png', import.meta.url))
 
-/** 面板显示用的视图：状态、每轮的推荐 / 选择 / 读数 / 审计、读数排名、假设（含历次更新）、笔记、分析、最近的事件。 */
+/**
+ * 面板显示用的视图：状态、每轮的推荐 / 选择 / 读数 / 审计、读数排名、假设（含历次更新）、笔记、分析、检索、最近的事件。
+ * 每条读数带 value（目标字段的值，空读数为 null）和完整的 readout。
+ */
 export function panelView(run, { events = 40 } = {}) {
   const s = run.state
-  const audit = auditRun(s)
+  const audit = run.audit()
   const all = readEvents(run.recorder.dir)
   const auditByRound = new Map(audit.rounds.map((x) => [x.round, x.checks]))
+  const objective = s.task.objective
+  const reading = (x) => ({ id: x.id, round: x.round, replicate: x.replicate, value: nullableRound(objectiveValue(x.readout, objective)), readout: roundReadout(x.readout) })
   const rounds = []
-  for (let r = 1; r <= Math.min(s.round, s.task.max_rounds); r++) {
+  for (let r = 1; r <= Math.min(s.round, s.task.budget.rounds); r++) {
     const rec = s.rounds[r]
     const last = rec?.proposals.at(-1)
     rounds.push({
@@ -29,8 +50,14 @@ export function panelView(run, { events = 40 } = {}) {
       proposals: rec?.proposals.length ?? 0,
       recommendations: last?.recommendations ?? [],
       steers: rec?.steers ?? 0,
-      submission: rec?.submission ? { accept: rec.submission.accept, replace: rec.submission.replace, batch: rec.submission.batch } : null,
-      results: rec?.results?.map((x) => ({ id: x.id, value: round4(x.value), replicate: x.replicate })) ?? null,
+      method: last?.method ?? null,
+      submission: rec?.submission ? {
+        batch: rec.submission.batch,
+        groups: rec.submission.groups,
+        outside: rec.submission.outside,
+        from_recommendation: rec.submission.from_recommendation,
+      } : null,
+      results: rec?.results?.map((x) => { const { round, ...rest } = reading(x); return rest }) ?? null,
       receipt: rec?.receipt ? {
         accepted: rec.receipt.accepted.length,
         rejected: rec.receipt.rejected.length,
@@ -40,19 +67,21 @@ export function panelView(run, { events = 40 } = {}) {
       checks: auditByRound.get(r) ?? {},
     })
   }
-  const direction = s.task.objective.direction === 'minimize' ? 1 : -1
-  const observations = s.observations
-    .map((o) => ({ id: o.id, value: round4(o.value), replicate: o.replicate, round: o.round }))
-    .sort((a, b) => direction * (a.value - b.value))
+  const sign = lowerIsBetter(objective) ? 1 : -1
+  // 空读数排在最后。
+  const observations = s.observations.map(reading).sort((a, b) => (a.value === null) - (b.value === null) || sign * (a.value - b.value))
   return {
     run_id: s.runId,
     task: {
       task_id: s.task.task_id,
       title: s.task.title,
       synthetic: s.task.synthetic,
-      objective: s.task.objective,
-      batch_size: s.task.batch_size,
-      max_rounds: s.task.max_rounds,
+      action: s.task.action,
+      objective,
+      objective_text: objectiveText(objective),
+      goal: lowerIsBetter(objective) ? 'low' : 'high',
+      readout_fields: s.task.readout.fields.map((f) => f.name),
+      budget: s.task.budget,
       n_candidates: s.task.n_candidates,
     },
     decision: s.decision,
@@ -65,6 +94,9 @@ export function panelView(run, { events = 40 } = {}) {
     hypotheses: s.hypotheses.map((h) => ({ ...h, history: h.history ?? [], updates: h.history?.length ?? 0 })),
     notes: s.notes,
     analyses: all.filter((e) => e.type === 'analysis/executed').map((e) => ({ round: e.round, ts: e.ts, ...e.data })),
+    retrievals: all
+      .filter((e) => e.type === 'retrieval/searched' || e.type === 'retrieval/fetched')
+      .map((e) => ({ round: e.round, ts: e.ts, tool: e.type === 'retrieval/searched' ? 'web_search' : 'web_fetch', ...e.data })),
     events: all.slice(-events).map(({ seq, ts, round, type, source }) => ({ seq, ts, round, type, source })),
   }
 }
@@ -75,7 +107,7 @@ function readEvents(dir) {
   return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
 }
 
-/** runs/ 下所有任务的摘要，最近更新的在前。读不了的目录跳过。 */
+/** runs/ 下所有任务的摘要，最近更新的在前。读不了的目录跳过；早期版本的记录标 legacy，面板只列不展开。 */
 export function listRuns(runsDir) {
   if (!existsSync(runsDir)) return []
   const out = []
@@ -84,6 +116,7 @@ export function listRuns(runsDir) {
     const path = join(runsDir, id, 'state.json')
     try {
       const s = JSON.parse(readFileSync(path, 'utf8'))
+      const legacy = s.format !== STATE_FORMAT
       out.push({
         run_id: id,
         title: s.task?.title ?? id,
@@ -91,7 +124,8 @@ export function listRuns(runsDir) {
         synthetic: s.task?.synthetic ?? null,
         status: s.status,
         round: s.round,
-        max_rounds: s.task?.max_rounds ?? null,
+        max_rounds: (legacy ? s.task?.max_rounds : s.task?.budget?.rounds) ?? null,
+        ...(legacy ? { legacy: true } : {}),
         updated: statSync(path).mtime.toISOString(),
       })
     } catch {}
@@ -102,17 +136,23 @@ export function listRuns(runsDir) {
 /**
  * 面板路由的处理函数。
  *   GET  <PANEL_ROUTE>/sessions                    → { runs: 摘要列表 }（科学台账页用）
- *   GET  <PANEL_ROUTE>/sessions/<会话 id>          → { run: 视图 | null }
+ *   GET  <PANEL_ROUTE>/sessions/<会话 id>          → { run: 视图 | null, proposal: agent 提的设置 | null }
+ *   POST <PANEL_ROUTE>/sessions/<会话 id>/start    body { task_id?, method?, rounds?, batch_size? } → { run: 视图 }
+ *                                                  （开始任务，第 1 轮随后由框架开；省略的项用默认）
  *   POST <PANEL_ROUTE>/sessions/<会话 id>/control  body { action } → { run: 视图 }
+ *   GET  <PANEL_ROUTE>/tasks                       → { tasks: 任务卡片预览列表, active, decision: 方法和各自需要的输入, limits }
  *   GET  <PANEL_ROUTE>/status                      → 插件配置和服务是否连得上（设置页用）
  *   GET  <PANEL_ROUTE>/logo                        → assets/logo.png
  * POST 要求 content-type 为 application/json 且带 x-perturbpilot 头，别的网页没法跨站伪造（会触发预检，这里不答预检）。
  * @param deps.getRun - (sessionId) => Run | undefined
  * @param deps.control - (sessionId, action) => void，执行控制并在需要时推动回合
+ * @param deps.start - async (sessionId, setup) => void，开始任务并推动第 1 轮；会话不存在抛 PanelError(404)
+ * @param deps.proposal - (sessionId) => 等用户确认的设置 | null
+ * @param deps.tasks - async () => 任务列表和决策模块的方法
  * @param deps.listRuns - () => 摘要列表
  * @param deps.status - async () => 状态对象
  */
-export function createPanelHandler({ getRun, control, listRuns = () => [], status = async () => ({}), logger }) {
+export function createPanelHandler({ getRun, control, start, proposal = () => null, tasks, listRuns = () => [], status = async () => ({}), logger }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost')
@@ -122,8 +162,9 @@ export function createPanelHandler({ getRun, control, listRuns = () => [], statu
         res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-cache' })
         return res.end(readFileSync(LOGO_PATH))
       }
-      if (rest.length === 1 && (rest[0] === 'sessions' || rest[0] === 'status')) {
+      if (rest.length === 1 && (rest[0] === 'sessions' || rest[0] === 'status' || rest[0] === 'tasks')) {
         if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' })
+        if (rest[0] === 'tasks') return send(res, 200, await tasks())
         return send(res, 200, rest[0] === 'sessions' ? { runs: listRuns() } : await status())
       }
       if (rest[0] !== 'sessions' || !SESSION_ID.test(rest[1] ?? '') || rest.length > 3) return send(res, 404, { error: 'not found' })
@@ -131,20 +172,28 @@ export function createPanelHandler({ getRun, control, listRuns = () => [], statu
       if (rest.length === 2) {
         if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' })
         const run = getRun(sessionId)
-        return send(res, 200, { run: run ? panelView(run) : null })
+        return send(res, 200, { run: run ? panelView(run) : null, proposal: run ? null : proposal(sessionId) })
       }
-      if (rest[2] !== 'control') return send(res, 404, { error: 'not found' })
+      if (rest[2] !== 'control' && rest[2] !== 'start') return send(res, 404, { error: 'not found' })
       if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
       if (!String(req.headers['content-type'] ?? '').startsWith('application/json') || req.headers['x-perturbpilot'] !== '1') {
         return send(res, 403, { error: 'forbidden' })
       }
       const body = JSON.parse(await readBody(req))
+      if (rest[2] === 'start') {
+        if (getRun(sessionId)) return send(res, 400, { error: '这个会话已经开始过任务' })
+        const { task_id, method, rounds, batch_size } = body ?? {}
+        await start(sessionId, { task_id, method, rounds, batch_size })
+        return send(res, 200, { run: panelView(getRun(sessionId)) })
+      }
       if (!CONTROL_ACTIONS.includes(body?.action)) return send(res, 400, { error: `action 必须是 ${CONTROL_ACTIONS.join('/')} 之一` })
       const run = getRun(sessionId)
       if (!run) return send(res, 404, { error: '这个会话还没有开始任务' })
       control(sessionId, body.action)
       return send(res, 200, { run: panelView(run) })
     } catch (error) {
+      if (error instanceof PanelError) return send(res, error.status, { error: error.message })
+      if (error instanceof ServiceError) return send(res, 502, { error: error.message })
       if (error instanceof RunError || error instanceof SyntaxError) return send(res, 400, { error: error.message })
       logger?.warn(`perturbpilot: panel request failed: ${error?.message ?? error}`)
       return send(res, 500, { error: 'internal error' })
@@ -173,6 +222,6 @@ function send(res, status, value) {
   res.end(JSON.stringify(value))
 }
 
-function round4(x) {
-  return Math.round(x * 1e4) / 1e4
+function nullableRound(x) {
+  return x === null ? null : round4(x)
 }
