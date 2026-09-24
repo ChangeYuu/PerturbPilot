@@ -25,6 +25,13 @@
             config:
               prefix: 你是 PerturbPilot 的科学发现 agent，由 {{model}} 模型驱动。
               suffix: ''
+          # 查文献用的 web_search / web_fetch：宿主层的 tool-web 被 web 端关掉了，这里按 web 端预设的写法在预设里挂一份。
+          # 调用只记录（runs/<id>/retrieval/），不拦截。
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
           - id: compaction
             name: cordis:group
             group: true

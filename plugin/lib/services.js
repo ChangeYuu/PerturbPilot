@@ -47,6 +47,7 @@ export function createServices({ oracleUrl, decisionUrl, fetch = globalThis.fetc
     run: (body, signal) => oracle('POST', '/run', body, signal),
     resetOracle: (body, signal) => oracle('POST', '/reset', body, signal),
     manifest: (signal) => decision('GET', '/manifest', undefined, signal),
+    init: (body, signal) => decision('POST', '/init', body, signal),
     propose: (body, signal) => decision('POST', '/propose', body, signal),
     observe: (body, signal) => decision('POST', '/observe', body, signal),
     snapshot: (signal) => decision('GET', '/snapshot', undefined, signal),

@@ -13,6 +13,7 @@ import { fakeServices } from './fake-services.js'
 const ROUTES = {
   'GET /task': 'task',
   'GET /manifest': 'manifest',
+  'POST /init': 'init',
   'POST /reset': 'resetOracle',
   'POST /restore': 'restore',
   'POST /propose': 'propose',
@@ -24,9 +25,10 @@ const ROUTES = {
 let server
 let base
 let dir
+let services
 const tokens = [] // 服务替身收到的每个请求带的令牌头
 before(async () => {
-  const services = fakeServices()
+  services = fakeServices()
   server = createServer((req, res) => {
     let body = ''
     req.on('data', (c) => (body += c))
@@ -49,6 +51,7 @@ before(async () => {
 after(() => {
   server.close()
   rmSync(dir, { recursive: true, force: true })
+  rmSync(services.packageDir, { recursive: true, force: true })
 })
 
 function fakeHost() {
@@ -154,17 +157,33 @@ test('plugin drives rounds, steers, validates and records', async () => {
   assert.equal(llm[0].step, 3)
   assert.ok(!JSON.stringify(llm).includes('sk-x'))
 
+  // 检索：web_search 的调用和结果经 session/event 到达，只记录；别的工具不记
+  host.handlers['session/event'](agent.session, { type: 'tool/call', data: { turn: 2, step: 3, callId: 'w1', name: 'web_search', arguments: { queries: ['G009 通路'] } } })
+  host.handlers['session/event'](agent.session, { type: 'tool/call', data: { turn: 2, step: 3, callId: 'o1', name: 'pp_get_ledger', arguments: {} } })
+  host.handlers['session/event'](agent.session, { type: 'tool/result', data: { message: { toolCallId: 'o1', isError: false, content: [] }, meta: {} } })
+  host.handlers['session/event'](agent.session, {
+    type: 'tool/result',
+    data: { message: { toolCallId: 'w1', isError: false, content: [{ type: 'text', text: '搜到一篇' }] }, meta: { sources: [{ url: 'https://example.org/a', title: 'A' }] } },
+  })
+  assert.deepEqual(readJsonl(join(runDir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => [e.type, e.data.id]), [['retrieval/searched', 'R1']])
+  assert.equal(JSON.parse(readFileSync(join(runDir, 'retrieval', 'R1.json'), 'utf8')).text, '搜到一篇')
+
   const decision = await host.tools.pp_get_decision.execute({}, exec(agent))
+  assert.equal(decision.method, 'coverage')
   const ids = decision.recommendations.map((x) => x.id)
-  await assert.rejects(host.tools.pp_submit_selection.execute({ accept: ids }, exec(agent))) // 缺 replace，参数校验拒绝
+  await assert.rejects(host.tools.pp_submit_selection.execute({ batch: ids }, exec(agent))) // 缺 groups，参数校验拒绝
+  await assert.rejects(host.tools.pp_submit_selection.execute({ batch: ids, groups: [{ ids: [ids[0]], source: 'bogus', reason: 'x' }] }, exec(agent))) // source 不在枚举里
+  const extra = decision.alternatives[0].id
   const submit = exec(agent)
   const result = await host.tools.pp_submit_selection.execute(
-    { accept: ids.slice(1), replace: [{ out: ids[0], in: decision.alternatives[0].id, reason_type: 'exploration', reason: '看看备选' }] },
+    { batch: [...ids.slice(1), extra], groups: [{ ids: [extra], source: 'literature', reason: '搜到的文章提到它' }] },
     submit,
   )
   assert.equal(submit.concluded, true)
   assert.equal(result.results.length, 3)
   assert.equal(result.results.filter((x) => !x.recommended).length, 1)
+  const audit = JSON.parse(readFileSync(join(runDir, 'audit.json'), 'utf8'))
+  assert.equal(audit.rounds[0].checks.literature_backed.result, 'pass')
 
   // 已经交了 → 不再催；空闲 → 开第 2 轮
   await host.handlers['agent/turn-stopping']({ agent, turn: 2 })
@@ -200,7 +219,7 @@ test('plugin drives rounds, steers, validates and records', async () => {
     assert.ok(!JSON.stringify(status).includes('tok-1')) // 只报有没有设，不报值
     assert.equal(status.config.runsDir, dir)
     assert.deepEqual(status.services.oracle, { ok: true, task_id: 'fake-task', synthetic: true })
-    assert.deepEqual(status.services.decision, { ok: true, name: 'fake', version: 'fake/0' })
+    assert.deepEqual(status.services.decision, { ok: true, name: 'fake', version: 'fake/0', method: 'coverage' })
     const view = (await (await fetch(panelBase)).json()).run
     assert.equal(view.status, 'paused')
     assert.equal(view.round, 2)

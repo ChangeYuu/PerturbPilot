@@ -1,6 +1,7 @@
 // PerturbPilot 的 DSH 插件：把"一次科学任务"接进 DSH 的一个会话里。
 // 一轮 = 一个 DSH turn；本轮提交后由框架用 followup 开下一轮。
-// agent 负责选（接受或替换决策模块的推荐），框架负责提交给 oracle 并把读数回灌给决策模块。
+// agent 负责选（参考决策模块的推荐，按依据分组写理由），框架负责提交给 oracle 并把读数回灌给决策模块。
+// agent 用 DSH 自带的 web_search / web_fetch 查文献，这里只记录检索，不拦截。
 // 科学状态放在会话之外（runs/<会话 id>/），每一步通过 systemPrompt.context 注入，所以上下文压缩不会丢。
 
 import { join, resolve } from 'node:path'
@@ -9,7 +10,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolvePython, runAnalysis } from './lib/analysis.js'
 import { installFetchCapture } from './lib/capture.js'
-import { CONTROL_ACTIONS, HYPOTHESIS_STATUSES, REASON_TYPES, Run, RunError } from './lib/run.js'
+import { CONTROL_ACTIONS, HYPOTHESIS_STATUSES, RETRIEVAL_TOOLS, Run, RunError, SOURCES } from './lib/run.js'
 import { createServices } from './lib/services.js'
 import { PANEL_ROUTE, createPanelHandler, listRuns } from './lib/panel.js'
 import { ROLE_PROMPT, roundPrompt, steerPrompt } from './lib/prompts.js'
@@ -36,6 +37,7 @@ const JSON_OUTPUT = {
 export function apply(ctx, config) {
   const runsDir = resolve(process.cwd(), config.runsDir)
   const runs = new Map() // agent.id -> Run
+  const retrievalCalls = new Map() // callId -> 还没回来的 web_search / web_fetch 调用 {agent_id, name, arguments}
   const driven = new Map() // agent.id -> 由框架发起、正在进行的轮次号
   let lastRequest = null // 最近一次 agent/request 的 {agent_id, turn, step}，用来给模型调用记录挂上归属
 
@@ -60,7 +62,7 @@ export function apply(ctx, config) {
     let run = runs.get(id)
     if (!run) {
       const dir = join(runsDir, id)
-      if (Run.exists(dir)) {
+      if (Run.exists(dir) && !Run.isLegacy(dir)) {
         run = Run.load(dir, id)
         runs.set(id, run)
       }
@@ -107,12 +109,13 @@ export function apply(ctx, config) {
 
   tool({
     name: 'pp_start_task',
-    description: '开始一次 PerturbPilot 任务：读取任务说明，清空 oracle 和决策模块的状态，建立运行记录。一个会话只跑一个任务；已经开始过就返回当前状态。调用后本 turn 结束，第 1 轮由框架自动开始。',
+    description: '开始一次 PerturbPilot 任务：读取任务卡片（扰动方式、读数字段、目标、预算），把任务包交给决策模块并清空 oracle 和决策模块的状态，建立运行记录。一个会话只跑一个任务；已经开始过就返回当前状态。调用后本 turn 结束，第 1 轮由框架自动开始。',
     parameters: {},
     async execute(_args, exec) {
       if (!exec.agent) throw new RunError('PerturbPilot 工具只能在会话里用')
       const existing = runFor(exec.agent)
       if (existing) return { already_started: true, ...summary(existing) }
+      if (Run.isLegacy(join(runsDir, exec.agent.id))) throw new RunError('这个会话里有旧格式的任务记录，不能再开任务；新开一个会话。')
       const run = await Run.start({ dir: join(runsDir, exec.agent.id), runId: exec.agent.id, services, signal: exec.signal })
       runs.set(exec.agent.id, run)
       exec.concludeTurn()
@@ -122,7 +125,7 @@ export function apply(ctx, config) {
 
   tool({
     name: 'pp_get_decision',
-    description: '向决策模块要本轮的推荐。recommendations 是默认要测的一批（每个带预测均值 mu、不确定度 sigma、得分 score）；alternatives 是排在后面的备选。每轮提交前必须至少调用一次。',
+    description: '向决策模块要本轮的推荐。recommendations 是默认要测的一批，alternatives 是排在后面的备选；每项带的数值随方法不同（比如 gp-ucb 给预测均值 mu、不确定度 sigma、得分 score，coverage 只给顺序分）。method 和 inputs_used 说明它用了什么方法和数据。每轮提交前必须至少调用一次。',
     parameters: {},
     async execute(_args, exec) {
       return requireRun(exec).getDecision(services, exec.signal)
@@ -131,21 +134,20 @@ export function apply(ctx, config) {
 
   tool({
     name: 'pp_submit_selection',
-    description: '提交本轮要测的一批候选。每个推荐都必须出现在 accept 里，或作为 replace 的 out 被换掉；替换必须给出 reason_type 和理由。框架会把这一批交给 oracle 测量、把读数交给决策模块，然后本 turn 结束。',
+    description: '提交本轮要测的一批候选。batch 的个数必须正好是本轮要求的个数（pp_get_decision 返回的 batch_size）；推荐以外的候选都要放进 groups 里某个 source 不是 decision 的组，并写明理由。框架会把这一批交给 oracle 测量、把读数交给决策模块，然后本 turn 结束。',
     parameters: {
-      accept: { type: 'array', required: true, items: { type: 'string' }, description: '原样接受的推荐 id' },
-      replace: {
+      batch: { type: 'array', required: true, items: { type: 'string' }, description: '本轮要测的候选 id' },
+      groups: {
         type: 'array',
         required: true,
-        description: '替换；不替换时传空数组',
+        description: '按依据分组的理由；全部照推荐时可以传空数组',
         items: {
           type: 'object',
           additionalProperties: false,
           properties: {
-            out: { type: 'string', required: true, description: '被换掉的推荐 id' },
-            in: { type: 'string', required: true, description: '换进来的候选 id（可以是已测过的，表示重复测量）' },
-            reason_type: { type: 'string', required: true, enum: [...REASON_TYPES], description: 'hypothesis_test 检验假设 / exploration 探索 / data_quality 复测可疑读数 / other' },
-            reason: { type: 'string', required: true, description: '一两句具体理由，引用读数或假设编号' },
+            ids: { type: 'array', required: true, items: { type: 'string' }, description: '这一组的候选 id，都要在 batch 里，一个 id 只能在一个组' },
+            source: { type: 'string', required: true, enum: [...SOURCES], description: 'decision 照推荐 / prior_knowledge 已有知识 / literature 本轮查到的文献 / analysis 分析结果 / hypothesis_test 检验假设 / exploration 探索 / data_quality 复测可疑读数' },
+            reason: { type: 'string', required: true, description: '一两句具体理由：引用读数、假设编号、分析编号或查到的来源' },
           },
         },
       },
@@ -186,7 +188,7 @@ export function apply(ctx, config) {
 
   tool({
     name: 'pp_get_ledger',
-    description: '取完整的读数账本、全部假设和笔记。状态简报里只列了前 15 个读数，需要全部时用这个。',
+    description: '取完整的读数账本（每次测量的全部读数字段）、全部假设、笔记和检索记录。状态简报里只列了最好的 10 个，需要全部时用这个。',
     parameters: {},
     async execute(_args, exec) {
       return requireRun(exec).ledger()
@@ -195,7 +197,7 @@ export function apply(ctx, config) {
 
   tool({
     name: 'pp_run_python',
-    description: '在本任务的运行目录里跑一段 Python 做分析（numpy 可用）。当前目录下有 observations.csv（id, round, value, replicate，全部读数）和 candidates.csv（id, f0, f1, …，候选特征）。用 print 输出结论；写出的文件会留在这次分析的目录里。这里不能测量新候选，测量只能经 pp_submit_selection。代码和输出都会记录。',
+    description: '在本任务的运行目录里跑一段 Python 做分析（numpy 可用）。当前目录下有 observations.csv（id, round, replicate 加每个读数字段，全部测量）、candidates.csv（任务包的候选表）、decision.csv（最近一次推荐里决策模块对每个候选的打分）、data/（任务包里公开的数据文件，比如候选特征）。用 print 输出结论；写出的文件会留在这次分析的目录里。这里不能测量新候选，测量只能经 pp_submit_selection。代码和输出都会记录。',
     parameters: {
       code: { type: 'string', required: true, description: '完整的 Python 脚本' },
       purpose: { type: 'string', required: true, description: '一句话：这段分析要回答什么' },
@@ -254,7 +256,7 @@ export function apply(ctx, config) {
       async status() {
         const [oracle, decision] = await Promise.all([
           check(probe.task, (x) => ({ task_id: x.task_id, synthetic: x.synthetic })),
-          check(probe.manifest, (x) => ({ name: x.name, version: x.version })),
+          check(probe.manifest, (x) => ({ name: x.name, version: x.version, method: x.method })),
         ])
         return {
           config: {
@@ -283,6 +285,10 @@ export function apply(ctx, config) {
     })
 
     ctx.on('session/event', (session, event) => {
+      if (event.type === 'tool/call' || event.type === 'tool/result') {
+        trackRetrieval(session.id, event)
+        return
+      }
       if (event.type !== 'user/message') return
       const agent = ctx.agents.get(session.id)
       const run = runFor(agent)
@@ -300,6 +306,26 @@ export function apply(ctx, config) {
         }
       }
     })
+
+    // 检索只记录不拦截：tool/call 记下调用，tool/result 回来时交给 Run 落盘。
+    function trackRetrieval(sessionId, event) {
+      const data = event.data ?? {}
+      if (event.type === 'tool/call') {
+        if (RETRIEVAL_TOOLS.includes(data.name) && runById(sessionId)) {
+          retrievalCalls.set(data.callId, { agent_id: sessionId, name: data.name, arguments: data.arguments })
+        }
+        return
+      }
+      const id = data.message?.toolCallId
+      const call = retrievalCalls.get(id)
+      if (!call) return
+      retrievalCalls.delete(id)
+      try {
+        runById(call.agent_id)?.recordRetrieval(call, data)
+      } catch (error) {
+        warn('could not record retrieval', error)
+      }
+    }
 
     ctx.on('agent/turn-stopping', ({ agent }) => {
       const run = runFor(agent)

@@ -1,125 +1,86 @@
-"""合成扰动筛选任务和 oracle。
+"""oracle：按任务包的隐藏读数表回答一批扰动的读数。
 
-这是一个**合成**任务，不是真实生物数据：候选基因的特征向量和真实效应都由随机种子生成。
-它的作用是让闭环能在本地、可复现地跑起来。
-
-复现性约定：同一个 seed 下，任务本身（候选、真实效应）完全确定；
-某个候选第 k 次被测到的读数也完全确定，与提交顺序、批次划分无关。
-这样从任意一轮分叉重放时，oracle 给出的结果一致。
+读数来自 hidden/scores.csv，一个候选一行、每个读数字段一列。
+任务卡片的 readout.noise_sd 大于 0 时（合成任务），每次读数加上确定性的测量噪声：
+噪声只由 (任务, 候选, 第几次测) 决定，与提交顺序、批次划分无关，从任意一轮分叉重放结果一致。
+没有 noise_sd 的任务（例如从已有筛选数据转换来的）每次读数都等于表里的值。
 """
 
 from __future__ import annotations
 
-import hashlib
-from dataclasses import dataclass, field
+import math
 from typing import Any
 
 import numpy as np
 
 from .jsonhttp import HttpError
+from .task import Package, read_csv, stable_int
 
-ORACLE_VERSION = "synthetic-screen/0.1"
-
-
-@dataclass
-class TaskConfig:
-    seed: int = 0
-    n_candidates: int = 200
-    n_features: int = 8
-    batch_size: int = 6
-    max_rounds: int = 10
-    noise_sd: float = 0.15
+ORACLE_VERSION = "score-table/0.2"
 
 
-def _stable_int(*parts: Any) -> int:
-    h = hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).digest()
-    return int.from_bytes(h[:8], "little")
-
-
-@dataclass
-class SyntheticScreen:
-    cfg: TaskConfig
-    ids: list[str] = field(init=False)
-    features: np.ndarray = field(init=False)
-    truth: np.ndarray = field(init=False)
-
-    def __post_init__(self) -> None:
-        rng = np.random.default_rng(_stable_int("task", self.cfg.seed))
-        n, d = self.cfg.n_candidates, self.cfg.n_features
-        self.ids = [f"G{i:03d}" for i in range(n)]
-        self.features = rng.standard_normal((n, d))
-        # 真实效应：几个高斯"通路"峰 + 一个弱线性项，峰值附近的基因效应最大。
-        centers = rng.standard_normal((3, d))
-        heights = np.array([1.6, 1.1, 0.8])
-        dist2 = ((self.features[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
-        bumps = (heights[None, :] * np.exp(-dist2 / (2 * 1.5**2))).sum(-1)
-        linear = self.features @ (0.1 * rng.standard_normal(d))
-        self.truth = bumps + linear
-
-    def index_of(self, cid: str) -> int:
-        try:
-            return self.ids.index(cid)
-        except ValueError:
-            raise HttpError(400, f"unknown candidate id {cid!r}") from None
-
-    def measure(self, cid: str, replicate: int) -> float:
-        i = self.index_of(cid)
-        rng = np.random.default_rng(_stable_int("noise", self.cfg.seed, cid, replicate))
-        return float(self.truth[i] + self.cfg.noise_sd * rng.standard_normal())
-
-    def card(self) -> dict[str, Any]:
-        return {
-            "task_id": f"synthetic-screen-seed{self.cfg.seed}",
-            "title": "合成 CRISPR 敲除筛选：找出敲除后目标表型下降最多的基因",
-            "synthetic": True,
-            "objective": {"name": "phenotype_reduction", "direction": "maximize"},
-            "batch_size": self.cfg.batch_size,
-            "max_rounds": self.cfg.max_rounds,
-            "data_cards": [
-                {
-                    "name": "gene_embedding",
-                    "modality": "embedding",
-                    "index": "gene",
-                    "role": "candidate_features",
-                    "shape": [self.cfg.n_candidates, self.cfg.n_features],
-                },
-                {
-                    "name": "phenotype_readout",
-                    "modality": "scalar",
-                    "index": "gene",
-                    "role": "round_readout",
-                    "noise_sd": self.cfg.noise_sd,
-                },
-            ],
-            "candidates": [
-                {"id": cid, "features": [round(float(v), 6) for v in self.features[i]]}
-                for i, cid in enumerate(self.ids)
-            ],
-        }
+def _num(text: str) -> float | None:
+    try:
+        v = float(text)
+    except ValueError:
+        return None
+    return v if math.isfinite(v) else None
 
 
 class Oracle:
     """实验通道：接收一批候选，当场返回读数。"""
 
-    def __init__(self, cfg: TaskConfig):
-        self.task = SyntheticScreen(cfg)
+    def __init__(self, package: Package):
+        self.package = package
+        self.card = package.card
+        self.fields = [f["name"] for f in self.card["readout"]["fields"]]
+        self.noise_sd = float(self.card["readout"].get("noise_sd") or 0.0)
+        self.batch_size = int(self.card["budget"]["batch_size"])
+        self.allow_repeats = bool(self.card["budget"].get("allow_repeats", False))
+        self.known = set(package.ids)
+
+        header, rows = read_csv(package.root / "hidden" / "scores.csv")
+        missing = [f for f in self.fields if f not in header]
+        if header[0] != "id" or missing:
+            raise ValueError(f"hidden/scores.csv must have an id column and readout fields {self.fields}")
+        cols = [header.index(f) for f in self.fields]
+        self.table: dict[str, dict[str, float | None]] = {
+            r[0]: {f: _num(r[c]) for f, c in zip(self.fields, cols)} for r in rows
+        }
         self.replicates: dict[str, int] = {}
         self.log: list[dict[str, Any]] = []
+
+    def measure(self, cid: str, replicate: int) -> dict[str, float | None] | None:
+        row = self.table.get(cid)
+        if row is None:
+            return None
+        if self.noise_sd <= 0:
+            return dict(row)
+        out: dict[str, float | None] = {}
+        for f, v in row.items():
+            rng = np.random.default_rng(stable_int("noise", self.card["task_id"], f, cid, replicate))
+            out[f] = None if v is None else float(v + self.noise_sd * rng.standard_normal())
+        return out
 
     def run(self, body: dict[str, Any]) -> dict[str, Any]:
         batch = body.get("batch")
         round_ = body.get("round")
         if not isinstance(batch, list) or not batch or not all(isinstance(c, str) for c in batch):
             raise HttpError(400, "batch must be a non-empty list of candidate ids")
-        if len(batch) > self.task.cfg.batch_size:
-            raise HttpError(400, f"batch size {len(batch)} exceeds limit {self.task.cfg.batch_size}")
+        if len(batch) > self.batch_size:
+            raise HttpError(400, f"batch size {len(batch)} exceeds limit {self.batch_size}")
         for cid in batch:
-            self.task.index_of(cid)
+            if cid not in self.known:
+                raise HttpError(400, f"unknown candidate id {cid!r}")
+        if not self.allow_repeats:
+            again = [c for c in batch if self.replicates.get(c)] or [c for i, c in enumerate(batch) if c in batch[:i]]
+            if again:
+                raise HttpError(400, f"repeats are not allowed in this task: {again[0]!r}")
         results = []
         for cid in batch:
             rep = self.replicates.get(cid, 0)
             self.replicates[cid] = rep + 1
-            results.append({"id": cid, "value": self.task.measure(cid, rep), "replicate": rep})
+            results.append({"id": cid, "replicate": rep, "readout": self.measure(cid, rep)})
         entry = {"round": round_, "results": results}
         self.log.append(entry)
         return {"oracle_version": ORACLE_VERSION, **entry}
@@ -133,7 +94,7 @@ class Oracle:
 
     def routes(self) -> dict[tuple[str, str], Any]:
         return {
-            ("GET", "/task"): lambda _b: self.task.card(),
+            ("GET", "/task"): lambda _b: self.package.public_card(),
             ("POST", "/run"): self.run,
             ("POST", "/reset"): self.reset,
             ("GET", "/health"): lambda _b: {"ok": True, "oracle_version": ORACLE_VERSION},

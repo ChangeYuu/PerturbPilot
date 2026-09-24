@@ -1,7 +1,7 @@
 // 面板路由测试：真实的 Run（oracle 和决策模块用替身）+ 真实的 HTTP 处理函数，检查视图内容、防伪造、控制动作。
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,15 +15,18 @@ let server
 let base
 let run
 let controlled
+let packages
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'pp-panel-'))
-  const services = fakeServices()
+  const services = fakeServices({ empty: ['G002'] })
+  packages = [services.packageDir]
   run = await Run.start({ dir, runId: 'sess-1', services })
   run.markDriven(1)
   const d = await run.getDecision(services)
   const ids = d.recommendations.map((x) => x.id)
-  await run.submitSelection({ accept: ids.slice(1), replace: [{ out: ids[0], in: d.alternatives[0].id, reason_type: 'exploration', reason: '看看' }] }, services)
+  const extra = d.alternatives[0].id
+  await run.submitSelection({ batch: [ids[1], ids[2], extra], groups: [{ ids: [extra], source: 'exploration', reason: '看看' }] }, services)
   run.writeNote({ text: '第一轮读数都偏低', cites: [ids[1]] })
   controlled = []
   const handler = createPanelHandler({
@@ -40,6 +43,7 @@ beforeEach(async () => {
 afterEach(() => {
   server.close()
   rmSync(dir, { recursive: true, force: true })
+  for (const p of packages) rmSync(p, { recursive: true, force: true })
 })
 
 const post = (path, body, headers = { 'content-type': 'application/json', 'x-perturbpilot': '1' }) =>
@@ -50,20 +54,42 @@ test('view summarizes rounds, audit, ranked observations and events', () => {
   assert.equal(view.status, 'active')
   assert.equal(view.round, 2)
   assert.deepEqual(view.controls, ['pause', 'stop'])
+  assert.deepEqual(view.task.budget, { rounds: 3, batch_size: 3, allow_repeats: true })
+  assert.equal(view.task.goal, 'high')
+  assert.equal(view.task.objective_text, '找效应最强的基因（看 score，越高越好）')
+  assert.deepEqual(view.task.readout_fields, ['score', 'absolute_effect'])
+  assert.equal(view.decision.method, 'coverage')
   assert.equal(view.rounds.length, 2)
   const [r1, r2] = view.rounds
-  assert.equal(r1.results.length, 3)
-  assert.equal(r1.submission.replace[0].reason_type, 'exploration')
+  assert.equal(r1.method, 'coverage')
+  assert.deepEqual(r1.submission, {
+    batch: ['G001', 'G002', 'G003'],
+    groups: [{ ids: ['G003'], source: 'exploration', reason: '看看' }],
+    outside: ['G003'],
+    from_recommendation: 2,
+  })
+  assert.deepEqual(r1.results[0], { id: 'G001', replicate: 0, value: 0.8415, readout: { score: 0.8415, absolute_effect: 0.8415 } })
+  assert.deepEqual(r1.results[1], { id: 'G002', replicate: 0, value: null, readout: null })
+  assert.deepEqual(r1.receipt, { accepted: 2, rejected: 1, state_version_before: 0, state_version_after: 1 })
   assert.equal(r1.checks.receipt_complete.result, 'pass')
   assert.equal(r1.checks.state_carried.result, 'pending')
   assert.equal(r2.submission, null)
   assert.equal(r2.results, null)
-  // 目标是 maximize，读数按从大到小排
-  const values = view.observations.map((o) => o.value)
-  assert.deepEqual(values, [...values].sort((a, b) => b - a))
+  // 目标越高越好，读数按从大到小排，空读数在最后
+  assert.deepEqual(view.observations.map((o) => [o.id, o.value]), [['G001', 0.8415], ['G003', 0.1411], ['G002', null]])
   assert.equal(view.notes[0].text, '第一轮读数都偏低')
+  assert.deepEqual(view.retrievals, [])
   assert.ok(view.events.some((e) => e.type === 'selection/submitted' && e.source === 'model'))
   assert.ok(view.events.every((e) => !('data' in e)))
+})
+
+test('view lists retrievals with their round and tool', () => {
+  run.recordRetrieval({ name: 'web_search', arguments: { queries: ['G001 通路'] } }, { message: { isError: false, content: [{ type: 'text', text: 'x' }] }, meta: { sources: [{ url: 'https://example.org', title: 'E' }] } })
+  const [x] = panelView(run).retrievals
+  assert.equal(x.round, 2)
+  assert.equal(x.tool, 'web_search')
+  assert.deepEqual(x.queries, ['G001 通路'])
+  assert.deepEqual(x.results, [{ title: 'E', url: 'https://example.org' }])
 })
 
 test('GET returns the view, or null for a session without a task', async () => {
@@ -111,16 +137,22 @@ test('run list and status routes', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pp-runs-'))
   try {
     const services = fakeServices()
+    packages.push(services.packageDir)
     await Run.start({ dir: join(root, 'older'), runId: 'older', services })
     await new Promise((r) => setTimeout(r, 20))
     const newer = await Run.start({ dir: join(root, 'newer'), runId: 'newer', services })
     newer.control('stop', 'human')
+    // 早期版本留下的记录：只列出，标 legacy。
+    mkdirSync(join(root, 'ancient'))
+    writeFileSync(join(root, 'ancient', 'state.json'), JSON.stringify({ runId: 'ancient', status: 'finished', round: 3, task: { title: '旧任务', max_rounds: 3 } }), 'utf8')
+    utimesSync(join(root, 'ancient', 'state.json'), new Date(2000, 0, 1), new Date(2000, 0, 1))
     mkdirSync(join(root, 'not-a-run'))
     writeFileSync(join(root, 'stray.txt'), 'x', 'utf8')
     const runs = listRuns(root)
-    assert.deepEqual(runs.map((x) => [x.run_id, x.status, x.round, x.max_rounds, x.title, x.synthetic]), [
-      ['newer', 'stopped', 1, 3, '测试任务', true],
-      ['older', 'active', 1, 3, '测试任务', true],
+    assert.deepEqual(runs.map((x) => [x.run_id, x.status, x.round, x.max_rounds, x.title, x.synthetic, x.legacy ?? false]), [
+      ['newer', 'stopped', 1, 3, '测试任务', true, false],
+      ['older', 'active', 1, 3, '测试任务', true, false],
+      ['ancient', 'finished', 3, 3, '旧任务', null, true],
     ])
     assert.deepEqual(listRuns(join(root, 'missing')), [])
 
@@ -129,7 +161,7 @@ test('run list and status routes', async () => {
     await new Promise((r) => s.listen(0, '127.0.0.1', r))
     const b = `http://127.0.0.1:${s.address().port}${PANEL_ROUTE}`
     try {
-      assert.deepEqual((await (await fetch(`${b}/sessions`)).json()).runs.map((x) => x.run_id), ['newer', 'older'])
+      assert.deepEqual((await (await fetch(`${b}/sessions`)).json()).runs.map((x) => x.run_id), ['newer', 'older', 'ancient'])
       assert.deepEqual(await (await fetch(`${b}/status`)).json(), { token_set: false })
       assert.equal((await fetch(`${b}/sessions`, { method: 'POST' })).status, 405)
       assert.equal((await fetch(`${b}/status/x`)).status, 404)

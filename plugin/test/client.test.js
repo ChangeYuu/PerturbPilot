@@ -2,7 +2,7 @@
 // 被测的注册逻辑、视图渲染、以及面板和宿主路由之间的请求照常运行（路由是真实的 createPanelHandler）。
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -52,13 +52,14 @@ let dir
 let run
 let server
 let base
+let services
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'pp-client-'))
-  const services = fakeServices()
+  services = fakeServices()
   run = await Run.start({ dir: join(dir, 'sess-1'), runId: 'sess-1', services })
   run.markDriven(1)
   const d = await run.getDecision(services)
-  await run.submitSelection({ accept: d.recommendations.map((x) => x.id), replace: [] }, services)
+  await run.submitSelection({ batch: d.recommendations.map((x) => x.id), groups: [] }, services)
   run.updateHypothesis({ text: 'G001 附近值高', status: 'proposed', cites: [run.state.observations[0].id] })
   run.updateHypothesis({ id: 'H1', status: 'weakened', cites: [], rationale: '复测后不高了' })
   run.writeNote({ text: '第一条笔记', cites: [] })
@@ -80,6 +81,7 @@ before(async () => {
 after(() => {
   server.close()
   rmSync(dir, { recursive: true, force: true })
+  rmSync(services.packageDir, { recursive: true, force: true })
 })
 
 test('bundle registers under the package name with a page tab type and a session-scoped body', () => {
@@ -136,10 +138,10 @@ function settled(args, value, { isError = false, error } = {}) {
   return { phase: 'result', block: { kind: 'tool-result', callId: 'c1', call: { argsRaw: JSON.stringify(args) }, content: [{ type: 'text', text }], isError, error } }
 }
 
-test('tool cards show recommendations, replacements with reasons and readings from real tool results', async () => {
+test('tool cards show recommendations, grouped reasons and readings from real tool results', async () => {
   const { exports } = loadClient(fakeReact())
   const card = (toolName, props) => exports.ToolCard({ toolName, callId: 'c1', ...props })
-  const services = fakeServices()
+  const services = fakeServices({ empty: ['G002'] })
   const d2 = mkdtempSync(join(tmpdir(), 'pp-card-'))
   try {
     const r = await Run.start({ dir: d2, runId: 's2', services })
@@ -147,21 +149,22 @@ test('tool cards show recommendations, replacements with reasons and readings fr
     const tree = card('pp_get_decision', settled({}, decision))
     const all = text(tree)
     assert.match(all, /决策模块推荐/)
-    assert.match(all, /第 1\/3 轮/)
+    assert.match(all, /第 1\/3 轮 · 方法 coverage/)
+    assert.match(all, /推荐得分/) // 数值列按决策模块给的字段显示
     for (const x of decision.recommendations) assert.ok(all.includes(x.id))
     assert.equal(find(tree, (n) => n.type === 'tbody')[0].children.length, decision.recommendations.length)
 
     const ids = decision.recommendations.map((x) => x.id)
-    const args = { accept: ids.slice(1), replace: [{ out: ids[0], in: 'G009', reason_type: 'exploration', reason: '看看 G009 那一带' }] }
+    const args = { batch: [ids[1], ids[2], 'G009'], groups: [{ ids: ['G009'], source: 'exploration', reason: '看看 G009 那一带' }] }
     const running = text(card('pp_submit_selection', started(args)))
     assert.match(running, /进行中/)
-    assert.match(running, new RegExp(`${ids[0]} → G009`))
+    assert.match(running, /提交 3 个候选，分 1 组写了依据/)
+    assert.match(running, /G009探索看看 G009 那一带/)
     const result = await r.submitSelection(args, services)
     const done = text(card('pp_submit_selection', settled(args, result)))
-    assert.match(done, /接受 2 个推荐，替换 1 个/)
-    assert.match(done, /探索看看 G009 那一带/)
-    for (const x of result.results) assert.ok(done.includes(String(x.value)))
-    assert.match(done, /替换进来/)
+    assert.match(done, /G001score=0\.8415, absolute_effect=0\.8415推荐/)
+    assert.match(done, /G002空推荐/)
+    assert.match(done, /G009score=0\.4121, absolute_effect=0\.4121推荐以外/)
     assert.match(done, /下一轮：第 2\/3 轮/)
 
     const hArgs = { text: 'G009 附近值高', status: 'proposed', cites: ['G009'], rationale: '第 1 轮读数' }
@@ -180,9 +183,9 @@ test('tool cards show errors, interruptions and the preparing phase', () => {
   const { exports } = loadClient(fakeReact())
   const card = (toolName, props) => exports.ToolCard({ toolName, callId: 'c1', ...props })
   assert.match(text(card('pp_get_decision', { phase: 'preparing', block: { callId: 'c1' } })), /准备中/)
-  const err = card('pp_submit_selection', settled({ accept: [] }, '既没有 accept 也没有被替换：G000', { isError: true }))
+  const err = card('pp_submit_selection', settled({ batch: [] }, '这一轮要正好交 3 个候选，交了 0 个', { isError: true }))
   assert.equal(err.props.className, 'pp-tool pp-tool-error')
-  assert.match(text(err), /既没有 accept/)
+  assert.match(text(err), /正好交 3 个/)
   const stopped = card('pp_write_note', settled({ text: 'x', cites: [] }, [], { isError: true, error: { name: 'AbortError', code: 'interrupted' } }))
   assert.match(text(stopped), /已中断/)
   // 结果文本不是 JSON 时不报错，只是不显示结果部分
@@ -205,10 +208,10 @@ test('panel renders loading, empty, error and full states', () => {
   assert.match(all, /第 2\/3 轮/)
   assert.match(all, /G001 附近值高/)
   for (const r of view.rounds[0].results) assert.ok(all.includes(`${r.id}=${r.value}`))
-  // 第 1 轮前三项审计通过
+  // 第 1 轮：调用、提交通过；没写文献理由，文献核对不适用；回执通过
   const marks = find(tree, (n) => n.props.className?.startsWith?.('pp-check '))
-  assert.equal(marks.length, view.rounds.length * 5)
-  assert.deepEqual(marks.slice(0, 3).map((n) => n.props.className), ['pp-check pp-pass', 'pp-check pp-pass', 'pp-check pp-pass'])
+  assert.equal(marks.length, view.rounds.length * 6)
+  assert.deepEqual(marks.slice(0, 4).map((n) => n.props.className), ['pp-check pp-pass', 'pp-check pp-pass', 'pp-check pp-na', 'pp-check pp-pass'])
 
   const actions = []
   const buttons = find(render({ view, onControl: (a) => actions.push(a) }), (n) => n.type === 'button')
@@ -291,12 +294,12 @@ test('ledger page renders the run list and the whole record of the selected run'
   assert.match(all, /科学台账/)
   assert.match(all, /测试任务/)
 
-  // 总览：目标、当前最佳、已测数量、改推荐的比例、审计
+  // 总览：目标、当前最佳、已测数量、推荐以外的比例、审计
   const best = view.observations[0]
-  assert.match(all, new RegExp(`目标：在 ${view.task.n_candidates} 个候选里找出`))
+  assert.match(all, new RegExp(`目标：找效应最强的基因（看 score，越高越好），候选 ${view.task.n_candidates} 个`))
   assert.match(all, new RegExp(`当前最佳${best.id} = ${best.value}第 1 轮测到`))
   assert.match(all, new RegExp(`已测3 / ${view.task.n_candidates}`))
-  assert.match(all, /agent 改了推荐0 \/ 3占 0%/)
+  assert.match(all, /推荐以外的0 \/ 3占 0%/)
   assert.match(all, /审计全部通过/)
   // 进展图每个读数一个点，本轮新的最佳单独标出
   const dots = find(tree, (n) => n.type === 'circle')
@@ -313,7 +316,7 @@ test('ledger page renders the run list and the whole record of the selected run'
   assert.equal(cards.length, 2)
   const [r1, r2] = cards.map(text)
   for (const id of view.rounds[0].recommendations) assert.ok(r1.includes(id))
-  assert.match(r1, /全部接受推荐/)
+  assert.match(r1, /全部照推荐/)
   assert.equal(find(cards[0], (n) => n.props.className === 'pp-bar-row').length, 3)
   assert.match(r1, new RegExp(`${best.id}.*${best.value}新的最佳`))
   assert.match(r1, /决策模块收下 3 条读数，状态版本 0 → 1/)
@@ -339,19 +342,33 @@ test('ledger page renders the run list and the whole record of the selected run'
   assert.match(text(render({ runs, selected: 'sess-1', view: null, error: 'HTTP 500' })), /出错了：HTTP 500.*读不到/)
 })
 
-test('ledger replacement reasons show up in the rounds table', async () => {
+test('ledger rounds show the groups outside the recommendation, retrievals and legacy runs', async () => {
   const { exports } = loadClient(fakeReact())
   const services = fakeServices()
   const d2 = mkdtempSync(join(tmpdir(), 'pp-ledger-'))
   try {
     const r = await Run.start({ dir: d2, runId: 's3', services })
+    r.recordRetrieval({ name: 'web_search', arguments: { queries: ['G009 通路'] } }, { message: { isError: false, content: [{ type: 'text', text: 'x' }] }, meta: { sources: [{ url: 'https://example.org/a', title: '一篇综述' }] } })
     const ids = (await r.getDecision(services)).recommendations.map((x) => x.id)
-    await r.submitSelection({ accept: ids.slice(1), replace: [{ out: ids[0], in: 'G009', reason_type: 'hypothesis_test', reason: '检验 H1' }] }, services)
-    const all = text(exports.renderLedger({ runs: listRuns(d2), selected: 's3', view: panelView(r), onSelect: () => {}, onControl: () => {} }))
-    assert.match(all, new RegExp(`${ids[0]} → G009`))
-    assert.match(all, /检验 H1/)
+    await r.submitSelection({ batch: [ids[1], ids[2], 'G009'], groups: [{ ids: ['G009'], source: 'literature', reason: '综述里 G009 在同一通路' }] }, services)
+    // 早期版本的记录：列出来但点不开
+    mkdirSync(join(d2, 'old'))
+    writeFileSync(join(d2, 'old', 'state.json'), JSON.stringify({ runId: 'old', status: 'finished', round: 3, task: { title: '旧任务', max_rounds: 3 } }), 'utf8')
+    const picked = []
+    const tree = exports.renderLedger({ runs: listRuns(d2), selected: 's3', view: panelView(r), onSelect: (id) => picked.push(id), onControl: () => {} })
+    const all = text(tree)
+    assert.match(all, /推荐以外 1 个/)
+    assert.match(all, /G009文献综述里 G009 在同一通路/)
+    assert.match(all, /检索R1 搜索 G009 通路 · 1 条结果/)
+    assert.match(all, /一篇综述/)
+    assert.match(all, /✓ 文献核对/)
+    const legacy = find(tree, (n) => n.type === 'button' && n.props.className?.includes?.('pp-run-legacy'))
+    assert.equal(legacy.length, 1)
+    assert.equal(legacy[0].props.disabled, true)
+    assert.match(text(legacy[0]), /旧格式/)
   } finally {
     rmSync(d2, { recursive: true, force: true })
+    rmSync(services.packageDir, { recursive: true, force: true })
   }
 })
 

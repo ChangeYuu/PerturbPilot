@@ -6,7 +6,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { auditRun } from './audit.js'
-import { CONTROL_ACTIONS, RunError } from './run.js'
+import { CONTROL_ACTIONS, RunError, STATE_FORMAT, roundReadout, round4 } from './run.js'
+import { lowerIsBetter, objectiveText, objectiveValue } from './task.js'
 
 export const PANEL_ROUTE = '/perturbpilot/api'
 const SESSION_ID = /^[A-Za-z0-9_.:-]{1,200}$/
@@ -14,14 +15,19 @@ const MAX_BODY = 4096
 // 左上角和新会话中间的 logo，由 client.js 的品牌插槽显示。
 export const LOGO_PATH = fileURLToPath(new URL('../assets/logo.png', import.meta.url))
 
-/** 面板显示用的视图：状态、每轮的推荐 / 选择 / 读数 / 审计、读数排名、假设（含历次更新）、笔记、分析、最近的事件。 */
+/**
+ * 面板显示用的视图：状态、每轮的推荐 / 选择 / 读数 / 审计、读数排名、假设（含历次更新）、笔记、分析、检索、最近的事件。
+ * 每条读数带 value（目标字段的值，空读数为 null）和完整的 readout。
+ */
 export function panelView(run, { events = 40 } = {}) {
   const s = run.state
   const audit = auditRun(s)
   const all = readEvents(run.recorder.dir)
   const auditByRound = new Map(audit.rounds.map((x) => [x.round, x.checks]))
+  const objective = s.task.objective
+  const reading = (x) => ({ id: x.id, round: x.round, replicate: x.replicate, value: nullableRound(objectiveValue(x.readout, objective)), readout: roundReadout(x.readout) })
   const rounds = []
-  for (let r = 1; r <= Math.min(s.round, s.task.max_rounds); r++) {
+  for (let r = 1; r <= Math.min(s.round, s.task.budget.rounds); r++) {
     const rec = s.rounds[r]
     const last = rec?.proposals.at(-1)
     rounds.push({
@@ -29,8 +35,14 @@ export function panelView(run, { events = 40 } = {}) {
       proposals: rec?.proposals.length ?? 0,
       recommendations: last?.recommendations ?? [],
       steers: rec?.steers ?? 0,
-      submission: rec?.submission ? { accept: rec.submission.accept, replace: rec.submission.replace, batch: rec.submission.batch } : null,
-      results: rec?.results?.map((x) => ({ id: x.id, value: round4(x.value), replicate: x.replicate })) ?? null,
+      method: last?.method ?? null,
+      submission: rec?.submission ? {
+        batch: rec.submission.batch,
+        groups: rec.submission.groups,
+        outside: rec.submission.outside,
+        from_recommendation: rec.submission.from_recommendation,
+      } : null,
+      results: rec?.results?.map((x) => { const { round, ...rest } = reading(x); return rest }) ?? null,
       receipt: rec?.receipt ? {
         accepted: rec.receipt.accepted.length,
         rejected: rec.receipt.rejected.length,
@@ -40,19 +52,21 @@ export function panelView(run, { events = 40 } = {}) {
       checks: auditByRound.get(r) ?? {},
     })
   }
-  const direction = s.task.objective.direction === 'minimize' ? 1 : -1
-  const observations = s.observations
-    .map((o) => ({ id: o.id, value: round4(o.value), replicate: o.replicate, round: o.round }))
-    .sort((a, b) => direction * (a.value - b.value))
+  const sign = lowerIsBetter(objective) ? 1 : -1
+  // 空读数排在最后。
+  const observations = s.observations.map(reading).sort((a, b) => (a.value === null) - (b.value === null) || sign * (a.value - b.value))
   return {
     run_id: s.runId,
     task: {
       task_id: s.task.task_id,
       title: s.task.title,
       synthetic: s.task.synthetic,
-      objective: s.task.objective,
-      batch_size: s.task.batch_size,
-      max_rounds: s.task.max_rounds,
+      action: s.task.action,
+      objective,
+      objective_text: objectiveText(objective),
+      goal: lowerIsBetter(objective) ? 'low' : 'high',
+      readout_fields: s.task.readout.fields.map((f) => f.name),
+      budget: s.task.budget,
       n_candidates: s.task.n_candidates,
     },
     decision: s.decision,
@@ -65,6 +79,9 @@ export function panelView(run, { events = 40 } = {}) {
     hypotheses: s.hypotheses.map((h) => ({ ...h, history: h.history ?? [], updates: h.history?.length ?? 0 })),
     notes: s.notes,
     analyses: all.filter((e) => e.type === 'analysis/executed').map((e) => ({ round: e.round, ts: e.ts, ...e.data })),
+    retrievals: all
+      .filter((e) => e.type === 'retrieval/searched' || e.type === 'retrieval/fetched')
+      .map((e) => ({ round: e.round, ts: e.ts, tool: e.type === 'retrieval/searched' ? 'web_search' : 'web_fetch', ...e.data })),
     events: all.slice(-events).map(({ seq, ts, round, type, source }) => ({ seq, ts, round, type, source })),
   }
 }
@@ -75,7 +92,7 @@ function readEvents(dir) {
   return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
 }
 
-/** runs/ 下所有任务的摘要，最近更新的在前。读不了的目录跳过。 */
+/** runs/ 下所有任务的摘要，最近更新的在前。读不了的目录跳过；早期版本的记录标 legacy，面板只列不展开。 */
 export function listRuns(runsDir) {
   if (!existsSync(runsDir)) return []
   const out = []
@@ -84,6 +101,7 @@ export function listRuns(runsDir) {
     const path = join(runsDir, id, 'state.json')
     try {
       const s = JSON.parse(readFileSync(path, 'utf8'))
+      const legacy = s.format !== STATE_FORMAT
       out.push({
         run_id: id,
         title: s.task?.title ?? id,
@@ -91,7 +109,8 @@ export function listRuns(runsDir) {
         synthetic: s.task?.synthetic ?? null,
         status: s.status,
         round: s.round,
-        max_rounds: s.task?.max_rounds ?? null,
+        max_rounds: (legacy ? s.task?.max_rounds : s.task?.budget?.rounds) ?? null,
+        ...(legacy ? { legacy: true } : {}),
         updated: statSync(path).mtime.toISOString(),
       })
     } catch {}
@@ -173,6 +192,6 @@ function send(res, status, value) {
   res.end(JSON.stringify(value))
 }
 
-function round4(x) {
-  return Math.round(x * 1e4) / 1e4
+function nullableRound(x) {
+  return x === null ? null : round4(x)
 }

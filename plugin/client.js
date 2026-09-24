@@ -4,7 +4,7 @@
 // - 设置里的 PerturbPilot 一页：只读显示插件配置、服务连不连得上、服务令牌设没设。
 //   数据都来自宿主侧挂在同源 web 服务上的 /perturbpilot/api（见 lib/panel.js）。
 // - 左上角和新会话中间的 logo（占 DSH 的品牌插槽，图由 /perturbpilot/api/logo 给）。
-// - 对话区里每个 pp_* 工具调用的卡片（推荐表、替换理由和读数、假设、笔记、分析），代替通用的参数/结果行。
+// - 对话区里每个 pp_* 工具调用的卡片（推荐表、分组理由和读数、假设、笔记、分析），代替通用的参数/结果行。
 // 不经过构建：直接按 DSH 浏览器模块的注册格式手写，只用平台自带的 react。
 window.__ModuleLoader__.load({
 	id: "perturbpilot",
@@ -27,12 +27,22 @@ window.__ModuleLoader__.load({
 		const CHECKS = [
 			["decision_called", "调用决策模块"],
 			["selection_submitted", "提交选择"],
+			["literature_backed", "文献核对"],
 			["receipt_complete", "回执完整"],
 			["state_carried", "状态衔接"],
 			["cited_later", "后续引用"],
 		];
 		const RESULT_MARK = { pass: "✓", fail: "✗", pending: "…", "n/a": "–" };
-		const REASON_TEXT = { hypothesis_test: "检验假设", exploration: "探索", data_quality: "复测", other: "其他" };
+		const SOURCE_TEXT = {
+			decision: "照推荐",
+			prior_knowledge: "已有知识",
+			literature: "文献",
+			analysis: "分析",
+			hypothesis_test: "检验假设",
+			exploration: "探索",
+			data_quality: "复测",
+		};
+		const SCORE_TEXT = { mu: "预测均值", sigma: "不确定度", score: "得分" };
 		const HYPOTHESIS_TEXT = { proposed: "提出", supported: "支持", weakened: "削弱", rejected: "否定" };
 
 		// ---- 数据 ----
@@ -74,6 +84,21 @@ window.__ModuleLoader__.load({
 
 		// ---- 视图（纯函数，只产出元素树） ----
 
+		/** 目标值；空读数显示成“空”。 */
+		function fmt(v) {
+			return v === null || v === undefined ? "空" : String(v);
+		}
+
+		/** 一条读数的全部字段，比如 “score=-1.2, absolute_effect=1.2”。 */
+		function readoutText(readout) {
+			if (!readout) return "空";
+			return Object.entries(readout).map(([k, v]) => `${k}=${v === null ? "空" : v}`).join(", ");
+		}
+
+		function sourceText(source) {
+			return SOURCE_TEXT[source] ?? source;
+		}
+
 		function section(title, ...children) {
 			return h("section", { className: "pp-section" }, h("h4", null, title), ...children);
 		}
@@ -98,10 +123,10 @@ window.__ModuleLoader__.load({
 				h("div", { className: "pp-title" }, t.title, t.synthetic ? h("span", { className: "pp-tag" }, "合成数据") : null),
 				h("div", { className: "pp-meta" },
 					h("span", { className: `pp-status pp-status-${view.status}` }, STATUS_TEXT[view.status] ?? view.status),
-					h("span", null, view.status === "finished" ? `共 ${t.max_rounds} 轮` : `第 ${Math.min(view.round, t.max_rounds)}/${t.max_rounds} 轮`),
-					h("span", null, `每轮 ${t.batch_size} 个 · 候选 ${t.n_candidates} 个`),
-					h("span", null, `目标：${t.objective.name}${t.objective.direction === "minimize" ? "（越小越好）" : "（越大越好）"}`),
-					h("span", null, `决策模块：${view.decision.name} ${view.decision.version}`)),
+					h("span", null, view.status === "finished" ? `共 ${t.budget.rounds} 轮` : `第 ${Math.min(view.round, t.budget.rounds)}/${t.budget.rounds} 轮`),
+					h("span", null, `每轮 ${t.budget.batch_size} 个 · 候选 ${t.n_candidates} 个`),
+					h("span", null, `目标：${t.objective_text}`),
+					h("span", null, `决策模块：${view.decision.name} ${view.decision.version} · ${view.decision.method}`)),
 				buttons.length ? h("div", { className: "pp-controls" }, ...buttons) : null);
 		}
 
@@ -115,9 +140,9 @@ window.__ModuleLoader__.load({
 		function selectionCell(round) {
 			const s = round.submission;
 			if (!s) return round.proposals ? "未提交" : "—";
-			const parts = [`接受 ${s.accept.length}`];
-			for (const r of s.replace) parts.push(`${r.out} → ${r.in}（${REASON_TEXT[r.reason_type] ?? r.reason_type}）`);
-			return h("span", { title: s.replace.map((r) => `${r.out} → ${r.in}：${r.reason}`).join("\n") }, parts.join("；"));
+			const parts = [`照推荐 ${s.from_recommendation}`];
+			for (const g of s.groups) if (g.source !== "decision") parts.push(`${sourceText(g.source)} ${g.ids.join(", ")}`);
+			return h("span", { title: s.groups.map((g) => `${sourceText(g.source)}（${g.ids.join(", ")}）：${g.reason}`).join("\n") }, parts.join("；"));
 		}
 
 		function roundsSection(view) {
@@ -125,7 +150,7 @@ window.__ModuleLoader__.load({
 				String(r.round),
 				r.recommendations.join(", ") || "—",
 				selectionCell(r),
-				r.results ? r.results.map((x) => `${x.id}=${x.value}${x.replicate ? "(复)" : ""}`).join(", ") : "—",
+				r.results ? r.results.map((x) => `${x.id}=${fmt(x.value)}${x.replicate ? "(复)" : ""}`).join(", ") : "—",
 				auditCell(r.checks),
 			]);
 			const c = view.audit_counts;
@@ -137,7 +162,7 @@ window.__ModuleLoader__.load({
 		function observationsSection(view) {
 			const top = view.observations.slice(0, 10);
 			return section(`读数排名（共 ${view.observations.length} 条，前 ${top.length}）`,
-				top.length ? table(["候选", "读数", "轮"], top.map((o) => [o.id + (o.replicate ? "（复测）" : ""), String(o.value), String(o.round)]))
+				top.length ? table(["候选", "读数", "轮"], top.map((o) => [o.id + (o.replicate ? "（复测）" : ""), fmt(o.value), String(o.round)]))
 					: h("p", { className: "pp-empty" }, "还没有读数"));
 		}
 
@@ -188,9 +213,9 @@ window.__ModuleLoader__.load({
 
 		/** 从视图里算出台账页要用的派生数据：每轮的至今最佳、每轮的思考记录、总览数字。 */
 		function ledgerModel(view) {
-			const minimize = view.task.objective.direction === "minimize";
+			const minimize = view.task.goal === "low";
 			const better = (a, b) => (minimize ? a < b : a > b);
-			const values = view.observations.map((o) => o.value);
+			const values = view.observations.map((o) => o.value).filter((v) => v !== null);
 			const range = values.length ? [Math.min(...values), Math.max(...values)] : [0, 1];
 			let best = null;
 			let replaced = 0;
@@ -198,13 +223,13 @@ window.__ModuleLoader__.load({
 			const rounds = view.rounds.map((r) => {
 				let newBest = null;
 				for (const x of r.results ?? []) {
-					if (!best || better(x.value, best.value)) {
+					if (x.value !== null && (!best || better(x.value, best.value))) {
 						best = { id: x.id, value: x.value, round: r.round };
 						newBest = x.id;
 					}
 				}
 				if (r.submission) {
-					replaced += r.submission.replace.length;
+					replaced += r.submission.outside.length;
 					measured += r.submission.batch.length;
 				}
 				const thoughts = [
@@ -213,6 +238,7 @@ window.__ModuleLoader__.load({
 						.map((e, i) => ({ kind: "hypothesis", item: { ...e, id: hyp.id, first: i === 0 } }))
 						.filter((x) => x.item.round === r.round)),
 					...view.notes.filter((n) => n.round === r.round).map((n) => ({ kind: "note", item: n })),
+					...(view.retrievals ?? []).filter((x) => x.round === r.round).map((x) => ({ kind: "retrieval", item: x })),
 				];
 				return { ...r, best, newBest, thoughts };
 			});
@@ -234,7 +260,7 @@ window.__ModuleLoader__.load({
 		/** 进展图：每个读数一个点，线是至今最佳。纯 SVG。 */
 		function progressChart(view, model) {
 			const W = 560, H = 170, L = 44, R = 12, T = 12, B = 26;
-			const n = view.task.max_rounds;
+			const n = view.task.budget.rounds;
 			const [lo, hi] = model.range;
 			const span = hi - lo || 1;
 			const x = (round) => L + (n <= 1 ? 0.5 : (round - 1) / (n - 1)) * (W - L - R);
@@ -243,6 +269,7 @@ window.__ModuleLoader__.load({
 			const line = [];
 			for (const r of model.rounds) {
 				for (const o of r.results ?? []) {
+					if (o.value === null) continue;
 					dots.push(h("circle", { cx: x(r.round), cy: y(o.value), r: 3, className: `pp-dot${o.id === r.newBest ? " pp-dot-best" : ""}` },
 						h("title", null, `第 ${r.round} 轮 ${o.id} = ${o.value}`)));
 				}
@@ -259,24 +286,25 @@ window.__ModuleLoader__.load({
 					...ticks,
 					line.length ? h("polyline", { points: line.join(" "), className: "pp-best-line" }) : null,
 					...dots),
-				h("figcaption", { className: "pp-sub" }, `横轴是轮次，每个点是一个读数；线是到这一轮为止的最佳（${model.minimize ? "越小越好" : "越大越好"}）。`));
+				h("figcaption", { className: "pp-sub" }, `横轴是轮次，每个点是一个读数的 ${view.task.objective.field}（空读数不画）；线是到这一轮为止的最佳（${model.minimize ? "越低越好" : "越高越好"}）。`));
 		}
 
 		function overview(view, model, busy, onControl) {
 			const t = view.task;
-			const round = view.status === "finished" ? t.max_rounds : Math.min(view.round, t.max_rounds);
+			const rounds = t.budget.rounds;
+			const round = view.status === "finished" ? rounds : Math.min(view.round, rounds);
 			const c = view.audit_counts;
 			return h("div", null,
 				header(view, busy, onControl),
 				h("p", { className: "pp-goal" },
-					`目标：在 ${t.n_candidates} 个候选里找出 ${t.objective.name} ${model.minimize ? "最小" : "最大"}的。`,
-					`每轮测 ${t.batch_size} 个，共 ${t.max_rounds} 轮。每轮决策模块先推荐一批，agent 可以原样接受，也可以写明理由换掉其中几个；框架把这一批交给 oracle 测量。`),
+					`目标：${t.objective_text}，候选 ${t.n_candidates} 个。`,
+					`每轮测 ${t.budget.batch_size} 个，共 ${rounds} 轮。每轮决策模块先推荐一批，agent 可以照推荐，也可以按生物学推理、文献或分析换成别的候选，并分组写明依据；框架把这一批交给 oracle 测量。`),
 				h("div", { className: "pp-overview" },
 					h("div", { className: "pp-stats" },
 						stat("当前最佳", model.best ? `${model.best.id} = ${model.best.value}` : "—", model.best ? `第 ${model.best.round} 轮测到` : "还没有读数"),
 						stat("已测", `${model.unique} / ${t.n_candidates}`, `共 ${view.observations.length} 个读数`),
-						stat("进度", `第 ${round} / ${t.max_rounds} 轮`, STATUS_TEXT[view.status] ?? view.status),
-						stat("agent 改了推荐", `${model.replaced} / ${model.measured}`, model.measured ? `占 ${Math.round((100 * model.replaced) / model.measured)}%` : "还没提交过"),
+						stat("进度", `第 ${round} / ${rounds} 轮`, STATUS_TEXT[view.status] ?? view.status),
+						stat("推荐以外的",`${model.replaced} / ${model.measured}`, model.measured ? `占 ${Math.round((100 * model.replaced) / model.measured)}%` : "还没提交过"),
 						stat("审计", c.fail ? `${c.fail} 项不通过` : "全部通过", `${c.pass} 通过 · ${c.pending} 待定`)),
 					progressChart(view, model)));
 		}
@@ -308,6 +336,19 @@ window.__ModuleLoader__.load({
 						h("span", { className: `pp-sub${item.exit_code === 0 ? "" : " pp-fail"}` }, ` · ${status}`),
 						h("span", { className: "pp-sub" }, ` · ${item.dir}${item.files?.length ? ` · 写出 ${item.files.join(", ")}` : ""}`)));
 			}
+			if (kind === "retrieval") {
+				const what = item.tool === "web_search"
+					? `搜索 ${(item.queries ?? []).join("；")} · ${item.results?.length ?? 0} 条结果`
+					: `读取 ${item.url ?? ""}${item.status ? `（${item.status}）` : ""}`;
+				return h("li", { className: "pp-thought" },
+					h("span", { className: "pp-kind pp-kind-retrieval" }, "检索"),
+					h("div", null,
+						h("b", null, item.id), " ", what,
+						item.is_error ? h("span", { className: "pp-sub pp-fail" }, " · 出错") : null,
+						item.results?.length ? h("details", null,
+							h("summary", { className: "pp-sub" }, "结果"),
+							h("ul", { className: "pp-list" }, ...item.results.map((x) => h("li", null, x.title || x.url, " ", h("span", { className: "pp-sub" }, x.url))))) : null));
+			}
 			if (kind === "hypothesis") {
 				return h("li", { className: "pp-thought" },
 					h("span", { className: "pp-kind pp-kind-hypothesis" }, item.first ? "提出假设" : "更新假设"),
@@ -325,22 +366,24 @@ window.__ModuleLoader__.load({
 		function readingBars(r, model) {
 			const [lo, hi] = model.range;
 			const span = hi - lo || 1;
-			const rows = [...r.results].sort((a, b) => (model.minimize ? a.value - b.value : b.value - a.value));
+			// 空读数排最后，条长为 0。
+			const rows = [...r.results].sort((a, b) => (a.value === null) - (b.value === null) || (model.minimize ? a.value - b.value : b.value - a.value));
 			return h("div", { className: "pp-bars" }, ...rows.map((x) => {
-				const share = model.minimize ? (hi - x.value) / span : (x.value - lo) / span;
-				const replacedIn = r.submission?.replace.some((p) => p.in === x.id);
+				const share = x.value === null ? 0 : model.minimize ? (hi - x.value) / span : (x.value - lo) / span;
+				const replacedIn = r.submission?.outside.includes(x.id);
 				return h("div", { className: "pp-bar-row" },
 					h("span", { className: "pp-bar-id" }, x.id, x.replicate ? h("span", { className: "pp-sub" }, " 复测") : null),
 					h("span", { className: "pp-bar-track" }, h("span", { className: `pp-bar${replacedIn ? " pp-bar-in" : ""}`, style: { width: `${Math.max(2, Math.round(share * 100))}%` } })),
-					h("span", { className: "pp-bar-value" }, String(x.value)),
+					h("span", { className: "pp-bar-value", title: readoutText(x.readout) }, fmt(x.value)),
 					x.id === r.newBest ? h("span", { className: "pp-new-best" }, "新的最佳") : h("span", null));
 			}));
 		}
 
 		function roundCard(r, model) {
 			const s = r.submission;
-			const out = new Set(s?.replace.map((x) => x.out) ?? []);
-			const ins = new Set(s?.replace.map((x) => x.in) ?? []);
+			// 推荐里没进这一批的划掉，推荐以外进来的高亮。
+			const out = new Set(s ? r.recommendations.filter((id) => !s.batch.includes(id)) : []);
+			const ins = new Set(s?.outside ?? []);
 			const state = r.results ? "已测" : s ? "已提交" : r.proposals ? "在选" : "刚开始";
 			const step = (label, ...body) => h("div", { className: "pp-step" }, h("div", { className: "pp-step-label" }, label), h("div", { className: "pp-step-body" }, ...body));
 			const receipt = r.receipt
@@ -350,7 +393,7 @@ window.__ModuleLoader__.load({
 				h("div", { className: "pp-round-head" },
 					h("span", { className: "pp-round-no" }, `第 ${r.round} 轮`),
 					h("span", { className: "pp-sub" }, state),
-					s ? h("span", { className: "pp-sub" }, s.replace.length ? `换了 ${s.replace.length} 个推荐` : "全部接受推荐") : null,
+					s ? h("span", { className: "pp-sub" }, s.outside.length ? `推荐以外 ${s.outside.length} 个` : "全部照推荐") : null,
 					r.proposals > 1 ? h("span", { className: "pp-sub" }, `要了 ${r.proposals} 次推荐`) : null,
 					r.steers ? h("span", { className: "pp-sub pp-fail" }, `框架催了 ${r.steers} 次`) : null,
 					r.best && r.results ? h("span", { className: "pp-round-best" }, `至今最佳 ${r.best.id} = ${r.best.value}`) : null),
@@ -363,10 +406,10 @@ window.__ModuleLoader__.load({
 				step("本轮测的",
 					s ? h("div", null,
 						h("div", { className: "pp-chips" }, ...s.batch.map((id) => chip(id, ins.has(id) ? "in" : null))),
-						s.replace.length ? h("ul", { className: "pp-swaps" }, ...s.replace.map((x) => h("li", null,
-							h("span", { className: "pp-swap" }, chip(x.out, "out"), " → ", chip(x.in, "in")),
-							h("span", { className: "pp-hyp" }, REASON_TEXT[x.reason_type] ?? x.reason_type),
-							h("span", null, x.reason)))) : null)
+						s.groups.length ? h("ul", { className: "pp-swaps" }, ...s.groups.map((g) => h("li", null,
+							h("span", { className: "pp-swap" }, ...g.ids.map((id) => chip(id, ins.has(id) ? "in" : null))),
+							h("span", { className: "pp-hyp" }, sourceText(g.source)),
+							h("span", null, g.reason)))) : null)
 						: h("span", { className: "pp-empty" }, "还没提交")),
 				step("读数", r.results?.length ? readingBars(r, model) : h("span", { className: "pp-empty" }, "还没有读数")),
 				h("footer", { className: "pp-round-foot" },
@@ -381,7 +424,7 @@ window.__ModuleLoader__.load({
 			return h("details", { className: "pp-fold" },
 				h("summary", null, `全部读数排名（${view.observations.length} 条）`),
 				view.observations.length
-					? table(["名次", "候选", "读数", "轮"], view.observations.map((o, i) => [String(i + 1), o.id + (o.replicate ? `（第 ${o.replicate + 1} 次测）` : ""), String(o.value), String(o.round)]))
+					? table(["名次", "候选", "读数", "轮"], view.observations.map((o, i) => [String(i + 1), o.id + (o.replicate ? `（第 ${o.replicate + 1} 次测）` : ""), readoutText(o.readout), String(o.round)]))
 					: h("p", { className: "pp-empty" }, "还没有读数"));
 		}
 
@@ -395,11 +438,16 @@ window.__ModuleLoader__.load({
 		}
 
 		function runListItem(item, selected, onSelect) {
+			// 旧格式的记录只列出来，不能展开。
 			return h("button", {
-				className: `pp-run${item.run_id === selected ? " pp-run-active" : ""}`,
+				className: `pp-run${item.run_id === selected ? " pp-run-active" : ""}${item.legacy ? " pp-run-legacy" : ""}`,
+				disabled: Boolean(item.legacy),
+				title: item.legacy ? "早期版本的记录，格式不同，不再展开" : undefined,
 				onClick: () => onSelect(item.run_id),
 			},
-				h("div", { className: "pp-run-title" }, item.title, item.synthetic ? h("span", { className: "pp-tag" }, "合成") : null),
+				h("div", { className: "pp-run-title" }, item.title,
+					item.legacy ? h("span", { className: "pp-tag" }, "旧格式") : null,
+					item.synthetic ? h("span", { className: "pp-tag" }, "合成") : null),
 				h("div", { className: "pp-sub" },
 					h("span", { className: `pp-status pp-status-${item.status}` }, STATUS_TEXT[item.status] ?? item.status),
 					` · 第 ${Math.min(item.round, item.max_rounds ?? item.round)}/${item.max_rounds ?? "?"} 轮 · ${(item.updated ?? "").slice(0, 16).replace("T", " ")}`),
@@ -446,7 +494,7 @@ window.__ModuleLoader__.load({
 		function serviceLine(label, s) {
 			if (!s) return h("li", null, `${label}：—`);
 			return h("li", null, `${label}：`, s.ok
-				? h("span", { className: "pp-pass" }, `连得上 ${s.task_id ?? ""}${s.name ? `${s.name} ${s.version}` : ""}${s.synthetic ? "（合成数据）" : ""}`)
+				? h("span", { className: "pp-pass" }, `连得上 ${s.task_id ?? ""}${s.name ? `${s.name} ${s.version}${s.method ? ` · ${s.method}` : ""}` : ""}${s.synthetic ? "（合成数据）" : ""}`)
 				: h("span", { className: "pp-fail" }, `连不上：${s.error}`));
 		}
 
@@ -517,23 +565,26 @@ window.__ModuleLoader__.load({
 		const TOOL_BODY = {
 			pp_start_task: (args, r) => r && h("p", null,
 				r.already_started ? "任务已经开始过，" : "",
-				`${r.task?.title ?? ""}：共 ${r.task?.max_rounds} 轮，每轮 ${r.task?.batch_size} 个，候选 ${r.task?.n_candidates} 个`,
+				`${r.task?.title ?? ""}：共 ${r.task?.budget?.rounds} 轮，每轮 ${r.task?.budget?.batch_size} 个，候选 ${r.task?.n_candidates} 个`,
 				r.task?.synthetic ? h("span", { className: "pp-tag" }, "合成数据") : null),
-			pp_get_decision: (args, r) => r && h("div", null,
-				h("p", { className: "pp-sub" }, `第 ${r.round}/${r.max_rounds} 轮 · 基于 ${r.n_observations} 条读数（状态版本 ${r.state_version}）`),
-				table(["推荐", "预测均值", "不确定度", "得分"], r.recommendations.map((x) => [x.id, num(x.mu), num(x.sigma), num(x.score)])),
-				r.alternatives?.length ? h("p", { className: "pp-sub" }, `备选：${r.alternatives.map((x) => x.id).join(", ")}`) : null),
+			pp_get_decision: (args, r) => {
+				if (!r) return null;
+				// 方法不同，给的数值列也不同：有哪些列就显示哪些。
+				const cols = [...new Set(r.recommendations.flatMap((x) => Object.keys(x)))].filter((k) => k !== "id" && k !== "rank");
+				return h("div", null,
+					h("p", { className: "pp-sub" }, `第 ${r.round}/${r.rounds} 轮 · 方法 ${r.method} · 基于 ${r.n_observations} 条读数（状态版本 ${r.state_version}）`),
+					table(["推荐", ...cols.map((k) => SCORE_TEXT[k] ?? k)], r.recommendations.map((x) => [x.id, ...cols.map((k) => num(x[k]))])),
+					r.alternatives?.length ? h("p", { className: "pp-sub" }, `备选：${r.alternatives.map((x) => x.id).join(", ")}`) : null);
+			},
 			pp_submit_selection: (args, r) => h("div", null,
-				args ? h("p", null,
-					`接受 ${args.accept?.length ?? 0} 个推荐`,
-					args.replace?.length ? `，替换 ${args.replace.length} 个` : "，没有替换") : null,
-				args?.replace?.length ? h("ul", { className: "pp-list" }, ...args.replace.map((x) => h("li", null,
-					h("b", null, `${x.out} → ${x.in}`),
-					h("span", { className: "pp-hyp" }, REASON_TEXT[x.reason_type] ?? x.reason_type), x.reason))) : null,
+				args ? h("p", null, `提交 ${args.batch?.length ?? 0} 个候选${args.groups?.length ? `，分 ${args.groups.length} 组写了依据` : ""}`) : null,
+				args?.groups?.length ? h("ul", { className: "pp-list" }, ...args.groups.map((g) => h("li", null,
+					h("b", null, (g.ids ?? []).join(", ")),
+					h("span", { className: "pp-hyp" }, sourceText(g.source)), g.reason))) : null,
 				r?.problem ? h("div", { className: "pp-error" }, r.problem) : null,
-				r?.results ? table(["候选", "读数", "来源"], [...r.results].sort((a, b) => b.value - a.value).map((x) => [
-					x.id + (x.replicate ? "（复测）" : ""), num(x.value), x.recommended ? "推荐" : "替换进来"])) : null,
-				r?.next ? h("p", { className: "pp-sub" }, r.next.finished ? "任务完成" : `下一轮：第 ${r.next.round}/${r.next.max_rounds} 轮`) : null),
+				r?.results ? table(["候选", "读数", "来源"], r.results.map((x) => [
+					x.id + (x.replicate ? "（复测）" : ""), readoutText(x.readout), x.recommended ? "推荐" : "推荐以外"])) : null,
+				r?.next ? h("p", { className: "pp-sub" }, r.next.finished ? "任务完成" : `下一轮：第 ${r.next.round}/${r.next.rounds} 轮`) : null),
 			pp_update_hypothesis: (args, r) => h("p", null,
 				h("b", null, r?.id ?? args?.id ?? "新假设"),
 				args?.status ? h("span", { className: `pp-hyp pp-hyp-${args.status}` }, HYPOTHESIS_TEXT[args.status] ?? args.status) : null,
@@ -542,7 +593,7 @@ window.__ModuleLoader__.load({
 				cites(args?.cites)),
 			pp_write_note: (args, r) => h("p", null, r?.id ? h("b", null, r.id) : null, args?.text ?? "", cites(args?.cites)),
 			pp_get_ledger: (args, r) => r && h("p", { className: "pp-sub" },
-				`${r.observations?.length ?? 0} 条读数 · ${r.hypotheses?.length ?? 0} 条假设 · ${r.notes?.length ?? 0} 条笔记`),
+				`${r.observations?.length ?? 0} 条读数 · ${r.hypotheses?.length ?? 0} 条假设 · ${r.notes?.length ?? 0} 条笔记 · ${r.retrievals?.length ?? 0} 次检索`),
 			pp_run_python: (args, r) => h("div", null,
 				args?.purpose ? h("p", null, args.purpose) : null,
 				args?.code ? h("details", null, h("summary", { className: "pp-sub" }, "代码"), h("pre", { className: "pp-pre" }, args.code)) : null,
@@ -706,7 +757,7 @@ window.__ModuleLoader__.load({
 		function LedgerPage() {
 			const [runs, listError] = usePoll(listRuns);
 			const [picked, setPicked] = react.useState(null);
-			const selected = picked ?? runs?.[0]?.run_id ?? null;
+			const selected = picked ?? runs?.find((x) => !x.legacy)?.run_id ?? null;
 			const [view, viewError, setView] = usePoll(selected ? viewFetcher(selected) : null);
 			const [busy, setBusy] = react.useState(false);
 			const [controlError, setControlError] = react.useState(null);
@@ -778,7 +829,7 @@ window.__ModuleLoader__.load({
 .pp-doc .pp-header .pp-title{font-size:18px}
 .pp-runs{display:flex;flex-direction:column;gap:4px}
 .pp-run{font:inherit;color:inherit;text-align:left;padding:8px 10px;border-radius:8px;border:1px solid transparent;background:transparent;cursor:pointer}
-.pp-run:hover{background:var(--pp-soft)}.pp-run-active{border-color:var(--pp-line);background:rgba(127,127,127,.12)}
+.pp-run:hover{background:var(--pp-soft)}.pp-run-legacy{opacity:.5;cursor:default}.pp-run-legacy:hover{background:transparent}.pp-run-active{border-color:var(--pp-line);background:rgba(127,127,127,.12)}
 .pp-run-title{font-weight:600;display:flex;gap:6px;align-items:center}.pp-run-id{font-family:var(--ds-font-family-code,monospace);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pp-goal{margin:4px 0 16px;opacity:.8;max-width:760px}
 .pp-overview{display:grid;grid-template-columns:minmax(220px,300px) 1fr;gap:16px;align-items:start}
@@ -820,7 +871,7 @@ window.__ModuleLoader__.load({
 .pp-thought{display:grid;grid-template-columns:64px 1fr;gap:8px;align-items:baseline}
 .pp-thought>div{min-width:0;word-break:break-word}
 .pp-kind{font-size:11px;text-align:center;padding:0 4px;border-radius:6px;background:var(--pp-soft);border:1px solid var(--pp-line);white-space:nowrap}
-.pp-kind-analysis{color:#6b46c1}.pp-kind-hypothesis{color:#2f8f4e}.pp-kind-note{color:#b7791f}
+.pp-kind-analysis{color:#6b46c1}.pp-kind-hypothesis{color:#2f8f4e}.pp-kind-note{color:#b7791f}.pp-kind-retrieval{color:#3182ce}
 .pp-bars{display:flex;flex-direction:column;gap:3px;max-width:620px}
 .pp-bar-row{display:grid;grid-template-columns:92px 1fr 64px 64px;gap:8px;align-items:center;font-variant-numeric:tabular-nums}
 .pp-bar-id{font-family:var(--ds-font-family-code,monospace);font-size:12px}
