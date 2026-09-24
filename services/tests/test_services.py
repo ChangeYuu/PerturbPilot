@@ -13,11 +13,11 @@ from ppsvc.task import Package, TaskError, write_json, write_synthetic_package
 
 
 def make(tmp_path, seed=0, method="auto", **kw):
-    root = write_synthetic_package(tmp_path / f"syn{seed}", seed=seed, **kw)
+    root = write_synthetic_package(tmp_path / f"syn{seed}", tmp_path / f"syn{seed}-hidden", seed=seed, **kw)
     pkg = Package.load(root)
     d = DecisionService(method)
     d.init({"task": pkg.public_card(), "package_dir": str(root)})
-    return Oracle(pkg), pkg, d
+    return Oracle(pkg, tmp_path / f"syn{seed}-hidden"), pkg, d
 
 
 def ro(x):
@@ -26,6 +26,10 @@ def ro(x):
 
 def truth_of(oracle, cid):
     return oracle.table[cid]["phenotype_reduction"]
+
+
+def hidden_of(root):
+    return root.parent / f"{root.name}-hidden"
 
 
 def small_package(root, *, objective, fields=("score",), allow_repeats=False, ids=("A", "B", "C", "D"), values=None):
@@ -40,8 +44,8 @@ def small_package(root, *, objective, fields=("score",), allow_repeats=False, id
     })
     (root / "candidates.csv").write_text("id\n" + "".join(f"{c}\n" for c in ids), encoding="utf-8")
     rows = "".join(f"{c},{','.join(str(abs(values[c]) if f == 'absolute_effect' else values[c]) for f in fields)}\n" for c in ids)
-    (root / "hidden").mkdir(parents=True, exist_ok=True)
-    (root / "hidden" / "scores.csv").write_text(f"id,{','.join(fields)}\n{rows}", encoding="utf-8")
+    hidden_of(root).mkdir(parents=True, exist_ok=True)
+    (hidden_of(root) / "scores.csv").write_text(f"id,{','.join(fields)}\n{rows}", encoding="utf-8")
     return root
 
 
@@ -49,10 +53,11 @@ def small_package(root, *, objective, fields=("score",), allow_repeats=False, id
 
 
 def test_synthetic_package_is_deterministic_per_seed(tmp_path):
-    a, b, c = (Package.load(write_synthetic_package(tmp_path / n, seed=s)) for n, s in (("a", 1), ("b", 1), ("c", 2)))
+    a, b, c = (Package.load(write_synthetic_package(tmp_path / n, tmp_path / f"{n}-hidden", seed=s)) for n, s in (("a", 1), ("b", 1), ("c", 2)))
     assert np.array_equal(a.features(), b.features())
     assert not np.array_equal(a.features(), c.features())
-    assert (tmp_path / "a" / "hidden" / "scores.csv").read_text(encoding="utf-8") == (tmp_path / "b" / "hidden" / "scores.csv").read_text(encoding="utf-8")
+    assert (tmp_path / "a-hidden" / "scores.csv").read_text(encoding="utf-8") == (tmp_path / "b-hidden" / "scores.csv").read_text(encoding="utf-8")
+    assert not (tmp_path / "a" / "hidden").exists()
 
 
 def test_public_card_has_no_hidden_data(tmp_path):
@@ -60,7 +65,22 @@ def test_public_card_has_no_hidden_data(tmp_path):
     card = pkg.public_card()
     assert card["n_candidates"] == 200 and card["package_dir"] == str(pkg.root)
     assert "candidates" not in card
-    assert all(not dc["file"].startswith("hidden") for dc in card["data_cards"])
+    assert "scores" not in json.dumps(card)
+    # 任务包目录里没有任何隐藏读数
+    files = sorted(str(x.relative_to(pkg.root)).replace("\\", "/") for x in pkg.root.rglob("*") if x.is_file())
+    assert files == ["candidates.csv", "data/gene_embedding.csv", "task.json"]
+
+
+def test_hidden_data_must_live_outside_the_package(tmp_path):
+    root = small_package(tmp_path / "p", objective={"kind": "maximize", "field": "score"})
+    pkg = Package.load(root)
+    for inside in (root, root / "secret"):
+        with pytest.raises(TaskError, match="must not be inside"):
+            Oracle(pkg, inside)
+    # 旧布局：任务包里还有 hidden/，直接拒绝加载
+    (root / "hidden").mkdir()
+    with pytest.raises(TaskError, match="contains hidden"):
+        Package.load(root)
 
 
 def test_bad_cards_are_rejected(tmp_path):
@@ -72,9 +92,9 @@ def test_bad_cards_are_rejected(tmp_path):
         Package.load(root)
     root = small_package(tmp_path / "r", objective={"kind": "maximize", "field": "score"})
     card = json.loads((root / "task.json").read_text(encoding="utf-8"))
-    card["data_cards"] = [{"name": "x", "modality": "table", "index": "candidate", "role": "prior", "visibility": "public", "file": "hidden/scores.csv"}]
+    card["data_cards"] = [{"name": "x", "modality": "table", "index": "candidate", "role": "prior", "visibility": "public", "file": "../p-hidden/scores.csv"}]
     write_json(root / "task.json", card)
-    with pytest.raises(TaskError, match="outside hidden"):
+    with pytest.raises(TaskError, match="inside the package"):
         Package.load(root)
 
 
@@ -83,7 +103,7 @@ def test_bad_cards_are_rejected(tmp_path):
 
 def test_readout_independent_of_submission_order(tmp_path):
     o1, _, _ = make(tmp_path)
-    o2 = Oracle(Package.load(tmp_path / "syn0"))
+    o2 = Oracle(Package.load(tmp_path / "syn0"), tmp_path / "syn0-hidden")
     r1 = o1.run({"round": 1, "batch": ["G001", "G002"]})["results"]
     r2 = o2.run({"round": 1, "batch": ["G002", "G001"]})["results"]
     assert {r["id"]: r["readout"] for r in r1} == {r["id"]: r["readout"] for r in r2}
@@ -108,7 +128,7 @@ def test_oracle_rejects_bad_batches(tmp_path):
 def test_table_task_is_exact_and_refuses_repeats(tmp_path):
     root = small_package(tmp_path / "p", objective={"kind": "hit_discovery", "field": "absolute_effect", "direction": "high"},
                          fields=("score", "absolute_effect"), values={"A": -2.5, "B": 1.0, "C": 0.1, "D": -0.2})
-    o = Oracle(Package.load(root))
+    o = Oracle(Package.load(root), hidden_of(root))
     res = o.run({"round": 1, "batch": ["A", "B"]})["results"]
     assert res == [{"id": "A", "replicate": 0, "readout": {"score": -2.5, "absolute_effect": 2.5}},
                    {"id": "B", "replicate": 0, "readout": {"score": 1.0, "absolute_effect": 1.0}}]
@@ -119,8 +139,8 @@ def test_table_task_is_exact_and_refuses_repeats(tmp_path):
 
 def test_missing_score_gives_empty_readout(tmp_path):
     root = small_package(tmp_path / "p", objective={"kind": "maximize", "field": "score"})
-    (root / "hidden" / "scores.csv").write_text("id,score\nA,1\nB,\nC,nan\n", encoding="utf-8")
-    o = Oracle(Package.load(root))
+    (hidden_of(root) / "scores.csv").write_text("id,score\nA,1\nB,\nC,nan\n", encoding="utf-8")
+    o = Oracle(Package.load(root), hidden_of(root))
     res = {r["id"]: r["readout"] for r in o.run({"batch": ["B", "D"]})["results"]}
     assert res == {"B": {"score": None}, "D": None}
     assert o.run({"batch": ["C"]})["results"][0]["readout"] == {"score": None}
@@ -268,7 +288,7 @@ def ptbench_task(root, readout, action_type="gene", operation="gene knockout", i
 
 def test_ptbench_absolute_task_converts(tmp_path):
     src = ptbench_task(tmp_path / "src", "normalized cytokine production")
-    info = convert(src, tmp_path / "il2")
+    info = convert(src, tmp_path / "il2", tmp_path / "il2-hidden")
     pkg = Package.load(tmp_path / "il2")
     card = pkg.card
     assert card["task_id"] == "ptbench-il2" and card["synthetic"] is False
@@ -278,20 +298,21 @@ def test_ptbench_absolute_task_converts(tmp_path):
     assert card["budget"] == {"rounds": 3, "batch_size": 2, "allow_repeats": False}
     text = (tmp_path / "il2" / "task.json").read_text(encoding="utf-8")
     assert "SECRET" not in text and "secret" not in text and "T_secret" not in text
-    assert (tmp_path / "il2" / "hidden" / "hits.txt").read_text(encoding="utf-8") == "G1\nG3\n"
+    assert (tmp_path / "il2-hidden" / "hits.txt").read_text(encoding="utf-8") == "G1\nG3\n"
+    assert sorted(x.name for x in (tmp_path / "il2").iterdir()) == ["candidates.csv", "task.json"]
     assert info["n_hits"] == 2 and info["notes"] == []
-    res = Oracle(pkg).run({"batch": ["G1"]})["results"][0]["readout"]
+    res = Oracle(pkg, tmp_path / "il2-hidden").run({"batch": ["G1"]})["results"][0]["readout"]
     assert res == {"score": -2.0, "absolute_effect": 2.0}
 
 
 def test_ptbench_directional_and_drug_tasks(tmp_path):
     src = ptbench_task(tmp_path / "src", "protein abundance decrease")
-    convert(src, tmp_path / "down")
+    convert(src, tmp_path / "down", tmp_path / "down-hidden")
     obj = Package.load(tmp_path / "down").card["objective"]
     assert (obj["field"], obj["direction"]) == ("score", "low")
 
     src = ptbench_task(tmp_path / "src2", "sensitivity z-score", action_type="drug", operation="small-molecule treatment", ids=("101", "102", "103", "104"))
-    info = convert(src, tmp_path / "drug")
+    info = convert(src, tmp_path / "drug", tmp_path / "drug-hidden")
     assert Package.load(tmp_path / "drug").card["action"]["type"] == "drug"
     assert any("数字编号" in n for n in info["notes"])
 
@@ -307,8 +328,8 @@ def _post(url, body=None, headers=None):
 
 
 def test_http_roundtrip(tmp_path):
-    root = write_synthetic_package(tmp_path / "syn", seed=0)
-    oracle, d = Oracle(Package.load(root)), DecisionService()
+    root = write_synthetic_package(tmp_path / "syn", tmp_path / "syn-hidden", seed=0)
+    oracle, d = Oracle(Package.load(root), tmp_path / "syn-hidden"), DecisionService()
     servers = [make_server("127.0.0.1", 0, oracle.routes()), make_server("127.0.0.1", 0, d.routes())]
     for s in servers:
         threading.Thread(target=s.serve_forever, daemon=True).start()

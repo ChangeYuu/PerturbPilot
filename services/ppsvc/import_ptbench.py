@@ -1,11 +1,12 @@
 """把一个 PerturbTrace（ptbench）任务目录转换成 PerturbPilot 任务包。
 
 用法：
-  python -m ppsvc.import_ptbench <ptbench 任务目录> <输出目录>
+  python -m ppsvc.import_ptbench <ptbench 任务目录> <输出的任务包目录> <输出的隐藏数据目录>
 
 只搬可以给 agent 看的字段：task_semantics 里的简述、生物系统、扰动方式、读数，和 budget。
 数据集身份（data.* 里的来源文件、数据名、原始列名）、implementation_notes、命中名单
-都不进 task.json；命中名单写到 hidden/hits.txt，只有 oracle 那一侧能读。
+都不进 task.json。读数表 scores.csv 和命中名单 hits.txt 写到任务包外的隐藏数据目录，
+只有 oracle 那一侧能读。
 
 目标方向按公开的读数描述定：读数写明 decrease/increase 的是有方向的任务（在 score 上取低/高），
 其余按 ptbench 的约定"两个方向的效应都算"，在 absolute_effect 上取高。
@@ -23,6 +24,7 @@ from typing import Any
 import numpy as np
 import yaml
 
+from .oracle import Oracle
 from .task import Package, read_csv, write_csv, write_json
 
 
@@ -57,7 +59,7 @@ def objective_and_fields(sem: dict[str, Any]) -> tuple[dict[str, Any], list[dict
     )
 
 
-def convert(src: Path, out: Path) -> dict[str, Any]:
+def convert(src: Path, out: Path, hidden: Path) -> dict[str, Any]:
     manifest = yaml.safe_load((src / "task_manifest.yaml").read_text(encoding="utf-8"))
     sem = manifest["task_semantics"]
     budget = manifest["budget"]
@@ -101,16 +103,16 @@ def convert(src: Path, out: Path) -> dict[str, Any]:
         ok = s is not None and math.isfinite(s)
         vals = {"score": s if ok else "", "absolute_effect": abs(s) if ok else ""}
         table.append([c, *[vals[n] for n in names]])
-    write_csv(out / "hidden" / "scores.csv", ["id", *names], table)
+    write_csv(hidden / "scores.csv", ["id", *names], table)
 
     hits_path = src / "hidden" / "hit_set.npy"
     n_hits = None
     if hits_path.exists():
         hits = [str(h) for h in np.load(hits_path, allow_pickle=True).tolist()]
-        (out / "hidden" / "hits.txt").write_text("".join(f"{h}\n" for h in hits), encoding="utf-8")
+        (hidden / "hits.txt").write_text("".join(f"{h}\n" for h in hits), encoding="utf-8")
         n_hits = len(hits)
 
-    Package.load(out)  # 转出来的包要能被 oracle 和决策模块读
+    Oracle(Package.load(out), hidden)  # 转出来的包要能被 oracle 和决策模块读
     notes = []
     if all(re.fullmatch(r"\d+", c) for c in ids):
         notes.append("候选 id 全是数字编号，任务里没有名称或结构；agent 没法用生物学知识推理这些候选。")
@@ -124,14 +126,18 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="ppsvc.import_ptbench")
     p.add_argument("src", help="ptbench 任务目录（含 task_manifest.yaml）")
     p.add_argument("out", help="输出的任务包目录")
+    p.add_argument("hidden", help="输出的隐藏数据目录（在任务包外面）")
     args = p.parse_args(argv)
-    out = Path(args.out)
-    if out.exists() and any(out.iterdir()):
-        sys.exit(f"{out} is not empty")
-    info = convert(Path(args.src), out)
+    out, hidden = Path(args.out), Path(args.hidden)
+    for d in (out, hidden):
+        if d.exists() and any(d.iterdir()):
+            sys.exit(f"{d} is not empty")
+    if out.resolve() == hidden.resolve() or out.resolve() in hidden.resolve().parents:
+        sys.exit("the hidden directory must be outside the task package")
+    info = convert(Path(args.src), out, hidden)
     obj = info["objective"]
     print(f"{info['task_id']}: {info['n_candidates']} candidates, {info['n_hits']} hits, "
-          f"objective {obj['field']} {obj['direction']} -> {out.resolve()}")
+          f"objective {obj['field']} {obj['direction']} -> {out.resolve()} (hidden {hidden.resolve()})")
     for n in info["notes"]:
         print(f"note: {n}")
 

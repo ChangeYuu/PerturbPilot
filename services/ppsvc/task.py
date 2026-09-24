@@ -4,10 +4,14 @@
     task.json        公开的任务卡片
     candidates.csv   id + 公开属性列
     data/            数据卡片的文件（task.json 的 data_cards 里列出）
-    hidden/          只有 oracle 读：scores.csv（id + 各读数字段）、hits.txt（命中名单，可选）
 
-task.json 里只放可以给 agent 看的东西；hidden/ 下的文件不出现在卡片里。
-没有指定任务包时，用 write_synthetic_package 在临时目录里生成一个合成任务包。
+  <隐藏数据目录>/     只有 oracle 读，放在任务包外面（服务用 --hidden 指定）
+    scores.csv       id + 各读数字段
+    hits.txt         命中名单，可选，运行时不读
+
+任务包整个目录 agent 都可能看到（分析工具会列出它），所以里面只放可以给 agent 看的东西；
+任务包里有 hidden/ 目录时直接拒绝加载，免得旧布局的隐藏读数被看到。
+没有指定任务包时，用 write_synthetic_package 在两个临时目录里分别生成合成任务包和它的隐藏数据。
 """
 
 from __future__ import annotations
@@ -82,8 +86,8 @@ def check_card(card: dict[str, Any]) -> None:
         if dc.get("modality") not in MODALITIES or dc.get("role") not in ROLES or dc.get("visibility") not in VISIBILITIES:
             raise TaskError(f"bad data card {dc.get('name')!r}")
         rel = Path(dc.get("file", ""))
-        if rel.is_absolute() or ".." in rel.parts or (rel.parts and rel.parts[0] == "hidden"):
-            raise TaskError(f"data card {dc.get('name')!r} must point inside the package, outside hidden/")
+        if rel.is_absolute() or ".." in rel.parts:
+            raise TaskError(f"data card {dc.get('name')!r} must point inside the package")
 
 
 def target_sign(objective: dict[str, Any]) -> float:
@@ -104,6 +108,8 @@ class Package:
     @classmethod
     def load(cls, root: str | Path) -> "Package":
         root = Path(root).resolve()
+        if (root / "hidden").exists():
+            raise TaskError(f"{root} contains hidden/; move the hidden data out of the task package and pass it with --hidden")
         card = json.loads((root / "task.json").read_text(encoding="utf-8"))
         check_card(card)
         header, rows = read_csv(root / "candidates.csv")
@@ -134,6 +140,7 @@ class Package:
 
 def write_synthetic_package(
     root: str | Path,
+    hidden: str | Path,
     seed: int = 0,
     n_candidates: int = 200,
     n_features: int = 8,
@@ -143,9 +150,10 @@ def write_synthetic_package(
 ) -> Path:
     """合成扰动筛选任务：候选基因的特征向量和真实效应都由随机种子生成，不是真实生物数据。
 
+    任务包写到 root，隐藏读数写到 hidden（两个目录要分开）。
     同一个 seed 下任务完全确定；oracle 按 (任务, 候选, 第几次测) 给噪声，所以读数与提交顺序无关。
     """
-    root = Path(root)
+    root, hidden = Path(root), Path(hidden)
     rng = np.random.default_rng(stable_int("task", seed))
     n, d = n_candidates, n_features
     ids = [f"G{i:03d}" for i in range(n)]
@@ -189,5 +197,5 @@ def write_synthetic_package(
         ["id", *[f"f{j}" for j in range(d)]],
         [[c, *[round(float(v), 6) for v in features[i]]] for i, c in enumerate(ids)],
     )
-    write_csv(root / "hidden" / "scores.csv", ["id", "phenotype_reduction"], [[c, float(truth[i])] for i, c in enumerate(ids)])
+    write_csv(hidden / "scores.csv", ["id", "phenotype_reduction"], [[c, float(truth[i])] for i, c in enumerate(ids)])
     return root

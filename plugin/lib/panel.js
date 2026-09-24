@@ -1,17 +1,31 @@
 // 浏览器面板的宿主侧：把一次任务的状态整理成面板要显示的视图，并挂一个 HTTP 路由给面板读和控制。
-// 路由挂在 DSH 自己的 web 服务上（同源），只读 runs/ 里已有的状态，写操作只有暂停 / 继续 / 结束。
+// 路由挂在 DSH 自己的 web 服务上（同源），只读 runs/ 里已有的状态，写操作只有开始任务和暂停 / 继续 / 结束。
 // 右侧栏按当前会话读一个任务；主区的科学台账页不绑会话，先列出 runs/ 下所有任务再选。
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { auditRun } from './audit.js'
 import { CONTROL_ACTIONS, RunError, STATE_FORMAT, roundReadout, round4 } from './run.js'
+import { ServiceError } from './services.js'
 import { lowerIsBetter, objectiveText, objectiveValue } from './task.js'
 
 export const PANEL_ROUTE = '/perturbpilot/api'
 const SESSION_ID = /^[A-Za-z0-9_.:-]{1,200}$/
 const MAX_BODY = 4096
+
+/** 面板路由要按指定状态码回的错误（比如会话不存在回 404）。 */
+export class PanelError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+/** 开始任务前给面板预览的任务卡片：去掉服务本机的路径。 */
+export function taskPreview(card) {
+  const { package_dir, ...rest } = card
+  return { ...rest, objective_text: objectiveText(card.objective), goal: lowerIsBetter(card.objective) ? 'low' : 'high' }
+}
 // 左上角和新会话中间的 logo，由 client.js 的品牌插槽显示。
 export const LOGO_PATH = fileURLToPath(new URL('../assets/logo.png', import.meta.url))
 
@@ -21,7 +35,7 @@ export const LOGO_PATH = fileURLToPath(new URL('../assets/logo.png', import.meta
  */
 export function panelView(run, { events = 40 } = {}) {
   const s = run.state
-  const audit = auditRun(s)
+  const audit = run.audit()
   const all = readEvents(run.recorder.dir)
   const auditByRound = new Map(audit.rounds.map((x) => [x.round, x.checks]))
   const objective = s.task.objective
@@ -122,16 +136,20 @@ export function listRuns(runsDir) {
  * 面板路由的处理函数。
  *   GET  <PANEL_ROUTE>/sessions                    → { runs: 摘要列表 }（科学台账页用）
  *   GET  <PANEL_ROUTE>/sessions/<会话 id>          → { run: 视图 | null }
+ *   POST <PANEL_ROUTE>/sessions/<会话 id>/start    body {} → { run: 视图 }（开始任务，第 1 轮随后由框架开）
  *   POST <PANEL_ROUTE>/sessions/<会话 id>/control  body { action } → { run: 视图 }
+ *   GET  <PANEL_ROUTE>/task                        → { task: 任务卡片预览 }（开始任务前显示）
  *   GET  <PANEL_ROUTE>/status                      → 插件配置和服务是否连得上（设置页用）
  *   GET  <PANEL_ROUTE>/logo                        → assets/logo.png
  * POST 要求 content-type 为 application/json 且带 x-perturbpilot 头，别的网页没法跨站伪造（会触发预检，这里不答预检）。
  * @param deps.getRun - (sessionId) => Run | undefined
  * @param deps.control - (sessionId, action) => void，执行控制并在需要时推动回合
+ * @param deps.start - async (sessionId) => void，开始任务并推动第 1 轮；会话不存在抛 PanelError(404)
+ * @param deps.task - async () => 任务卡片预览
  * @param deps.listRuns - () => 摘要列表
  * @param deps.status - async () => 状态对象
  */
-export function createPanelHandler({ getRun, control, listRuns = () => [], status = async () => ({}), logger }) {
+export function createPanelHandler({ getRun, control, start, task, listRuns = () => [], status = async () => ({}), logger }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost')
@@ -141,8 +159,9 @@ export function createPanelHandler({ getRun, control, listRuns = () => [], statu
         res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-cache' })
         return res.end(readFileSync(LOGO_PATH))
       }
-      if (rest.length === 1 && (rest[0] === 'sessions' || rest[0] === 'status')) {
+      if (rest.length === 1 && (rest[0] === 'sessions' || rest[0] === 'status' || rest[0] === 'task')) {
         if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' })
+        if (rest[0] === 'task') return send(res, 200, { task: await task() })
         return send(res, 200, rest[0] === 'sessions' ? { runs: listRuns() } : await status())
       }
       if (rest[0] !== 'sessions' || !SESSION_ID.test(rest[1] ?? '') || rest.length > 3) return send(res, 404, { error: 'not found' })
@@ -152,18 +171,25 @@ export function createPanelHandler({ getRun, control, listRuns = () => [], statu
         const run = getRun(sessionId)
         return send(res, 200, { run: run ? panelView(run) : null })
       }
-      if (rest[2] !== 'control') return send(res, 404, { error: 'not found' })
+      if (rest[2] !== 'control' && rest[2] !== 'start') return send(res, 404, { error: 'not found' })
       if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
       if (!String(req.headers['content-type'] ?? '').startsWith('application/json') || req.headers['x-perturbpilot'] !== '1') {
         return send(res, 403, { error: 'forbidden' })
       }
       const body = JSON.parse(await readBody(req))
+      if (rest[2] === 'start') {
+        if (getRun(sessionId)) return send(res, 400, { error: '这个会话已经开始过任务' })
+        await start(sessionId)
+        return send(res, 200, { run: panelView(getRun(sessionId)) })
+      }
       if (!CONTROL_ACTIONS.includes(body?.action)) return send(res, 400, { error: `action 必须是 ${CONTROL_ACTIONS.join('/')} 之一` })
       const run = getRun(sessionId)
       if (!run) return send(res, 404, { error: '这个会话还没有开始任务' })
       control(sessionId, body.action)
       return send(res, 200, { run: panelView(run) })
     } catch (error) {
+      if (error instanceof PanelError) return send(res, error.status, { error: error.message })
+      if (error instanceof ServiceError) return send(res, 502, { error: error.message })
       if (error instanceof RunError || error instanceof SyntaxError) return send(res, 400, { error: error.message })
       logger?.warn(`perturbpilot: panel request failed: ${error?.message ?? error}`)
       return send(res, 500, { error: 'internal error' })

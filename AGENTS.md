@@ -16,7 +16,8 @@ PerturbPilot 是**基于 DSH（DeepSeek Harness）开发的生物科学发现框
 
 - 一个任务的所有轮都在**同一个 DSH 会话**里；一轮 = 一个 DSH turn，本轮提交后由框架用 followup 开下一轮。
 - **agent 选、框架提交**：agent 调 `pp_get_decision` 拿推荐，用 `pp_submit_selection` 直接交一批（正好 `batch_size` 个，候选不够时交剩下的全部），推荐以外的候选要分组写理由；框架把批次交给 oracle，再把读数回灌给决策模块。
-- 任务来自仓库外的任务包（服务用 `--task` 选），决策模块每轮必须调用，方法不限于 GP-UCB。
+- 任务来自仓库外的任务包（服务用 `--task` 选），隐藏读数放在任务包外的另一个目录（`--hidden`），只有 oracle 读；决策模块每轮必须调用，方法不限于 GP-UCB。
+- 任务由用户在面板上点“开始任务”发起（`POST /sessions/<id>/start`），不经 agent 的工具。
 - 查文献用 DSH 的 `web_search` / `web_fetch`，只记录不拦截，事后审计。
 - 科学状态存在会话之外（`runs/<会话 id>/`），每一步经 `systemPrompt.context` 注入简报，上下文压缩不丢。
 - 模型原始请求/响应靠包住全局 fetch 抓取，挂在最近一次 `agent/request` 上。

@@ -222,29 +222,51 @@ test('retrievals are recorded with their full text and back literature reasons i
   let checks = readJson(join(dir, 'audit.json')).rounds[0].checks
   assert.equal(checks.literature_backed.result, 'fail')
 
-  // 第 2 轮：先查（一次出错的不算），再提交 → 通过。
-  run.recordRetrieval({ name: 'web_fetch', arguments: { url: 'https://example.org/x' } }, { message: { isError: true, content: [{ type: 'text', text: '404' }] }, meta: { url: 'https://example.org/x', statusCode: 404 } })
+  // 第 2 轮：先查（一次出错的不算），再提交；检索结果里提到了 G018 → 通过。
+  // DSH 的 tool/call 事件里参数是 JSON 字符串，记录时解析成对象。
+  run.recordRetrieval({ name: 'web_fetch', arguments: '{"url": "https://example.org/x"}' }, { message: { isError: true, content: [{ type: 'text', text: '404 G018' }] }, meta: { statusCode: 404 } })
   const search = run.recordRetrieval(
-    { name: 'web_search', arguments: { queries: ['G018 pathway'] } },
-    { message: { isError: false, content: [{ type: 'text', text: '搜索结果正文' }] }, meta: { sources: [{ url: 'https://example.org/a', title: 'A' }] } },
+    { name: 'web_search', arguments: JSON.stringify({ queries: ['G018 pathway'] }) },
+    { message: { isError: false, content: [{ type: 'text', text: '搜索结果：g018 属于同一通路；G0011 无关' }] }, meta: { sources: [{ url: 'https://example.org/a', title: 'A' }] } },
   )
   assert.equal(search.id, 'R2')
   await playRound(run, services, { extra: [{ id: 'G018', source: 'literature', reason: '查到 G018 的报道' }] })
   checks = readJson(join(dir, 'audit.json')).rounds[1].checks
-  assert.equal(checks.literature_backed.result, 'pass')
-  assert.deepEqual(checks.literature_backed.retrievals, ['R2'])
+  assert.deepEqual(checks.literature_backed, { result: 'pass', groups: 1, retrievals: ['R2'], unbacked: [], unlabelled: [] })
 
   const saved = readJson(join(dir, 'retrieval', 'R2.json'))
-  assert.equal(saved.text, '搜索结果正文')
+  assert.equal(saved.text, '搜索结果：g018 属于同一通路；G0011 无关')
   assert.deepEqual(saved.arguments, { queries: ['G018 pathway'] })
   assert.equal(saved.round, 2)
   const events = readJsonl(join(dir, 'events.jsonl'))
   const fetched = events.find((e) => e.type === 'retrieval/fetched')
-  assert.deepEqual(fetched.data, { id: 'R1', url: 'https://example.org/x', status: 404, chars: 3, is_error: true, file: 'retrieval/R1.json' })
+  assert.deepEqual(fetched.data, { id: 'R1', url: 'https://example.org/x', status: 404, chars: 8, is_error: true, file: 'retrieval/R1.json' })
   const searched = events.find((e) => e.type === 'retrieval/searched')
+  assert.deepEqual(searched.data.queries, ['G018 pathway'])
   assert.deepEqual(searched.data.results, [{ title: 'A', url: 'https://example.org/a' }])
   assert.equal(searched.source, 'model')
   assert.equal(run.ledger().retrievals.length, 2)
+
+  // 第 3 轮：查过，但检索内容里没有 G017（G001 只是 G0011 的一部分，不算提到）；
+  // 照推荐选进来的 G000 被提到了，记成没标文献的参考。审计从磁盘上的检索记录重新读全文。
+  run.recordRetrieval({ name: 'web_search', arguments: { queries: ['x'] } }, { message: { isError: false, content: [{ type: 'text', text: 'G000 and G0011 only' }] }, meta: {} })
+  const reloaded = Run.load(dir, 's1')
+  await playRound(reloaded, services, { extra: [{ id: 'G017', source: 'literature', reason: '文献说 G017 有关' }] })
+  checks = readJson(join(dir, 'audit.json')).rounds[2].checks
+  assert.equal(checks.literature_backed.result, 'fail')
+  assert.deepEqual(checks.literature_backed.unbacked, ['G017'])
+  assert.deepEqual(checks.literature_backed.retrievals, ['R3'])
+  const batch = reloaded.state.rounds[3].submission.batch
+  assert.deepEqual(checks.literature_backed.unlabelled, batch.includes('G000') ? ['G000'] : [])
+})
+
+test('literature check applies when a round searched but claimed no literature', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  run.recordRetrieval({ name: 'web_search', arguments: '{"queries": ["G000"]}' }, { message: { isError: false, content: [{ type: 'text', text: 'about G000' }] }, meta: {} })
+  await playRound(run, services)
+  const check = readJson(join(dir, 'audit.json')).rounds[0].checks.literature_backed
+  assert.deepEqual(check, { result: 'pass', groups: 0, retrievals: ['R1'], unbacked: [], unlabelled: ['G000'] })
 })
 
 test('driver bookkeeping: steer limit, stall, pause and resume', async () => {

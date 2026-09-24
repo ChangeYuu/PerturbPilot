@@ -26,17 +26,41 @@ export function checkReceipt(results, receipt, objective) {
   }
 }
 
-export function auditRun(state) {
+/**
+ * @param retrievalText - (检索编号) => 那次检索的结果全文（retrieval/R<N>.json 的 text），文献核对要用
+ */
+export function auditRun(state, retrievalText) {
   const rounds = []
   for (const r of Object.keys(state.rounds).map(Number).sort((a, b) => a - b)) {
-    rounds.push(auditRound(state, r))
+    rounds.push(auditRound(state, r, retrievalText))
   }
   const counts = { pass: 0, fail: 0, pending: 0, 'n/a': 0 }
   for (const round of rounds) for (const check of Object.values(round.checks)) counts[check.result]++
   return { run_id: state.runId, status: state.status, current_round: state.round, counts, rounds }
 }
 
-function auditRound(state, r) {
+/**
+ * 文献核对（只审不拦）：本轮提交之前成功的检索里，有没有提到写了 literature 理由的候选。
+ * 候选 id 按整词、不分大小写在检索结果全文里找；没提到的记进 unbacked，有一个就不通过。
+ * 没写 literature 理由、但检索里提到了的本批候选记进 unlabelled，只作参考，不影响结果。
+ * 本轮既没有 literature 理由也没有成功的检索时不适用。
+ */
+function literatureCheck(state, r, sub, retrievalText) {
+  const found = (state.retrievals ?? []).filter((x) => x.round === r && x.at <= sub.at && !x.is_error).map((x) => x.id)
+  const literature = sub.groups.filter((g) => g.source === 'literature')
+  if (literature.length === 0 && found.length === 0) return { result: 'n/a' }
+  const texts = found.map((id) => retrievalText(id) ?? '')
+  const mentioned = (cid) => {
+    const re = new RegExp(`(?<![A-Za-z0-9_])${cid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`, 'i')
+    return texts.some((t) => re.test(t))
+  }
+  const claimed = new Set(literature.flatMap((g) => g.ids))
+  const unbacked = [...claimed].filter((cid) => !mentioned(cid))
+  const unlabelled = [...new Set(sub.batch)].filter((cid) => !claimed.has(cid) && mentioned(cid))
+  return { result: unbacked.length ? 'fail' : 'pass', groups: literature.length, retrievals: found, unbacked, unlabelled }
+}
+
+function auditRound(state, r, retrievalText) {
   const rec = state.rounds[r]
   const closed = state.status === 'finished' || state.status === 'stopped'
   const checks = {}
@@ -63,14 +87,7 @@ function auditRound(state, r) {
     by_source: sub.by_source,
   }
 
-  // 理由里说依据文献的，这一轮提交之前得真的查过（web_search / web_fetch 留下了检索记录）。只审不拦。
-  const literature = sub.groups.filter((g) => g.source === 'literature')
-  if (literature.length === 0) {
-    checks.literature_backed = { result: 'n/a' }
-  } else {
-    const found = (state.retrievals ?? []).filter((x) => x.round === r && x.at <= sub.at && !x.is_error).map((x) => x.id)
-    checks.literature_backed = { result: found.length ? 'pass' : 'fail', groups: literature.length, retrievals: found }
-  }
+  checks.literature_backed = literatureCheck(state, r, sub, retrievalText)
 
   const receipt = rec.receipt
   if (!receipt) {

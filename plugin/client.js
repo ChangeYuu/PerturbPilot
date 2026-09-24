@@ -56,15 +56,20 @@ window.__ModuleLoader__.load({
 			return body;
 		}
 
+		function post(url, body) {
+			return fetch(url, {
+				method: "POST",
+				headers: { "content-type": "application/json", "x-perturbpilot": "1" },
+				body: JSON.stringify(body),
+			}).then(parse);
+		}
+
 		function createApi(sessionId) {
 			const base = `${API}/sessions/${encodeURIComponent(sessionId)}`;
 			return {
 				get: (signal) => fetch(base, { signal, cache: "no-store" }).then(parse),
-				control: (action) => fetch(`${base}/control`, {
-					method: "POST",
-					headers: { "content-type": "application/json", "x-perturbpilot": "1" },
-					body: JSON.stringify({ action }),
-				}).then(parse),
+				start: () => post(`${base}/start`, {}),
+				control: (action) => post(`${base}/control`, { action }),
 			};
 		}
 
@@ -79,6 +84,7 @@ window.__ModuleLoader__.load({
 		const globalApi = {
 			list: (signal) => fetch(`${API}/sessions`, { signal, cache: "no-store" }).then(parse),
 			status: (signal) => fetch(`${API}/status`, { signal, cache: "no-store" }).then(parse),
+			task: (signal) => fetch(`${API}/task`, { signal, cache: "no-store" }).then(parse),
 			run: apiFor,
 		};
 
@@ -190,13 +196,30 @@ window.__ModuleLoader__.load({
 					`第 ${e.round} 轮 ${e.type}`))));
 		}
 
-		/** 面板的全部内容。view 为 undefined 表示加载中，null 表示这个会话还没开始任务。 */
-		function renderPanel({ view, error, busy, onControl }) {
+		/** 还没开始任务时：服务当前载入的任务卡片和“开始任务”按钮。task 为 undefined 表示还在读，null 表示读不到。 */
+		function startCard(task, busy, onStart) {
+			const card = task === undefined ? h("p", { className: "pp-empty" }, "正在读取任务…")
+				: task === null ? h("p", { className: "pp-empty" }, "读不到任务卡片，先确认服务在运行（设置页可以检查）")
+					: h("div", null,
+						h("div", { className: "pp-title" }, task.title, task.synthetic ? h("span", { className: "pp-tag" }, "合成数据") : null),
+						h("ul", { className: "pp-list" },
+							h("li", null, `扰动：${task.action?.type ?? "—"}${task.action?.description ? `，${task.action.description}` : ""}`),
+							h("li", null, `目标：${task.objective_text}`),
+							h("li", null, `共 ${task.budget.rounds} 轮，每轮 ${task.budget.batch_size} 个；候选 ${task.n_candidates} 个${task.budget.allow_repeats ? "，可以重复测" : ""}`)));
+			return section("开始任务",
+				card,
+				h("button", { className: "pp-button pp-start", disabled: busy || !task, onClick: onStart }, busy ? "正在开始…" : "开始任务"),
+				h("p", { className: "pp-legend" }, "开始后第 1 轮自动进行；随时可以在对话里插话，或在这里暂停、结束。"));
+		}
+
+		/** 面板的全部内容。view 为 undefined 表示加载中，null 表示这个会话还没开始任务（这时 task 是任务卡片预览）。 */
+		function renderPanel({ view, task, error, busy, onControl, onStart }) {
 			const banner = error ? h("div", { className: "pp-error" }, `出错了：${error}`) : null;
 			if (view === undefined) return h("div", { className: "pp-panel" }, banner, h("p", { className: "pp-empty" }, "加载中…"));
 			if (view === null) {
 				return h("div", { className: "pp-panel" }, banner,
-					h("p", { className: "pp-empty" }, "这个会话还没有开始任务。在对话里对 agent 说“开始任务”，它会调用 pp_start_task。"));
+					h("p", { className: "pp-empty" }, "这个会话还没有开始任务。"),
+					startCard(task, busy, onStart));
 			}
 			return h("div", { className: "pp-panel" }, banner,
 				header(view, busy, onControl),
@@ -417,7 +440,16 @@ window.__ModuleLoader__.load({
 						const result = r.checks[key]?.result ?? "pending";
 						return h("span", { className: `pp-check pp-${result === "n/a" ? "na" : result}`, title: `${label}：${result}` }, `${RESULT_MARK[result] ?? "?"} ${label}`);
 					}),
-					receipt ? h("span", { className: "pp-sub" }, receipt) : null));
+					receipt ? h("span", { className: "pp-sub" }, receipt) : null,
+					literatureNote(r.checks.literature_backed)));
+		}
+
+		/** 文献核对的细节：写了文献理由但检索里没提到的，和检索里提到了但没标文献的。 */
+		function literatureNote(check) {
+			const parts = [];
+			if (check?.unbacked?.length) parts.push(`标了文献、检索里没提到：${check.unbacked.join(", ")}`);
+			if (check?.unlabelled?.length) parts.push(`检索里提到、没标文献：${check.unlabelled.join(", ")}`);
+			return parts.length ? h("span", { className: "pp-sub" }, parts.join("；")) : null;
 		}
 
 		function allReadingsSection(view) {
@@ -458,7 +490,7 @@ window.__ModuleLoader__.load({
 		function renderLedger({ runs, selected, view, error, busy, onSelect, onControl }) {
 			const banner = error ? h("div", { className: "pp-error" }, `出错了：${error}`) : null;
 			const list = runs === undefined ? h("p", { className: "pp-empty" }, "加载中…")
-				: runs.length === 0 ? h("p", { className: "pp-empty" }, "还没有任务。新建一个会话，对 agent 说“开始任务”。")
+				: runs.length === 0 ? h("p", { className: "pp-empty" }, "还没有任务。新建一个会话，在右侧栏的 PerturbPilot 面板上点“开始任务”。")
 					: h("div", { className: "pp-runs" }, ...runs.map((x) => runListItem(x, selected, onSelect)));
 			let body;
 			if (!selected) body = h("p", { className: "pp-empty" }, runs?.length === 0 ? "" : "选一个任务");
@@ -520,7 +552,6 @@ window.__ModuleLoader__.load({
 		// ---- 对话区里 pp_* 工具调用的卡片（只看这次调用自己的参数和结果，回放时也一样） ----
 
 		const TOOL_TITLE = {
-			pp_start_task: "开始任务",
 			pp_get_decision: "决策模块推荐",
 			pp_submit_selection: "提交本轮选择",
 			pp_update_hypothesis: "更新假设",
@@ -563,10 +594,6 @@ window.__ModuleLoader__.load({
 		}
 
 		const TOOL_BODY = {
-			pp_start_task: (args, r) => r && h("p", null,
-				r.already_started ? "任务已经开始过，" : "",
-				`${r.task?.title ?? ""}：共 ${r.task?.budget?.rounds} 轮，每轮 ${r.task?.budget?.batch_size} 个，候选 ${r.task?.n_candidates} 个`,
-				r.task?.synthetic ? h("span", { className: "pp-tag" }, "合成数据") : null),
 			pp_get_decision: (args, r) => {
 				if (!r) return null;
 				// 方法不同，给的数值列也不同：有哪些列就显示哪些。
@@ -665,7 +692,32 @@ window.__ModuleLoader__.load({
 					setBusy(false);
 				}
 			}, [api]);
-			return renderPanel({ view, error, busy, onControl });
+			// 还没开始任务时读一次任务卡片给预览。
+			const [task, setTask] = react.useState(undefined);
+			const waiting = view === null;
+			react.useEffect(() => {
+				if (!waiting) return;
+				const controller = new AbortController();
+				globalApi.task(controller.signal).then((body) => setTask(body.task), (e) => {
+					if (controller.signal.aborted) return;
+					setTask(null);
+					setError(e.message);
+				});
+				return () => controller.abort();
+			}, [waiting]);
+			const onStart = react.useCallback(async () => {
+				setBusy(true);
+				try {
+					const body = await api.start();
+					setView(body.run);
+					setError(null);
+				} catch (e) {
+					setError(e.message);
+				} finally {
+					setBusy(false);
+				}
+			}, [api]);
+			return renderPanel({ view, task, error, busy, onControl, onStart });
 		}
 
 		function PanelGlyph(props) {

@@ -91,6 +91,7 @@ export class Run {
     this.recorder = recorder
     this.state = state
     this.candidateSet = new Set(state.candidateIds)
+    this.retrievalTexts = new Map() // 检索编号 -> 结果全文；检索记录写了就不再变
   }
 
   get budget() {
@@ -321,27 +322,45 @@ export class Run {
     const text = (result.message?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
     const isError = Boolean(result.message?.isError)
     const file = `retrieval/${id}.json`
+    const args = parseArguments(call.arguments)
     this.recorder.writeJson(join('retrieval', `${id}.json`), {
       id,
       round: r,
       tool: call.name,
-      arguments: call.arguments ?? null,
+      arguments: args,
       is_error: isError,
       meta: result.meta ?? null,
       text,
     })
+    this.retrievalTexts.set(id, text)
     const entry = { id, round: r, at: new Date().toISOString(), tool: call.name, is_error: isError }
     this.state.retrievals.push(entry)
     if (call.name === 'web_search') {
-      const queries = call.arguments?.queries ?? (call.arguments?.query ? [call.arguments.query] : [])
+      const queries = args?.queries ?? (args?.query ? [args.query] : [])
       const results = (result.meta?.sources ?? []).map((x) => ({ title: x.title ?? null, url: x.url }))
       this.recorder.event('retrieval/searched', 'model', r, { id, queries, results, is_error: isError, file })
     } else {
-      const url = call.arguments?.url ?? result.meta?.url ?? null
+      const url = args?.url ?? result.meta?.url ?? null
       this.recorder.event('retrieval/fetched', 'model', r, { id, url, status: result.meta?.statusCode ?? null, chars: text.length, is_error: isError, file })
     }
     this.save()
     return entry
+  }
+
+  /** 第 id 次检索的结果全文（文献核对用）；记录读不到时当作空文本。 */
+  retrievalText(id) {
+    if (!this.retrievalTexts.has(id)) {
+      let text = ''
+      try {
+        text = this.recorder.readJson(join('retrieval', `${id}.json`)).text ?? ''
+      } catch {}
+      this.retrievalTexts.set(id, text)
+    }
+    return this.retrievalTexts.get(id)
+  }
+
+  audit() {
+    return auditRun(this.state, (id) => this.retrievalText(id))
   }
 
   // ---- 假设与笔记 ----
@@ -476,7 +495,7 @@ export class Run {
   save() {
     this.recorder.writeJson('state.json', this.state)
     this.recorder.writeJson('memory.json', { hypotheses: this.state.hypotheses, notes: this.state.notes })
-    this.recorder.writeJson('audit.json', auditRun(this.state))
+    this.recorder.writeJson('audit.json', this.audit())
   }
 
   // ---- 每轮注入给模型的简报 ----
@@ -544,4 +563,14 @@ export function roundReadout(readout) {
 
 export function round4(x) {
   return Math.round(x * 1e4) / 1e4
+}
+
+/** DSH 的 tool/call 事件里参数是 JSON 字符串；解析不了就原样保留。 */
+function parseArguments(value) {
+  if (typeof value !== 'string') return value ?? null
+  try {
+    return JSON.parse(value)
+  } catch {
+    return value
+  }
 }

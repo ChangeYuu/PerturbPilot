@@ -1,4 +1,5 @@
 // PerturbPilot 的 DSH 插件：把"一次科学任务"接进 DSH 的一个会话里。
+// 任务由用户在面板上点"开始任务"发起，框架建好运行记录后开第 1 轮。
 // 一轮 = 一个 DSH turn；本轮提交后由框架用 followup 开下一轮。
 // agent 负责选（参考决策模块的推荐，按依据分组写理由），框架负责提交给 oracle 并把读数回灌给决策模块。
 // agent 用 DSH 自带的 web_search / web_fetch 查文献，这里只记录检索，不拦截。
@@ -12,7 +13,7 @@ import { resolvePython, runAnalysis } from './lib/analysis.js'
 import { installFetchCapture } from './lib/capture.js'
 import { CONTROL_ACTIONS, HYPOTHESIS_STATUSES, RETRIEVAL_TOOLS, Run, RunError, SOURCES } from './lib/run.js'
 import { createServices } from './lib/services.js'
-import { PANEL_ROUTE, createPanelHandler, listRuns } from './lib/panel.js'
+import { PANEL_ROUTE, PanelError, createPanelHandler, listRuns, taskPreview } from './lib/panel.js'
 import { ROLE_PROMPT, roundPrompt, steerPrompt } from './lib/prompts.js'
 
 export const name = 'perturbpilot'
@@ -77,8 +78,27 @@ export function apply(ctx, config) {
   function requireRun(exec) {
     if (!exec.agent) throw new RunError('PerturbPilot 工具只能在会话里用')
     const run = runFor(exec.agent)
-    if (!run) throw new RunError('还没有开始任务，先调用 pp_start_task')
+    if (!run) throw new RunError('这个会话还没有开始任务；任务由用户在 PerturbPilot 面板上点"开始任务"发起')
     return run
+  }
+
+  const starting = new Set() // 正在开始任务的会话，防止连点开出两个
+
+  /** 面板上点"开始任务"：建运行记录，然后由框架开第 1 轮（会话正忙时等它空下来再开）。 */
+  async function startTask(sessionId) {
+    const agent = ctx.agents.get(sessionId)
+    if (!agent) throw new PanelError(404, '找不到这个会话')
+    if (runById(sessionId)) throw new RunError('这个会话已经开始过任务')
+    const dir = join(runsDir, sessionId)
+    if (Run.isLegacy(dir)) throw new RunError('这个会话里有旧格式的任务记录，不能再开任务；新开一个会话。')
+    if (starting.has(sessionId)) throw new RunError('正在开始任务')
+    starting.add(sessionId)
+    try {
+      runs.set(sessionId, await Run.start({ dir, runId: sessionId, services }))
+    } finally {
+      starting.delete(sessionId)
+    }
+    drive(agent)
   }
 
   function warn(message, error) {
@@ -106,22 +126,6 @@ export function apply(ctx, config) {
   // ---- 工具 ----
 
   const tool = (options) => ctx.tools.register(defineTool({ output: JSON_OUTPUT, ...options }))
-
-  tool({
-    name: 'pp_start_task',
-    description: '开始一次 PerturbPilot 任务：读取任务卡片（扰动方式、读数字段、目标、预算），把任务包交给决策模块并清空 oracle 和决策模块的状态，建立运行记录。一个会话只跑一个任务；已经开始过就返回当前状态。调用后本 turn 结束，第 1 轮由框架自动开始。',
-    parameters: {},
-    async execute(_args, exec) {
-      if (!exec.agent) throw new RunError('PerturbPilot 工具只能在会话里用')
-      const existing = runFor(exec.agent)
-      if (existing) return { already_started: true, ...summary(existing) }
-      if (Run.isLegacy(join(runsDir, exec.agent.id))) throw new RunError('这个会话里有旧格式的任务记录，不能再开任务；新开一个会话。')
-      const run = await Run.start({ dir: join(runsDir, exec.agent.id), runId: exec.agent.id, services, signal: exec.signal })
-      runs.set(exec.agent.id, run)
-      exec.concludeTurn()
-      return { started: true, ...summary(run), note: '第 1 轮会自动开始。' }
-    },
-  })
 
   tool({
     name: 'pp_get_decision',
@@ -252,6 +256,8 @@ export function apply(ctx, config) {
         const agent = ctx.agents.get(sessionId)
         if (action === 'resume' && agent) drive(agent)
       },
+      start: startTask,
+      task: async () => taskPreview(await probe.task()),
       listRuns: () => listRuns(runsDir),
       async status() {
         const [oracle, decision] = await Promise.all([

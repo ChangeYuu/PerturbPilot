@@ -7,7 +7,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
-import { PANEL_ROUTE, createPanelHandler, listRuns, panelView } from '../lib/panel.js'
+import { PANEL_ROUTE, PanelError, createPanelHandler, listRuns, panelView, taskPreview } from '../lib/panel.js'
 import { Run } from '../lib/run.js'
 import { fakeServices } from './fake-services.js'
 
@@ -53,8 +53,11 @@ let run
 let server
 let base
 let services
+let fresh // 面板上点"开始任务"后建的第二个任务，放在另一个目录，不进任务列表
+let freshDir
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'pp-client-'))
+  freshDir = mkdtempSync(join(tmpdir(), 'pp-client-fresh-'))
   services = fakeServices()
   run = await Run.start({ dir: join(dir, 'sess-1'), runId: 'sess-1', services })
   run.markDriven(1)
@@ -65,8 +68,13 @@ before(async () => {
   run.writeNote({ text: '第一条笔记', cites: [] })
   run.recordAnalysis({ id: 'A1', purpose: '算特征相关', exit_code: 0, timed_out: false, duration_ms: 40, dir: 'analysis/A1', files: ['fig.txt'] })
   const handler = createPanelHandler({
-    getRun: (id) => (id === 'sess-1' ? run : undefined),
+    getRun: (id) => (id === 'sess-1' ? run : id === 'sess-2' ? fresh : undefined),
     control: (_id, action) => run.control(action, 'human'),
+    async start(id) {
+      if (id !== 'sess-2') throw new PanelError(404, '找不到这个会话')
+      fresh = await Run.start({ dir: join(freshDir, 'sess-2'), runId: 'sess-2', services })
+    },
+    task: async () => taskPreview(await services.task()),
     listRuns: () => listRuns(dir),
     status: async () => ({
       config: { oracleUrl: 'http://127.0.0.1:8701', serviceTokenEnv: 'PERTURBPILOT_SERVICE_TOKEN', pythonTimeoutMs: 60000 },
@@ -81,6 +89,7 @@ before(async () => {
 after(() => {
   server.close()
   rmSync(dir, { recursive: true, force: true })
+  rmSync(freshDir, { recursive: true, force: true })
   rmSync(services.packageDir, { recursive: true, force: true })
 })
 
@@ -115,7 +124,7 @@ test('bundle registers under the package name with a page tab type and a session
   const views = slots.slice(1, 1 + exports.TOOL_NAMES.length)
   assert.ok(views.every((s) => s.opts.name === 'tool.call.toolview' && s.component === exports.ToolCard))
   assert.deepEqual(views.map((s) => s.opts.key).sort(), [
-    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_start_task', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
+    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
   ])
   // 主区的科学台账页、左侧栏入口（id 对上主区的 key）、设置页
   const [page, entry, settings, mark, name, hero] = slots.slice(1 + exports.TOOL_NAMES.length)
@@ -197,6 +206,22 @@ test('panel renders loading, empty, error and full states', () => {
   const render = (props) => exports.renderPanel({ busy: false, error: null, onControl: () => {}, ...props })
   assert.match(text(render({ view: undefined })), /加载中/)
   assert.match(text(render({ view: null })), /还没有开始任务/)
+  // 没开始任务：显示任务卡片和“开始任务”按钮；卡片还没读到或读不到时按钮不能点
+  const startButton = (props) => find(render({ view: null, ...props }), (n) => n.type === 'button')[0]
+  assert.match(text(render({ view: null, task: undefined })), /正在读取任务/)
+  assert.ok(startButton({ task: undefined }).props.disabled)
+  assert.match(text(render({ view: null, task: null })), /读不到任务卡片/)
+  assert.ok(startButton({ task: null }).props.disabled)
+  const preview = { title: '测试任务', synthetic: true, action: { type: 'knockout', description: 'CRISPR 敲除' }, objective_text: '找效应最强的基因', budget: { rounds: 3, batch_size: 3, allow_repeats: true }, n_candidates: 20 }
+  const card = text(render({ view: null, task: preview }))
+  for (const s of ['测试任务', '合成数据', '扰动：knockout，CRISPR 敲除', '目标：找效应最强的基因', '共 3 轮，每轮 3 个；候选 20 个，可以重复测']) assert.ok(card.includes(s), s)
+  let clicked = 0
+  const button = startButton({ task: preview, onStart: () => clicked++ })
+  assert.equal(text(button), '开始任务')
+  assert.ok(!button.props.disabled)
+  button.props.onClick()
+  assert.equal(clicked, 1)
+  assert.ok(startButton({ task: preview, busy: true }).props.disabled)
   assert.match(text(render({ view: null, error: 'HTTP 500' })), /出错了：HTTP 500/)
 
   const view = panelView(run)
@@ -246,6 +271,15 @@ test('panel body talks to the real host route: poll, then pause', async () => {
     const missing = slots[0].inject('nobody').api
     assert.equal((await missing.get()).run, null)
     await assert.rejects(missing.control('pause'), /还没有开始任务/)
+    await assert.rejects(missing.start(), /找不到这个会话/)
+
+    // 开始任务：先读任务卡片预览（组件里的读法见下面），再点开始，拿回新任务的视图
+    const second = slots[0].inject('sess-2').api
+    assert.equal((await second.get()).run, null)
+    const started = await second.start()
+    assert.equal(started.run.run_id, 'sess-2')
+    assert.equal(started.run.round, 1)
+    await assert.rejects(second.start(), /已经开始过/)
 
     // 组件本身：一次渲染 + 执行它登记的轮询 effect，拿到的数据经 setState 送出
     const updates = []
@@ -253,11 +287,22 @@ test('panel body talks to the real host route: poll, then pause', async () => {
     react.effects.length = 0
     const tree = exports.PanelBody({ useTabInfo: () => ({ tab: { visible: true } }), api })
     assert.match(text(tree), /加载中/)
-    assert.equal(react.effects.length, 1)
+    assert.equal(react.effects.length, 2) // 轮询；还没开始任务时读任务卡片（view 初始是 undefined，这个 effect 什么也不做）
     const cleanup = react.effects[0]()
     await new Promise((r) => setTimeout(r, 100))
     cleanup()
     assert.ok(updates.some((v) => v && v.run_id === 'sess-1' && v.status === 'stopped'))
+
+    // 还没开始任务的会话：组件读一次任务卡片给预览（第一个 state 是视图，这里给 null）
+    updates.length = 0
+    let calls = 0
+    react.useState = (initial) => [calls++ === 0 ? null : initial, (v) => updates.push(v)]
+    react.effects.length = 0
+    const waiting = exports.PanelBody({ useTabInfo: () => ({ tab: { visible: true } }), api: missing })
+    assert.match(text(waiting), /还没有开始任务/)
+    react.effects[1]()
+    await new Promise((r) => setTimeout(r, 100))
+    assert.ok(updates.some((v) => v?.title === '测试任务' && v.package_dir === undefined))
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -348,7 +393,7 @@ test('ledger rounds show the groups outside the recommendation, retrievals and l
   const d2 = mkdtempSync(join(tmpdir(), 'pp-ledger-'))
   try {
     const r = await Run.start({ dir: d2, runId: 's3', services })
-    r.recordRetrieval({ name: 'web_search', arguments: { queries: ['G009 通路'] } }, { message: { isError: false, content: [{ type: 'text', text: 'x' }] }, meta: { sources: [{ url: 'https://example.org/a', title: '一篇综述' }] } })
+    r.recordRetrieval({ name: 'web_search', arguments: { queries: ['G009 通路'] } }, { message: { isError: false, content: [{ type: 'text', text: '综述：G009 和 G002 在同一通路' }] }, meta: { sources: [{ url: 'https://example.org/a', title: '一篇综述' }] } })
     const ids = (await r.getDecision(services)).recommendations.map((x) => x.id)
     await r.submitSelection({ batch: [ids[1], ids[2], 'G009'], groups: [{ ids: ['G009'], source: 'literature', reason: '综述里 G009 在同一通路' }] }, services)
     // 早期版本的记录：列出来但点不开
@@ -362,6 +407,8 @@ test('ledger rounds show the groups outside the recommendation, retrievals and l
     assert.match(all, /检索R1 搜索 G009 通路 · 1 条结果/)
     assert.match(all, /一篇综述/)
     assert.match(all, /✓ 文献核对/)
+    assert.match(all, /检索里提到、没标文献：G002/)
+    assert.doesNotMatch(all, /标了文献、检索里没提到/)
     const legacy = find(tree, (n) => n.type === 'button' && n.props.className?.includes?.('pp-run-legacy'))
     assert.equal(legacy.length, 1)
     assert.equal(legacy[0].props.disabled, true)

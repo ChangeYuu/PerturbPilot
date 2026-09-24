@@ -6,7 +6,8 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
-import { LOGO_PATH, PANEL_ROUTE, createPanelHandler, listRuns, panelView } from '../lib/panel.js'
+import { LOGO_PATH, PANEL_ROUTE, PanelError, createPanelHandler, listRuns, panelView, taskPreview } from '../lib/panel.js'
+import { ServiceError } from '../lib/services.js'
 import { Run } from '../lib/run.js'
 import { fakeServices } from './fake-services.js'
 
@@ -176,5 +177,75 @@ test('run list and status routes', async () => {
     }
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('start creates the run from the panel and the task route previews the card', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pp-start-'))
+  const services = fakeServices()
+  packages.push(services.packageDir)
+  const runs = new Map()
+  const started = []
+  const handler = createPanelHandler({
+    getRun: (id) => runs.get(id),
+    control() {},
+    async start(id) {
+      if (id !== 'fresh') throw new PanelError(404, '找不到这个会话')
+      runs.set(id, await Run.start({ dir: join(root, id), runId: id, services }))
+      started.push(id)
+    },
+    task: async () => taskPreview(await services.task()),
+  })
+  const s = createServer(handler)
+  await new Promise((r) => s.listen(0, '127.0.0.1', r))
+  const b = `http://127.0.0.1:${s.address().port}${PANEL_ROUTE}`
+  const postTo = (path, headers = { 'content-type': 'application/json', 'x-perturbpilot': '1' }) =>
+    fetch(b + path, { method: 'POST', headers, body: '{}' })
+  try {
+    const { task } = await (await fetch(`${b}/task`)).json()
+    assert.equal(task.title, '测试任务')
+    assert.equal(task.package_dir, undefined) // 不把服务本机的路径给浏览器
+    assert.equal(task.objective_text, '找效应最强的基因（看 score，越高越好）')
+    assert.deepEqual(task.budget, { rounds: 3, batch_size: 3, allow_repeats: true })
+    assert.equal((await fetch(`${b}/task`, { method: 'POST' })).status, 405)
+
+    assert.equal((await postTo('/sessions/fresh/start', { 'content-type': 'application/json' })).status, 403)
+    assert.equal((await fetch(`${b}/sessions/fresh/start`)).status, 405)
+    assert.equal((await postTo('/sessions/nobody/start')).status, 404)
+    assert.deepEqual(started, [])
+
+    const res = await (await postTo('/sessions/fresh/start')).json()
+    assert.equal(res.run.run_id, 'fresh')
+    assert.equal(res.run.status, 'active')
+    assert.equal(res.run.round, 1)
+    // 开过的会话不能再开
+    const again = await postTo('/sessions/fresh/start')
+    assert.equal(again.status, 400)
+    assert.match((await again.json()).error, /已经开始过/)
+    assert.deepEqual(started, ['fresh'])
+  } finally {
+    s.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('service failures while starting come back as 502 with the message', async () => {
+  const handler = createPanelHandler({
+    getRun: () => undefined,
+    control() {},
+    start: async () => { throw new ServiceError('oracle', '/task', 0, 'unreachable at http://127.0.0.1:1') },
+    task: async () => { throw new ServiceError('oracle', '/task', 0, 'unreachable at http://127.0.0.1:1') },
+  })
+  const s = createServer(handler)
+  await new Promise((r) => s.listen(0, '127.0.0.1', r))
+  const b = `http://127.0.0.1:${s.address().port}${PANEL_ROUTE}`
+  try {
+    const t = await fetch(`${b}/task`)
+    assert.equal(t.status, 502)
+    assert.match((await t.json()).error, /oracle \/task failed: unreachable/)
+    const r = await fetch(`${b}/sessions/x/start`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-perturbpilot': '1' }, body: '{}' })
+    assert.equal(r.status, 502)
+  } finally {
+    s.close()
   }
 })

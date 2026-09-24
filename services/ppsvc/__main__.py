@@ -3,8 +3,10 @@
 用法：
   python -m ppsvc                                  # 合成任务（种子 0）
   python -m ppsvc --seed 3 --rounds 8 --batch-size 6
-  python -m ppsvc --task D:\\pp-tasks\\il2          # 任务包目录
-  python -m ppsvc --task <目录> --decision coverage
+  python -m ppsvc --task D:\\pp-tasks\\il2 --hidden D:\\pp-tasks-hidden\\il2   # 任务包和它的隐藏数据
+  python -m ppsvc --task <目录> --hidden <目录> --decision coverage
+
+隐藏数据（scores.csv 等）放在任务包外面；给了 --task 就必须给 --hidden。
 
 --decision：auto（默认，有嵌入特征用 gp-ucb，否则 coverage）、gp-ucb、coverage。
 决策模块启动时还没读任务，插件开任务时调 /init 把任务包交给它。
@@ -33,6 +35,7 @@ TOKEN_ENV = "PERTURBPILOT_SERVICE_TOKEN"
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="ppsvc")
     p.add_argument("--task", help="任务包目录；不给就生成合成任务")
+    p.add_argument("--hidden", help="任务包的隐藏数据目录（在任务包外面）；给了 --task 就必须给")
     p.add_argument("--decision", choices=METHODS, default="auto")
     p.add_argument("--seed", type=int, default=0, help="合成任务的种子")
     p.add_argument("--rounds", type=int, default=10, help="合成任务的轮数")
@@ -43,12 +46,17 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     if args.task:
-        root = Path(args.task)
+        if not args.hidden:
+            p.error("--task needs --hidden (the directory with the hidden scores, outside the task package)")
+        root, hidden = Path(args.task), Path(args.hidden)
     else:
+        if args.hidden:
+            p.error("--hidden only goes with --task")
         root = Path(tempfile.mkdtemp(prefix="pp-synthetic-"))
-        write_synthetic_package(root, seed=args.seed, max_rounds=args.rounds, batch_size=args.batch_size)
+        hidden = Path(tempfile.mkdtemp(prefix="pp-synthetic-hidden-"))
+        write_synthetic_package(root, hidden, seed=args.seed, max_rounds=args.rounds, batch_size=args.batch_size)
     package = Package.load(root)
-    oracle = Oracle(package)
+    oracle = Oracle(package, hidden)
     decision = DecisionService(args.decision)
 
     token = os.environ.get(TOKEN_ENV) or None
