@@ -286,14 +286,45 @@ test('ledger page renders the run list and the whole record of the selected run'
   const all = text(tree)
   assert.match(all, /科学台账/)
   assert.match(all, /测试任务/)
-  // 各轮：推荐、回执
-  for (const id of view.rounds[0].recommendations) assert.ok(all.includes(id))
-  assert.match(all, /收下 3；状态版本/)
-  // 读数全列，假设带历次更新，笔记和分析都在
-  assert.equal(find(tree, (n) => n.type === 'table')[1].children[1].children.length, view.observations.length)
-  assert.match(all, /复测后不高了/)
-  assert.match(all, /N1第 2 轮：第一条笔记/)
-  assert.match(all, /A1.*算特征相关完成（40 ms）fig\.txtanalysis\/A1/)
+
+  // 总览：目标、当前最佳、已测数量、改推荐的比例、审计
+  const best = view.observations[0]
+  assert.match(all, new RegExp(`目标：在 ${view.task.n_candidates} 个候选里找出`))
+  assert.match(all, new RegExp(`当前最佳${best.id} = ${best.value}第 1 轮测到`))
+  assert.match(all, new RegExp(`已测3 / ${view.task.n_candidates}`))
+  assert.match(all, /agent 改了推荐0 \/ 3占 0%/)
+  assert.match(all, /审计全部通过/)
+  // 进展图每个读数一个点，本轮新的最佳单独标出
+  const dots = find(tree, (n) => n.type === 'circle')
+  assert.equal(dots.length, 3)
+  assert.equal(dots.filter((n) => n.props.className === 'pp-dot pp-dot-best').length, 1)
+
+  // 当前结论：假设的最新状态和演变
+  assert.match(all, /当前结论（1 条假设）/)
+  assert.match(all, /H1削弱第 2 轮提出 · 更新 1 次/)
+  assert.match(all, /看它是怎么变过来的/)
+
+  // 逐轮：每轮一张卡片；第 1 轮有推荐、提交、读数条和回执，第 2 轮有本轮的分析、假设和笔记
+  const cards = find(tree, (n) => n.type === 'article')
+  assert.equal(cards.length, 2)
+  const [r1, r2] = cards.map(text)
+  for (const id of view.rounds[0].recommendations) assert.ok(r1.includes(id))
+  assert.match(r1, /全部接受推荐/)
+  assert.equal(find(cards[0], (n) => n.props.className === 'pp-bar-row').length, 3)
+  assert.match(r1, new RegExp(`${best.id}.*${best.value}新的最佳`))
+  assert.match(r1, /决策模块收下 3 条读数，状态版本 0 → 1/)
+  assert.match(r1, /✓ 调用决策模块/)
+  assert.match(r2, /还没有向决策模块要推荐/)
+  assert.match(r2, /分析A1 算特征相关 · 完成 · analysis\/A1 · 写出 fig\.txt/)
+  assert.match(r2, /提出假设H1 提出G001 附近值高/)
+  assert.match(r2, /更新假设H1 削弱复测后不高了/)
+  assert.match(r2, /笔记N1 第一条笔记/)
+  assert.match(r2, /还没提交/)
+
+  // 全部读数和事件日志折叠在最后
+  const folds = find(tree, (n) => n.props.className === 'pp-fold')
+  assert.deepEqual(folds.map((n) => text(n.children[0])), ['全部读数排名（3 条）', `事件日志（最近 ${view.events.length} 条）`])
+
   // 列表项可点
   const items = find(tree, (n) => n.type === 'button' && n.props.className?.startsWith?.('pp-run'))
   assert.equal(items.length, 1)
