@@ -1,0 +1,43 @@
+{
+  "name": "perturbpilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PerturbPilot：基于 DSH 的生物科学发现框架插件",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/*.js",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-llm": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.7-rc.1",
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh": "0.1.7-rc.1"
+  }
+}

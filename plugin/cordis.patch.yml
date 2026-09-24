@@ -1,0 +1,6 @@
+# PerturbPilot 插件的 bundle patch：安装进 profile 后，框架插件作为一行挂到插件树上。
+# 配置项见 index.js 里的 Config；要改服务地址或运行目录，在 profile 自己的 cordis.patch.yml 里按 id 覆盖这一行。
+
+- insert:
+    - id: perturbpilot
+      name: perturbpilot
