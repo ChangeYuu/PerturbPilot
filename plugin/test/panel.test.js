@@ -1,12 +1,12 @@
 // 面板路由测试：真实的 Run（oracle 和决策模块用替身）+ 真实的 HTTP 处理函数，检查视图内容、防伪造、控制动作。
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
-import { PANEL_ROUTE, createPanelHandler, panelView } from '../lib/panel.js'
+import { PANEL_ROUTE, createPanelHandler, listRuns, panelView } from '../lib/panel.js'
 import { Run } from '../lib/run.js'
 import { fakeServices } from './fake-services.js'
 
@@ -94,4 +94,49 @@ test('control requires JSON plus the custom header, and applies the action', asy
   assert.equal(again.status, 400)
   assert.deepEqual(controlled.map((x) => x[1]), ['pause', 'stop', 'resume'])
   assert.ok(panelView(run).events.some((e) => e.type === 'run/paused' && e.source === 'human'))
+})
+
+test('view carries hypothesis history and the analyses that were run', async () => {
+  const measured = run.state.observations[0].id
+  run.updateHypothesis({ text: '偏低', status: 'proposed', cites: [measured] })
+  run.updateHypothesis({ id: 'H1', status: 'weakened', cites: [], rationale: '复测后不低' })
+  run.recordAnalysis({ id: 'A1', purpose: '算相关', exit_code: 0, timed_out: false, duration_ms: 12, dir: 'analysis/A1', files: [] })
+  const view = panelView(run)
+  assert.deepEqual(view.hypotheses[0].history.map((x) => [x.status, x.rationale]), [['proposed', null], ['weakened', '复测后不低']])
+  assert.equal(view.hypotheses[0].updates, 2)
+  assert.deepEqual(view.analyses.map((x) => [x.id, x.purpose, x.round, x.exit_code]), [['A1', '算相关', 2, 0]])
+})
+
+test('run list and status routes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pp-runs-'))
+  try {
+    const services = fakeServices()
+    await Run.start({ dir: join(root, 'older'), runId: 'older', services })
+    await new Promise((r) => setTimeout(r, 20))
+    const newer = await Run.start({ dir: join(root, 'newer'), runId: 'newer', services })
+    newer.control('stop', 'human')
+    mkdirSync(join(root, 'not-a-run'))
+    writeFileSync(join(root, 'stray.txt'), 'x', 'utf8')
+    const runs = listRuns(root)
+    assert.deepEqual(runs.map((x) => [x.run_id, x.status, x.round, x.max_rounds, x.title, x.synthetic]), [
+      ['newer', 'stopped', 1, 3, '测试任务', true],
+      ['older', 'active', 1, 3, '测试任务', true],
+    ])
+    assert.deepEqual(listRuns(join(root, 'missing')), [])
+
+    const handler = createPanelHandler({ getRun: () => undefined, control() {}, listRuns: () => runs, status: async () => ({ token_set: false }) })
+    const s = createServer(handler)
+    await new Promise((r) => s.listen(0, '127.0.0.1', r))
+    const b = `http://127.0.0.1:${s.address().port}${PANEL_ROUTE}`
+    try {
+      assert.deepEqual((await (await fetch(`${b}/sessions`)).json()).runs.map((x) => x.run_id), ['newer', 'older'])
+      assert.deepEqual(await (await fetch(`${b}/status`)).json(), { token_set: false })
+      assert.equal((await fetch(`${b}/sessions`, { method: 'POST' })).status, 405)
+      assert.equal((await fetch(`${b}/status/x`)).status, 404)
+    } finally {
+      s.close()
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })

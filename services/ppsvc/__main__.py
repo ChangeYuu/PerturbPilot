@@ -3,16 +3,23 @@
 用法：
   python -m ppsvc --seed 0
   python -m ppsvc --seed 0 --oracle-port 8701 --decision-port 8702
+
+设了环境变量 PERTURBPILOT_SERVICE_TOKEN 时，两个服务都只接受带同一个值的
+x-perturbpilot-token 请求头的请求（插件从同名环境变量读，分析用的 Python 子进程拿不到）。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import threading
 
 from .decision import GpUcbDecision
 from .jsonhttp import make_server
 from .oracle import Oracle, TaskConfig
+
+TOKEN_ENV = "PERTURBPILOT_SERVICE_TOKEN"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -30,14 +37,17 @@ def main(argv: list[str] | None = None) -> None:
     card = oracle.task.card()
     decision = GpUcbDecision(card["candidates"], noise_sd=cfg.noise_sd)
 
+    token = os.environ.get(TOKEN_ENV) or None
     servers = [
-        make_server(args.host, args.oracle_port, oracle.routes()),
-        make_server(args.host, args.decision_port, decision.routes()),
+        make_server(args.host, args.oracle_port, oracle.routes(), token),
+        make_server(args.host, args.decision_port, decision.routes(), token),
     ]
     for s in servers:
         threading.Thread(target=s.serve_forever, daemon=True).start()
     print(f"oracle   http://{args.host}:{args.oracle_port}  ({card['task_id']}, synthetic)", flush=True)
     print(f"decision http://{args.host}:{args.decision_port}", flush=True)
+    if token is None:
+        print(f"warning: {TOKEN_ENV} is not set, the services accept requests from anyone on this machine", file=sys.stderr, flush=True)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

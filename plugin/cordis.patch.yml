@@ -1,6 +1,65 @@
 # PerturbPilot 插件的 bundle patch：安装进 profile 后，框架插件作为一行挂到插件树上。
 # 配置项见 index.js 里的 Config；要改服务地址或运行目录，在 profile 自己的 cordis.patch.yml 里按 id 覆盖这一行。
+#
+# 同时把 web 端改成 PerturbPilot 专用：
+# - 只留一个"科学发现"模式（智能体预设）。它不带 shell、文件读写、子 agent、计划模式、技能，
+#   也不读工作区里的 AGENTS.md / CLAUDE.md，所以工作区里的开发文件不会进科学 agent 的上下文。
+#   pp_* 工具和角色提示由 perturbpilot 这一行在宿主层注册，所有会话都看得到。
+# - 关掉 web 端自带的 4 个模式和模式选择器，关掉计划模式开关、预设设置页和插件设置页。
+# 这个文件在 web-app 的 bundle 之后应用，所以能按 id 覆盖它的行。
 
 - insert:
     - id: perturbpilot
       name: perturbpilot
+    - id: preset-perturbpilot
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: perturbpilot
+        name: 科学发现
+        description: PerturbPilot 扰动筛选任务：按轮向决策模块要推荐、选择、提交，记录假设和笔记
+        order: 0
+        plugins:
+          # 子行 id 沿用 web 端预设里的写法：宿主层同 id 的行已由 web-app 关掉，预设里的这一份才生效。
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: 你是 PerturbPilot 的科学发现 agent，由 {{model}} 模型驱动。
+              suffix: ''
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+
+- id: agent-preset-registry
+  config:
+    default: perturbpilot
+    modeSelectionEnabled: false
+
+- id: preset-standard
+  disabled: true
+- id: preset-ptc
+  disabled: true
+- id: preset-minimal
+  disabled: true
+- id: preset-cordis
+  disabled: true
+
+- id: ui-plan
+  disabled: true
+- id: ui-agent-preset
+  disabled: true
+- id: ui-settings-plugins
+  disabled: true

@@ -7,6 +7,12 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 - 科学状态（读数、假设、笔记）存在会话之外，每一步通过 `systemPrompt.context` 注入 `<perturbpilot_state>` 简报，所以上下文压缩后也不会丢。
 - 本轮快结束还没提交时，框架最多催 `maxSteers` 次；催完仍没交，就暂停等人处理。
 - 浏览器面板：DSH web 端右侧栏里的 “PerturbPilot 任务” 页（点右侧栏的 “+” 打开），每 2 秒刷新本会话的任务状态、各轮推荐 / 选择 / 读数 / 审计、读数排名、假设、笔记和最近事件，并有暂停 / 继续 / 结束按钮。对话照常在 DSH 的对话区进行。
+- 科学台账页：左侧栏的 “科学台账” 入口打开一个占满主区的页面。左边列出 `runs/` 下所有任务（最近更新的在前，默认选第一个），右边是选中任务的完整记录：各轮推荐 / 选择和替换理由 / 读数 / 回执 / 审计，全部读数排名，假设和历次更新，笔记，Python 分析，最近事件。也有暂停 / 继续 / 结束按钮。
+- 设置里的 “PerturbPilot” 一页：oracle 和决策模块连不连得上、服务令牌设了没有、插件当前的配置。这一页只读。
+- 数据分析：agent 可以调 `pp_run_python(code, purpose)`，在这次分析自己的目录里跑一段 Python（numpy 可用）。目录里事先导出了 `observations.csv`（id, round, value, replicate）和 `candidates.csv`（id, f0, f1, …）。这个工具不能测量新候选：两个服务都要求 `x-perturbpilot-token` 头，令牌只有框架有，Python 子进程拿到的环境变量是白名单里的那几项，不含令牌和模型密钥。
+  - **Windows 上没有沙箱。** 子进程能读写本机文件，包括 oracle 的源码；令牌只防它直接调服务测量。所有代码和输出都记录下来，可以事后查。
+- 对话区里每个 `pp_*` 工具调用显示成卡片：推荐表（预测均值 / 不确定度 / 得分）、本轮接受和替换（带理由）、读数表、假设和笔记，不再是原始 JSON。
+- 专用模式：插件的 bundle patch（`cordis.patch.yml`）只留一个“科学发现”模式。这个模式只有 `pp_*` 工具和上下文压缩，没有 shell、文件读写、子 agent、计划模式、技能，也不读工作区里的 AGENTS.md / CLAUDE.md。web 端自带的 4 个模式、模式选择器、计划模式开关、预设设置页和插件设置页都关掉了。
 
 ## 运行记录 `runs/<会话 id>/`
 
@@ -17,6 +23,7 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 | `decision/NN-propose-K.json`、`NN-observe.json`、`NN-snapshot.json` | 决策模块的原始往返：推荐（含全候选池）、回执、可恢复快照 |
 | `oracle/NN-run.json` | oracle 的原始读数 |
 | `state.json` / `memory.json` | 完整运行状态 / 假设和笔记 |
+| `analysis/A<N>/` | 第 N 次 `pp_run_python`：`code.py`、导出的 `observations.csv` 和 `candidates.csv`、`stdout.txt`、`stderr.txt`，以及脚本自己写出的文件。每次对应一条 `analysis/executed` 事件（`id, purpose, exit_code, timed_out, duration_ms, dir, files`） |
 | `audit.json` | 配对审计，每轮检查四项：调用了决策模块 → 提交了选择 → 回执完整且版本号 +1 → 下一轮用的状态版本对得上。另外还查后面是否有假设或笔记引用了本轮的读数 |
 
 ## 启动
@@ -30,26 +37,28 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 在 PowerShell 里依次执行：
 
 ```powershell
-# 1. 起 oracle 和决策模块（另开一个窗口，常驻）
+# 1. 起 oracle 和决策模块（另开一个窗口，常驻）。令牌随便取一个随机串，这个窗口和第 4 步的窗口要设成同一个值
+$env:PERTURBPILOT_SERVICE_TOKEN = '<随机串>'
 cd D:\internwork\科学发现智能体系统\services
 ..\.venv\Scripts\python -m ppsvc --seed 0
 
-# 2. 密钥只放进环境变量，不写进任何文件
+# 2. 密钥只放进环境变量，不写进任何文件；DSH_HOME 用单独的目录，不和日常用的 DSH 共用会话、工作区和设置
 $env:DEEPSEEK_API_KEY = (Get-Content <密钥文件> -Raw).Trim()
+$env:DSH_HOME = 'D:\DeepSeek\pp-home'
 
 # 3. 第一次用时：建空 profile，再把插件挂进去（不经过 pnpm）
 $node = 'D:\DeepSeek\npm-global\node.exe'
 $dsh = 'D:\internwork\科学发现智能体系统\plugin\node_modules\@deepseek-ai\dsh\lib\bin.js'
 & $node $dsh plugin --profile perturbpilot version-exemptions
 & $node D:\internwork\科学发现智能体系统\plugin\scripts\link-profile.js perturbpilot
-& $node $dsh --profile perturbpilot --dump-config    # 输出里应当有 id: perturbpilot 这一行
+& $node $dsh --profile perturbpilot --dump-config    # 应当有 perturbpilot 和 preset-perturbpilot 两行，preset-standard 等 4 个预设是 disabled: true
 
-# 4. 启动，在浏览器里打开它打印的地址
+# 4. 启动，在浏览器里打开它打印的地址（这个窗口也要先设同一个 $env:PERTURBPILOT_SERVICE_TOKEN）
 cd D:\internwork\科学发现智能体系统
 & $node $dsh --profile perturbpilot
 ```
 
-面板的数据走同源路由 `/perturbpilot/api/sessions/<会话 id>`（GET 读视图，`POST .../control` 带 `{"action": "pause"|"resume"|"stop"}` 控制；POST 要求 `content-type: application/json` 和 `x-perturbpilot: 1` 头）。只有带 web 服务的组合（web 模板）才挂这个路由。
+面板的数据走同源路由 `/perturbpilot/api`：`GET /sessions` 列出所有任务，`GET /status` 返回配置和服务是否连得上（不返回令牌本身），`/sessions/<会话 id>`（GET 读视图，`POST .../control` 带 `{"action": "pause"|"resume"|"stop"}` 控制；POST 要求 `content-type: application/json` 和 `x-perturbpilot: 1` 头）。只有带 web 服务的组合（web 模板）才挂这个路由。
 
 会话里对 agent 说"开始任务"，它会调用 `pp_start_task`，之后按轮自动推进。随时可以插话；"暂停 / 继续 / 结束"由 agent 调用 `pp_control` 执行。
 
@@ -64,6 +73,9 @@ cd D:\internwork\科学发现智能体系统
 | `runsDir` | `runs` | 运行目录，相对于启动 dsh 的目录 |
 | `llmUrlPattern` | `deepseek` | URL 命中这个正则的 fetch 调用记为模型调用 |
 | `maxSteers` | `2` | 一轮里最多催几次 |
+| `pythonPath` | `python` | `pp_run_python` 用的 Python。只写名字就从 PATH 找；带目录的相对路径按启动 dsh 的目录解析。建议设成 `.venv\Scripts\python.exe`（有 numpy） |
+| `pythonTimeoutMs` | `60000` | 一次分析最长跑多久，超时杀掉 |
+| `serviceTokenEnv` | `PERTURBPILOT_SERVICE_TOKEN` | 服务令牌所在的环境变量名。没设这个变量时服务不查令牌（ppsvc 启动时会警告），分析用的 Python 就能直接调服务 |
 
 ## 测试
 
@@ -74,4 +86,4 @@ cd ..
 .venv\Scripts\python -m pytest -q
 ```
 
-测试不联网、不需要密钥。oracle 和决策模块用本地替身，DSH 宿主用最小替身；被测的插件代码照常运行。
+测试不联网、不需要密钥。分析工具的测试会真的起 Python 子进程（优先用仓库的 `.venv`）。oracle 和决策模块用本地替身，DSH 宿主用最小替身；被测的插件代码照常运行。

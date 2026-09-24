@@ -103,9 +103,9 @@ def test_closed_loop_beats_random_on_average():
     assert np.mean(gains) > 0
 
 
-def _post(url, body=None):
+def _post(url, body=None, headers=None):
     data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **(headers or {})})
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -128,3 +128,20 @@ def test_http_roundtrip():
     finally:
         for s in servers:
             s.shutdown()
+
+
+def test_token_required_when_configured():
+    oracle, _, _ = make()
+    server = make_server("127.0.0.1", 0, oracle.routes(), token="s3cret")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        for headers in (None, {"x-perturbpilot-token": "wrong"}):
+            with pytest.raises(urllib.error.HTTPError) as e:
+                _post(f"{base}/run", {"batch": ["G001"]}, headers)
+            assert e.value.code == 401
+        assert oracle.replicates == {}  # 被拒的请求没有测量
+        res = _post(f"{base}/run", {"batch": ["G001"]}, {"x-perturbpilot-token": "s3cret"})
+        assert res["results"][0]["id"] == "G001"
+    finally:
+        server.shutdown()

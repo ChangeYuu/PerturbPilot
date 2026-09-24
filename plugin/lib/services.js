@@ -1,5 +1,7 @@
 // 调用决策模块和 oracle 两个 HTTP 服务。用插件安装抓取之前保存下来的原始 fetch，避免把这些调用混进模型调用记录。
 
+export const TOKEN_HEADER = 'x-perturbpilot-token'
+
 export class ServiceError extends Error {
   constructor(service, path, status, message) {
     super(`${service} ${path} failed${status ? ` (${status})` : ''}: ${message}`)
@@ -9,15 +11,19 @@ export class ServiceError extends Error {
   }
 }
 
-export function createServices({ oracleUrl, decisionUrl, fetch = globalThis.fetch, timeoutMs = 30000 }) {
+/** token 给了就随每个请求带上 x-perturbpilot-token 头（服务设了令牌时，没带的请求一律 401）。 */
+export function createServices({ oracleUrl, decisionUrl, fetch = globalThis.fetch, timeoutMs = 30000, token }) {
   async function call(service, base, method, path, body, signal) {
     const signals = [AbortSignal.timeout(timeoutMs)]
     if (signal) signals.push(signal)
+    const headers = {}
+    if (body !== undefined) headers['content-type'] = 'application/json'
+    if (token) headers[TOKEN_HEADER] = token
     let response
     try {
       response = await fetch(new URL(path, base), {
         method,
-        headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+        headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.any(signals),
       })

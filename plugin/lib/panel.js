@@ -1,7 +1,8 @@
 // 浏览器面板的宿主侧：把一次任务的状态整理成面板要显示的视图，并挂一个 HTTP 路由给面板读和控制。
 // 路由挂在 DSH 自己的 web 服务上（同源），只读 runs/ 里已有的状态，写操作只有暂停 / 继续 / 结束。
+// 右侧栏按当前会话读一个任务；主区的科学台账页不绑会话，先列出 runs/ 下所有任务再选。
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { auditRun } from './audit.js'
 import { CONTROL_ACTIONS, RunError } from './run.js'
@@ -10,10 +11,11 @@ export const PANEL_ROUTE = '/perturbpilot/api'
 const SESSION_ID = /^[A-Za-z0-9_.:-]{1,200}$/
 const MAX_BODY = 4096
 
-/** 面板显示用的视图：状态、每轮的推荐 / 选择 / 读数 / 审计、读数排名、假设、笔记、最近的事件。 */
+/** 面板显示用的视图：状态、每轮的推荐 / 选择 / 读数 / 审计、读数排名、假设（含历次更新）、笔记、分析、最近的事件。 */
 export function panelView(run, { events = 40 } = {}) {
   const s = run.state
   const audit = auditRun(s)
+  const all = readEvents(run.recorder.dir)
   const auditByRound = new Map(audit.rounds.map((x) => [x.round, x.checks]))
   const rounds = []
   for (let r = 1; r <= Math.min(s.round, s.task.max_rounds); r++) {
@@ -57,35 +59,64 @@ export function panelView(run, { events = 40 } = {}) {
     controls: run.closed ? [] : s.status === 'paused' ? ['resume', 'stop'] : ['pause', 'stop'],
     rounds,
     observations,
-    hypotheses: s.hypotheses.map(({ history, ...h }) => ({ ...h, updates: history?.length ?? 0 })),
+    hypotheses: s.hypotheses.map((h) => ({ ...h, history: h.history ?? [], updates: h.history?.length ?? 0 })),
     notes: s.notes,
-    events: tailEvents(run.recorder.dir, events),
+    analyses: all.filter((e) => e.type === 'analysis/executed').map((e) => ({ round: e.round, ts: e.ts, ...e.data })),
+    events: all.slice(-events).map(({ seq, ts, round, type, source }) => ({ seq, ts, round, type, source })),
   }
 }
 
-function tailEvents(dir, n) {
+function readEvents(dir) {
   const path = join(dir, 'events.jsonl')
   if (!existsSync(path)) return []
-  const lines = readFileSync(path, 'utf8').split('\n').filter(Boolean).slice(-n)
-  return lines.map((line) => {
-    const { seq, ts, round, type, source } = JSON.parse(line)
-    return { seq, ts, round, type, source }
-  })
+  return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
+/** runs/ 下所有任务的摘要，最近更新的在前。读不了的目录跳过。 */
+export function listRuns(runsDir) {
+  if (!existsSync(runsDir)) return []
+  const out = []
+  for (const id of readdirSync(runsDir)) {
+    if (!SESSION_ID.test(id)) continue
+    const path = join(runsDir, id, 'state.json')
+    try {
+      const s = JSON.parse(readFileSync(path, 'utf8'))
+      out.push({
+        run_id: id,
+        title: s.task?.title ?? id,
+        task_id: s.task?.task_id ?? null,
+        synthetic: s.task?.synthetic ?? null,
+        status: s.status,
+        round: s.round,
+        max_rounds: s.task?.max_rounds ?? null,
+        updated: statSync(path).mtime.toISOString(),
+      })
+    } catch {}
+  }
+  return out.sort((a, b) => b.updated.localeCompare(a.updated))
 }
 
 /**
  * 面板路由的处理函数。
+ *   GET  <PANEL_ROUTE>/sessions                    → { runs: 摘要列表 }（科学台账页用）
  *   GET  <PANEL_ROUTE>/sessions/<会话 id>          → { run: 视图 | null }
  *   POST <PANEL_ROUTE>/sessions/<会话 id>/control  body { action } → { run: 视图 }
+ *   GET  <PANEL_ROUTE>/status                      → 插件配置和服务是否连得上（设置页用）
  * POST 要求 content-type 为 application/json 且带 x-perturbpilot 头，别的网页没法跨站伪造（会触发预检，这里不答预检）。
  * @param deps.getRun - (sessionId) => Run | undefined
  * @param deps.control - (sessionId, action) => void，执行控制并在需要时推动回合
+ * @param deps.listRuns - () => 摘要列表
+ * @param deps.status - async () => 状态对象
  */
-export function createPanelHandler({ getRun, control, logger }) {
+export function createPanelHandler({ getRun, control, listRuns = () => [], status = async () => ({}), logger }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost')
       const rest = url.pathname.slice(PANEL_ROUTE.length).split('/').filter(Boolean)
+      if (rest.length === 1 && (rest[0] === 'sessions' || rest[0] === 'status')) {
+        if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' })
+        return send(res, 200, rest[0] === 'sessions' ? { runs: listRuns() } : await status())
+      }
       if (rest[0] !== 'sessions' || !SESSION_ID.test(rest[1] ?? '') || rest.length > 3) return send(res, 404, { error: 'not found' })
       const sessionId = rest[1]
       if (rest.length === 2) {

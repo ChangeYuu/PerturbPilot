@@ -334,6 +334,11 @@ export class Run {
     this.recorder.event('human/message', 'human', this.state.round, { text })
   }
 
+  /** 一次 pp_run_python 跑完了（见 analysis.js）。分析跑的时候任务可能已经结束，所以这里不检查状态。 */
+  recordAnalysis(entry) {
+    this.recorder.event('analysis/executed', 'model', this.state.round, entry)
+  }
+
   recordLlmCall(record, correlation) {
     this.recorder.llmCall({ round: this.state.round, ...correlation, ...record })
   }

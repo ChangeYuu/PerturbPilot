@@ -24,6 +24,7 @@ const ROUTES = {
 let server
 let base
 let dir
+const tokens = [] // 服务替身收到的每个请求带的令牌头
 before(async () => {
   const services = fakeServices()
   server = createServer((req, res) => {
@@ -32,6 +33,7 @@ before(async () => {
     req.on('end', async () => {
       res.setHeader('content-type', 'application/json')
       if (req.url === '/llm/chat') return res.end(JSON.stringify({ choices: [] }))
+      tokens.push(req.headers['x-perturbpilot-token'])
       const method = ROUTES[`${req.method} ${req.url}`]
       if (!method) {
         res.statusCode = 404
@@ -107,13 +109,18 @@ const readJsonl = (path) => readFileSync(path, 'utf8').split('\n').filter(Boolea
 test('plugin drives rounds, steers, validates and records', async () => {
   const originalFetch = globalThis.fetch
   const host = fakeHost()
-  const config = new plugin.Config({ oracleUrl: base, decisionUrl: base, runsDir: dir, llmUrlPattern: '/llm/' })
-  plugin.apply(host.ctx, config)
+  const config = new plugin.Config({ oracleUrl: base, decisionUrl: base, runsDir: dir, llmUrlPattern: '/llm/', serviceTokenEnv: 'PP_TEST_SERVICE_TOKEN' })
+  process.env.PP_TEST_SERVICE_TOKEN = 'tok-1'
+  try {
+    plugin.apply(host.ctx, config)
+  } finally {
+    delete process.env.PP_TEST_SERVICE_TOKEN
+  }
   const agent = host.addAgent('sess-1')
   const runDir = join(dir, 'sess-1')
 
   assert.deepEqual(Object.keys(host.tools).sort(), [
-    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_start_task', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
+    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_start_task', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
   ])
   assert.equal(host.sections[0].name, 'perturbpilot:role')
   const brief = () => host.contexts[0].text({ agent })
@@ -183,8 +190,17 @@ test('plugin drives rounds, steers, validates and records', async () => {
   assert.equal(host.routes[0].path, '/perturbpilot/api')
   const panel = createServer(host.routes[0].handler)
   await new Promise((r) => panel.listen(0, '127.0.0.1', r))
-  const panelBase = `http://127.0.0.1:${panel.address().port}/perturbpilot/api/sessions/sess-1`
+  const apiBase = `http://127.0.0.1:${panel.address().port}/perturbpilot/api`
+  const panelBase = `${apiBase}/sessions/sess-1`
   try {
+    const listed = (await (await fetch(`${apiBase}/sessions`)).json()).runs
+    assert.deepEqual(listed.map((x) => [x.run_id, x.status, x.round]), [['sess-1', 'paused', 2]])
+    const status = await (await fetch(`${apiBase}/status`)).json()
+    assert.equal(status.token_set, true)
+    assert.ok(!JSON.stringify(status).includes('tok-1')) // 只报有没有设，不报值
+    assert.equal(status.config.runsDir, dir)
+    assert.deepEqual(status.services.oracle, { ok: true, task_id: 'fake-task', synthetic: true })
+    assert.deepEqual(status.services.decision, { ok: true, name: 'fake', version: 'fake/0' })
     const view = (await (await fetch(panelBase)).json()).run
     assert.equal(view.status, 'paused')
     assert.equal(view.round, 2)
@@ -201,6 +217,10 @@ test('plugin drives rounds, steers, validates and records', async () => {
   } finally {
     panel.close()
   }
+
+  // 每个服务请求（包括设置页的探测）都带了令牌
+  assert.ok(tokens.length > 0)
+  assert.ok(tokens.every((t) => t === 'tok-1'))
 
   const events = readJsonl(join(runDir, 'events.jsonl'))
   const human = events.find((e) => e.type === 'human/message')

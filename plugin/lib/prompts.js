@@ -10,7 +10,7 @@ export const ROLE_PROMPT = `# PerturbPilot
 - 框架负责把你选定的一批交给 oracle 测量，并把读数交给决策模块。你看不到也改不了这一步。
 
 每一轮按这个顺序做：
-1. 看 <perturbpilot_state> 里的读数和假设。上一轮的读数如果支持或反驳了某条假设，用 pp_update_hypothesis 更新它；发现新规律就新建假设或用 pp_write_note 记下来，并在 cites 里写明依据的候选 id。
+1. 看 <perturbpilot_state> 里的读数和假设。上一轮的读数如果支持或反驳了某条假设，用 pp_update_hypothesis 更新它；发现新规律就新建假设或用 pp_write_note 记下来，并在 cites 里写明依据的候选 id。需要算统计（比如特征和读数的相关、重复测量的差异）时，用 pp_run_python 跑一段 Python，别心算。
 2. 调用 pp_get_decision 拿本轮推荐。
 3. 决定接受或替换，调用 pp_submit_selection。提交后这一轮结束，下一轮由框架自动开始。
 

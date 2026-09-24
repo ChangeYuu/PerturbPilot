@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,12 +18,23 @@ class HttpError(Exception):
         self.message = message
 
 
-def make_server(host: str, port: int, routes: dict[tuple[str, str], Route]) -> ThreadingHTTPServer:
-    """routes 的键是 (方法, 路径)，处理函数收到请求体（GET 时为空 dict），返回可 JSON 化的对象。"""
+TOKEN_HEADER = "x-perturbpilot-token"
+
+
+def make_server(
+    host: str, port: int, routes: dict[tuple[str, str], Route], token: str | None = None
+) -> ThreadingHTTPServer:
+    """routes 的键是 (方法, 路径)，处理函数收到请求体（GET 时为空 dict），返回可 JSON 化的对象。
+
+    给了 token 时，每个请求都要带 x-perturbpilot-token 头且值相等，否则 401。
+    """
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def _handle(self, method: str) -> None:
+            if token and not hmac.compare_digest(self.headers.get(TOKEN_HEADER, ""), token):
+                self._send(401, {"error": "missing or wrong service token"})
+                return
             route = routes.get((method, self.path.split("?", 1)[0]))
             if route is None:
                 self._send(404, {"error": f"no route {method} {self.path}"})

@@ -7,7 +7,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
-import { PANEL_ROUTE, createPanelHandler, panelView } from '../lib/panel.js'
+import { PANEL_ROUTE, createPanelHandler, listRuns, panelView } from '../lib/panel.js'
 import { Run } from '../lib/run.js'
 import { fakeServices } from './fake-services.js'
 
@@ -55,12 +55,24 @@ let base
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'pp-client-'))
   const services = fakeServices()
-  run = await Run.start({ dir, runId: 'sess-1', services })
+  run = await Run.start({ dir: join(dir, 'sess-1'), runId: 'sess-1', services })
   run.markDriven(1)
   const d = await run.getDecision(services)
   await run.submitSelection({ accept: d.recommendations.map((x) => x.id), replace: [] }, services)
   run.updateHypothesis({ text: 'G001 附近值高', status: 'proposed', cites: [run.state.observations[0].id] })
-  const handler = createPanelHandler({ getRun: (id) => (id === 'sess-1' ? run : undefined), control: (_id, action) => run.control(action, 'human') })
+  run.updateHypothesis({ id: 'H1', status: 'weakened', cites: [], rationale: '复测后不高了' })
+  run.writeNote({ text: '第一条笔记', cites: [] })
+  run.recordAnalysis({ id: 'A1', purpose: '算特征相关', exit_code: 0, timed_out: false, duration_ms: 40, dir: 'analysis/A1', files: ['fig.txt'] })
+  const handler = createPanelHandler({
+    getRun: (id) => (id === 'sess-1' ? run : undefined),
+    control: (_id, action) => run.control(action, 'human'),
+    listRuns: () => listRuns(dir),
+    status: async () => ({
+      config: { oracleUrl: 'http://127.0.0.1:8701', serviceTokenEnv: 'PERTURBPILOT_SERVICE_TOKEN', pythonTimeoutMs: 60000 },
+      token_set: false,
+      services: { oracle: { ok: true, task_id: 'fake-task', synthetic: true }, decision: { ok: false, error: 'decision /manifest failed: unreachable' } },
+    }),
+  })
   server = createServer(handler)
   await new Promise((r) => server.listen(0, '127.0.0.1', r))
   base = `http://127.0.0.1:${server.address().port}`
@@ -89,7 +101,7 @@ test('bundle registers under the package name with a page tab type and a session
   assert.equal(types[0].patterns, undefined) // 页面型 tab，按 kind 打开
   assert.equal(types[0].title(), 'PerturbPilot')
   assert.equal(types[0].guide.length, 1)
-  assert.equal(slots.length, 1)
+  assert.equal(slots.length, 1 + exports.TOOL_NAMES.length + 3)
   assert.equal(slots[0].opts.name, 'sidebar.right.pane.tab')
   assert.equal(slots[0].opts.key, exports.PANEL_ID)
   assert.equal(slots[0].component, exports.PanelBody)
@@ -97,6 +109,80 @@ test('bundle registers under the package name with a page tab type and a session
   const a = slots[0].opts.inject('s1').api
   assert.equal(slots[0].opts.inject('s1').api, a)
   assert.notEqual(slots[0].opts.inject('s2').api, a)
+  // 每个 pp_* 工具在对话区有自己的卡片，按工具名注册
+  const views = slots.slice(1, 1 + exports.TOOL_NAMES.length)
+  assert.ok(views.every((s) => s.opts.name === 'tool.call.toolview' && s.component === exports.ToolCard))
+  assert.deepEqual(views.map((s) => s.opts.key).sort(), [
+    'pp_control', 'pp_get_decision', 'pp_get_ledger', 'pp_run_python', 'pp_start_task', 'pp_submit_selection', 'pp_update_hypothesis', 'pp_write_note',
+  ])
+  // 主区的科学台账页、左侧栏入口（id 对上主区的 key）、设置页
+  const [page, entry, settings] = slots.slice(1 + exports.TOOL_NAMES.length)
+  assert.deepEqual([page.opts.name, page.opts.key, page.component], ['main', exports.LEDGER_ID, exports.LedgerPage])
+  assert.deepEqual([entry.opts.name, entry.opts.id, entry.opts.label(), entry.component], ['sidebar.panellist', exports.LEDGER_ID, '科学台账', exports.PanelGlyph])
+  assert.deepEqual([settings.opts.name, settings.opts.id, settings.opts.label(), settings.component], ['settings.section', exports.SETTINGS_ID, 'PerturbPilot', exports.SettingsSection])
+  assert.equal(exports.PanelGlyph({ size: 18 }).props.width, 18)
+})
+
+// 按 DSH 工具块的形状包一次调用：start 只有参数，result 带 call 和 content（插件工具的输出是 JSON 文本）。
+function started(args) {
+  return { phase: 'start', block: { callId: 'c1', argsRaw: JSON.stringify(args) } }
+}
+function settled(args, value, { isError = false, error } = {}) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value)
+  return { phase: 'result', block: { kind: 'tool-result', callId: 'c1', call: { argsRaw: JSON.stringify(args) }, content: [{ type: 'text', text }], isError, error } }
+}
+
+test('tool cards show recommendations, replacements with reasons and readings from real tool results', async () => {
+  const { exports } = loadClient(fakeReact())
+  const card = (toolName, props) => exports.ToolCard({ toolName, callId: 'c1', ...props })
+  const services = fakeServices()
+  const d2 = mkdtempSync(join(tmpdir(), 'pp-card-'))
+  try {
+    const r = await Run.start({ dir: d2, runId: 's2', services })
+    const decision = await r.getDecision(services)
+    const tree = card('pp_get_decision', settled({}, decision))
+    const all = text(tree)
+    assert.match(all, /决策模块推荐/)
+    assert.match(all, /第 1\/3 轮/)
+    for (const x of decision.recommendations) assert.ok(all.includes(x.id))
+    assert.equal(find(tree, (n) => n.type === 'tbody')[0].children.length, decision.recommendations.length)
+
+    const ids = decision.recommendations.map((x) => x.id)
+    const args = { accept: ids.slice(1), replace: [{ out: ids[0], in: 'G009', reason_type: 'exploration', reason: '看看 G009 那一带' }] }
+    const running = text(card('pp_submit_selection', started(args)))
+    assert.match(running, /进行中/)
+    assert.match(running, new RegExp(`${ids[0]} → G009`))
+    const result = await r.submitSelection(args, services)
+    const done = text(card('pp_submit_selection', settled(args, result)))
+    assert.match(done, /接受 2 个推荐，替换 1 个/)
+    assert.match(done, /探索看看 G009 那一带/)
+    for (const x of result.results) assert.ok(done.includes(String(x.value)))
+    assert.match(done, /替换进来/)
+    assert.match(done, /下一轮：第 2\/3 轮/)
+
+    const hArgs = { text: 'G009 附近值高', status: 'proposed', cites: ['G009'], rationale: '第 1 轮读数' }
+    const hyp = text(card('pp_update_hypothesis', settled(hArgs, r.updateHypothesis(hArgs))))
+    assert.match(hyp, /H1/)
+    assert.match(hyp, /提出/)
+    assert.match(hyp, /依据 G009/)
+    const nArgs = { text: '读数都偏低', cites: [] }
+    assert.match(text(card('pp_write_note', settled(nArgs, r.writeNote(nArgs)))), /N1读数都偏低/)
+  } finally {
+    rmSync(d2, { recursive: true, force: true })
+  }
+})
+
+test('tool cards show errors, interruptions and the preparing phase', () => {
+  const { exports } = loadClient(fakeReact())
+  const card = (toolName, props) => exports.ToolCard({ toolName, callId: 'c1', ...props })
+  assert.match(text(card('pp_get_decision', { phase: 'preparing', block: { callId: 'c1' } })), /准备中/)
+  const err = card('pp_submit_selection', settled({ accept: [] }, '既没有 accept 也没有被替换：G000', { isError: true }))
+  assert.equal(err.props.className, 'pp-tool pp-tool-error')
+  assert.match(text(err), /既没有 accept/)
+  const stopped = card('pp_write_note', settled({ text: 'x', cites: [] }, [], { isError: true, error: { name: 'AbortError', code: 'interrupted' } }))
+  assert.match(text(stopped), /已中断/)
+  // 结果文本不是 JSON 时不报错，只是不显示结果部分
+  assert.match(text(card('pp_control', settled({ action: 'pause' }, 'not json'))), /暂停/)
 })
 
 test('panel renders loading, empty, error and full states', () => {
@@ -165,6 +251,124 @@ test('panel body talks to the real host route: poll, then pause', async () => {
     await new Promise((r) => setTimeout(r, 100))
     cleanup()
     assert.ok(updates.some((v) => v && v.run_id === 'sess-1' && v.status === 'stopped'))
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('python card shows the purpose, the code, the output and failures', () => {
+  const { exports } = loadClient(fakeReact())
+  const card = (props) => exports.ToolCard({ toolName: 'pp_run_python', callId: 'c1', ...props })
+  const args = { purpose: '算相关', code: 'print(0.42)' }
+  const ok = card(settled(args, { id: 'A1', exit_code: 0, timed_out: false, stdout: '0.42\n', stderr: '', files: ['out/fig.txt'] }))
+  const all = text(ok)
+  assert.match(all, /Python 分析/)
+  assert.match(all, /算相关/)
+  assert.equal(text(find(ok, (n) => n.type === 'details')[0]), '代码print(0.42)')
+  assert.match(all, /A1 · 完成 · 写出 out\/fig\.txt/)
+  assert.match(all, /0\.42/)
+  const failed = text(card(settled(args, { id: 'A2', exit_code: 1, timed_out: false, stdout: '', stderr: 'ValueError: 坏了', files: [] })))
+  assert.match(failed, /出错（退出码 1）/)
+  assert.match(failed, /ValueError: 坏了/)
+  assert.match(text(card(settled(args, { id: 'A3', exit_code: null, timed_out: true, stdout: '', stderr: '', files: [] }))), /超时，已停止/)
+})
+
+test('ledger page renders the run list and the whole record of the selected run', () => {
+  const { exports } = loadClient(fakeReact())
+  const render = (props) => exports.renderLedger({ error: null, busy: false, onSelect: () => {}, onControl: () => {}, ...props })
+  assert.match(text(render({ runs: undefined, selected: null })), /加载中/)
+  assert.match(text(render({ runs: [], selected: null })), /还没有任务/)
+
+  const runs = listRuns(dir)
+  const view = panelView(run)
+  const picked = []
+  const tree = render({ runs, selected: 'sess-1', view, onSelect: (id) => picked.push(id) })
+  const all = text(tree)
+  assert.match(all, /科学台账/)
+  assert.match(all, /测试任务/)
+  // 各轮：推荐、回执
+  for (const id of view.rounds[0].recommendations) assert.ok(all.includes(id))
+  assert.match(all, /收下 3；状态版本/)
+  // 读数全列，假设带历次更新，笔记和分析都在
+  assert.equal(find(tree, (n) => n.type === 'table')[1].children[1].children.length, view.observations.length)
+  assert.match(all, /复测后不高了/)
+  assert.match(all, /N1第 2 轮：第一条笔记/)
+  assert.match(all, /A1.*算特征相关完成（40 ms）fig\.txtanalysis\/A1/)
+  // 列表项可点
+  const items = find(tree, (n) => n.type === 'button' && n.props.className?.startsWith?.('pp-run'))
+  assert.equal(items.length, 1)
+  assert.equal(items[0].props.className, 'pp-run pp-run-active')
+  items[0].props.onClick()
+  assert.deepEqual(picked, ['sess-1'])
+  assert.match(text(render({ runs, selected: 'sess-1', view: undefined })), /加载中/)
+  assert.match(text(render({ runs, selected: 'sess-1', view: null, error: 'HTTP 500' })), /出错了：HTTP 500.*读不到/)
+})
+
+test('ledger replacement reasons show up in the rounds table', async () => {
+  const { exports } = loadClient(fakeReact())
+  const services = fakeServices()
+  const d2 = mkdtempSync(join(tmpdir(), 'pp-ledger-'))
+  try {
+    const r = await Run.start({ dir: d2, runId: 's3', services })
+    const ids = (await r.getDecision(services)).recommendations.map((x) => x.id)
+    await r.submitSelection({ accept: ids.slice(1), replace: [{ out: ids[0], in: 'G009', reason_type: 'hypothesis_test', reason: '检验 H1' }] }, services)
+    const all = text(exports.renderLedger({ runs: listRuns(d2), selected: 's3', view: panelView(r), onSelect: () => {}, onControl: () => {} }))
+    assert.match(all, new RegExp(`${ids[0]} → G009`))
+    assert.match(all, /检验 H1/)
+  } finally {
+    rmSync(d2, { recursive: true, force: true })
+  }
+})
+
+test('settings page shows service reachability, the token and the config', () => {
+  const { exports } = loadClient(fakeReact())
+  assert.match(text(exports.renderSettings({ status: undefined })), /加载中/)
+  const status = {
+    config: { oracleUrl: 'http://127.0.0.1:8701', serviceTokenEnv: 'PERTURBPILOT_SERVICE_TOKEN', pythonTimeoutMs: 60000 },
+    token_set: false,
+    services: { oracle: { ok: true, task_id: 'fake-task', synthetic: true }, decision: { ok: false, error: 'unreachable' } },
+  }
+  const refreshed = []
+  const tree = exports.renderSettings({ status, error: null, onRefresh: () => refreshed.push(1) })
+  const all = text(tree)
+  assert.match(all, /oracle：连得上 fake-task（合成数据）/)
+  assert.match(all, /决策模块：连不上：unreachable/)
+  assert.match(all, /没设.*PERTURBPILOT_SERVICE_TOKEN/)
+  assert.match(all, /oracle 服务地址oracleUrlhttp:\/\/127\.0\.0\.1:8701/)
+  assert.match(all, /决策模块服务地址decisionUrl—/)
+  find(tree, (n) => n.type === 'button')[0].props.onClick()
+  assert.deepEqual(refreshed, [1])
+  const set = text(exports.renderSettings({ status: { ...status, token_set: true, services: { decision: { ok: true, name: 'gp-ucb', version: '0.1' } } } }))
+  assert.match(set, /已设（PERTURBPILOT_SERVICE_TOKEN）/)
+  assert.match(set, /决策模块：连得上 gp-ucb 0\.1/)
+})
+
+test('ledger page and settings section talk to the real host routes', async () => {
+  const react = fakeReact()
+  const { exports } = loadClient(react)
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (url, init) => originalFetch(new URL(url, base), init)
+  try {
+    const updates = []
+    react.useState = (initial) => [initial, (v) => updates.push(v)]
+    assert.match(text(exports.LedgerPage()), /加载中/)
+    // 先只有任务列表的轮询（还没选中任务，视图的轮询不启动）
+    assert.equal(react.effects.length, 2)
+    const stops = react.effects.map((fn) => fn())
+    await new Promise((r) => setTimeout(r, 100))
+    stops.forEach((stop) => stop?.())
+    const list = updates.find(Array.isArray)
+    assert.deepEqual(list.map((x) => [x.run_id, x.title]), [['sess-1', '测试任务']])
+
+    react.effects.length = 0
+    updates.length = 0
+    exports.SettingsSection({ close: () => {} })
+    assert.equal(react.effects.length, 1)
+    react.effects[0]()
+    await new Promise((r) => setTimeout(r, 100))
+    const status = updates.find((v) => v && v.services)
+    assert.equal(status.services.oracle.task_id, 'fake-task')
+    assert.equal(status.token_set, false)
   } finally {
     globalThis.fetch = originalFetch
   }
