@@ -43,15 +43,18 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 在 PowerShell 里依次执行：
 
 ```powershell
+# 0. 从仓库本地真实数据生成任务包（生成的 real-tasks/ 和 real-tasks-hidden/ 不进版本库）
+cd D:\internwork\科学发现智能体系统\services
+..\.venv\Scripts\python -m ppsvc.register_real
+
 # 1. 起 oracle 和决策模块（另开一个窗口，常驻）。令牌随便取一个随机串，这个窗口和第 4 步的窗口要设成同一个值
-#    --tasks 指向放任务包的目录（每个带 task.json 的子目录是一个任务包），--hidden-root 指向放隐藏数据的目录（子目录和任务包同名，在任务包外面），两个要一起给；面板和 agent 从这些任务包里选。
-#    只跑一个任务包时也可以用 --task <任务包目录> --hidden <隐藏数据目录>；什么都不加就用合成任务。
+#    --tasks 指向放真实任务包的目录（每个带 task.json 的子目录是一个任务包），--hidden-root 指向放隐藏数据的目录（子目录和任务包同名，在任务包外面），两个要一起给；面板和 agent 从这些任务包里选。
+#    只跑一个任务包时也可以用 --task <任务包目录> --hidden <隐藏数据目录>。生产服务不再自动生成合成任务。
 #    --decision 是默认方法（auto / gp-ucb / coreset / top-uncertain / coverage，auto 在任务包有候选特征时用 gp-ucb、没有时用 coverage；coreset 和 top-uncertain 要装 torch），开始任务时可以另选。
 $env:PERTURBPILOT_SERVICE_TOKEN = '<随机串>'
 cd D:\internwork\科学发现智能体系统\services
-..\.venv\Scripts\python -m ppsvc --tasks D:\internwork\pp-tasks --hidden-root D:\internwork\pp-tasks-hidden
+..\.venv\Scripts\python -m ppsvc --tasks D:\internwork\科学发现智能体系统\real-tasks --hidden-root D:\internwork\科学发现智能体系统\real-tasks-hidden
 # 或：..\.venv\Scripts\python -m ppsvc --task D:\internwork\pp-tasks\il2 --hidden D:\internwork\pp-tasks-hidden\il2
-# 或：..\.venv\Scripts\python -m ppsvc --seed 0
 
 # 2. 密钥只放进环境变量，不写进任何文件；DSH_HOME 用单独的目录，不和日常用的 DSH 共用会话、工作区和设置
 $env:DEEPSEEK_API_KEY = (Get-Content <密钥文件> -Raw).Trim()
@@ -81,7 +84,7 @@ cd D:\internwork\科学发现智能体系统
 <任务包>/
   task.json        公开的任务卡片：task_id, title, synthetic, brief, action, readout.fields, objective{kind, field, direction, description}, budget{rounds, batch_size, allow_repeats}, data_cards
   candidates.csv   id + 公开属性列
-  data/            data_cards 里列出的公开数据文件；role 为 candidate_features 的表是 id + 数值列，可以只覆盖部分候选
+  data/            data_cards 里列出的公开数据文件；candidate_features 可以是 id + 数值列的 CSV，也可以是含 X 的 numpy .npz（可选 id；没有 id 时按 candidates.csv 顺序对齐）
 
 <隐藏数据目录>/     服务启动时用 --hidden 指定；用 --tasks 时是 --hidden-root 下和任务包同名的子目录
   scores.csv       id + 各读数字段

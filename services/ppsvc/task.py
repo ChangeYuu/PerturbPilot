@@ -4,7 +4,8 @@
     task.json        公开的任务卡片
     candidates.csv   id + 公开属性列
     data/            数据卡片的文件（task.json 的 data_cards 里列出）
-                     候选特征表（role=candidate_features, modality=embedding）是 id + 数值列的 CSV，
+                     候选特征表（role=candidate_features, modality=embedding）可以是 id + 数值列的 CSV，
+                     也可以是含 X 的 numpy .npz（可选 id；没有 id 时按 candidates.csv 顺序对齐）。
                      可以只覆盖一部分候选：没有行的候选就是没有特征，决策模块不会假装它有
 
   <隐藏数据目录>/     只有 oracle 读，放在任务包外面（服务用 --hidden 指定）
@@ -13,7 +14,7 @@
 
 任务包整个目录 agent 都可能看到（分析工具会列出它），所以里面只放可以给 agent 看的东西；
 任务包里有 hidden/ 目录时直接拒绝加载，免得旧布局的隐藏读数被看到。
-没有指定任务包时，用 write_synthetic_package 在两个临时目录里分别生成合成任务包和它的隐藏数据。
+生产服务必须显式指定真实任务包；write_synthetic_package 只供测试夹具使用。
 """
 
 from __future__ import annotations
@@ -140,16 +141,35 @@ class Package:
         for dc in self.card.get("data_cards", []):
             if dc["role"] != "candidate_features" or dc["modality"] != "embedding" or dc["visibility"] not in visible:
                 continue
-            header, rows = read_csv(self.root / dc["file"])
-            by_id = {}
-            for r in rows:
-                if r[0] not in known:
-                    raise TaskError(f"data card {dc['name']!r} has a row for {r[0]!r}, which is not a candidate")
-                if r[0] in by_id:
-                    raise TaskError(f"data card {dc['name']!r} has two rows for {r[0]!r}")
-                if len(r) != len(header):
-                    raise TaskError(f"data card {dc['name']!r} row {r[0]!r} has {len(r)} columns, expected {len(header)}")
-                by_id[r[0]] = [float(x) for x in r[1:]]
+            path = self.root / dc["file"]
+            if path.suffix.lower() == ".npz":
+                try:
+                    with np.load(path, allow_pickle=False) as bundle:
+                        x = np.asarray(bundle["X"], dtype=np.float32)
+                        feature_ids = np.asarray(bundle["id"] if "id" in bundle else self.ids)
+                except (OSError, KeyError, ValueError) as error:
+                    raise TaskError(f"data card {dc['name']!r} invalid npz: {error}") from error
+                if x.ndim != 2 or len(x) != len(feature_ids):
+                    raise TaskError(f"data card {dc['name']!r} npz must contain 2-D X and one id per row")
+                by_id = {}
+                for index, raw_id in enumerate(feature_ids):
+                    cid = str(raw_id)
+                    if cid not in known:
+                        raise TaskError(f"data card {dc['name']!r} has a row for {cid!r}, which is not a candidate")
+                    if cid in by_id:
+                        raise TaskError(f"data card {dc['name']!r} has two rows for {cid!r}")
+                    by_id[cid] = np.asarray(x[index], dtype=np.float32)
+            else:
+                header, rows = read_csv(path)
+                by_id = {}
+                for r in rows:
+                    if r[0] not in known:
+                        raise TaskError(f"data card {dc['name']!r} has a row for {r[0]!r}, which is not a candidate")
+                    if r[0] in by_id:
+                        raise TaskError(f"data card {dc['name']!r} has two rows for {r[0]!r}")
+                    if len(r) != len(header):
+                        raise TaskError(f"data card {dc['name']!r} row {r[0]!r} has {len(r)} columns, expected {len(header)}")
+                    by_id[r[0]] = [float(x) for x in r[1:]]
             if not by_id:
                 raise TaskError(f"data card {dc['name']!r} has no rows")
             tables.append(by_id)
@@ -158,7 +178,7 @@ class Package:
         rows = np.array([i for i, c in enumerate(self.ids) if all(c in t for t in tables)], dtype=int)
         if len(rows) == 0:
             raise TaskError("no candidate has a row in every candidate_features card")
-        X = np.hstack([np.asarray([t[self.ids[i]] for i in rows], dtype=float).reshape(len(rows), -1) for t in tables])
+        X = np.hstack([np.asarray([t[self.ids[i]] for i in rows], dtype=np.float32).reshape(len(rows), -1) for t in tables])
         return Features(rows, X)
 
 

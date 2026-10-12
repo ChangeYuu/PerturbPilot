@@ -273,6 +273,17 @@ def partial_package(root, featured=("A", "B", "C", "D", "E", "F"), ids=tuple("AB
     return root
 
 
+def test_npz_feature_cards_align_by_id_or_candidate_order(tmp_path):
+    root = partial_package(tmp_path / "p", featured=("A", "B", "C"), ids=("A", "B", "C"))
+    np.savez(root / "data" / "emb.npz", X=np.array([[1, 2], [3, 4], [5, 6]], dtype=np.float32), id=np.array(["A", "B", "C"]))
+    card = json.loads((root / "task.json").read_text(encoding="utf-8"))
+    card["data_cards"][0]["file"] = "data/emb.npz"
+    write_json(root / "task.json", card)
+    feats = Package.load(root).features()
+    assert feats.rows.tolist() == [0, 1, 2]
+    assert np.array_equal(feats.X, np.array([[1, 2], [3, 4], [5, 6]], dtype=np.float32))
+
+
 @pytest.mark.parametrize("method", ["gp-ucb", "coreset", "top-uncertain"])
 def test_candidates_without_features_are_never_recommended(tmp_path, method):
     root = partial_package(tmp_path / "p")

@@ -46,3 +46,9 @@ credentials.json
 .DS_Store
 Thumbs.db
 *.log
+
+# 本地真实数据与生成的任务包（不进版本库）
+整理后基因扰动数据/
+整理后序列优化数据/
+real-tasks/
+real-tasks-hidden/

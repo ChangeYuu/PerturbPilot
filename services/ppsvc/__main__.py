@@ -1,8 +1,6 @@
 """启动 oracle 和决策模块两个 HTTP 服务。
 
 用法：
-  python -m ppsvc                                  # 合成任务（种子 0）
-  python -m ppsvc --seed 3 --rounds 8 --batch-size 6
   python -m ppsvc --task D:\\pp-tasks\\il2 --hidden D:\\pp-tasks-hidden\\il2   # 任务包和它的隐藏数据
   python -m ppsvc --task <目录> --hidden <目录> --decision coverage
   python -m ppsvc --tasks D:\\pp-tasks --hidden-root D:\\pp-tasks-hidden      # 目录下的所有任务包
@@ -25,28 +23,24 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import tempfile
 import threading
 from pathlib import Path
 
 from .decision import METHODS, DecisionService
 from .jsonhttp import make_server
 from .oracle import Oracle, OracleHub
-from .task import Package, write_synthetic_package
+from .task import Package
 
 TOKEN_ENV = "PERTURBPILOT_SERVICE_TOKEN"
 
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="ppsvc")
-    p.add_argument("--task", help="任务包目录；不给就生成合成任务")
+    p.add_argument("--task", help="任务包目录；和 --hidden 一起使用")
     p.add_argument("--hidden", help="任务包的隐藏数据目录（在任务包外面）；给了 --task 就必须给")
     p.add_argument("--tasks", help="放多个任务包的目录，每个子目录一个")
     p.add_argument("--hidden-root", help="放隐藏数据的目录，子目录和 --tasks 下的任务包同名；给了 --tasks 就必须给")
     p.add_argument("--decision", choices=METHODS, default="auto")
-    p.add_argument("--seed", type=int, default=0, help="合成任务的种子")
-    p.add_argument("--rounds", type=int, default=10, help="合成任务的轮数")
-    p.add_argument("--batch-size", type=int, default=6, help="合成任务每轮的批量")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--oracle-port", type=int, default=8701)
     p.add_argument("--decision-port", type=int, default=8702)
@@ -68,9 +62,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         if args.hidden:
             p.error("--hidden only goes with --task")
-        root = Path(tempfile.mkdtemp(prefix="pp-synthetic-"))
-        hidden = Path(tempfile.mkdtemp(prefix="pp-synthetic-hidden-"))
-        write_synthetic_package(root, hidden, seed=args.seed, max_rounds=args.rounds, batch_size=args.batch_size)
+        p.error("必须提供 --tasks 和 --hidden-root，或提供 --task 和 --hidden；生产服务不再生成合成任务")
     if not args.tasks:
         oracle = OracleHub([Oracle(Package.load(root), hidden)])
     decision = DecisionService(args.decision)
