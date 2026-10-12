@@ -265,7 +265,7 @@ export function apply(ctx, config) {
 
   tool({
     name: 'pp_run_python',
-    description: '在本任务的运行目录里跑一段 Python 做分析（numpy 可用）。当前目录下有 observations.csv（id, round, replicate 加每个读数字段，全部测量）、candidates.csv（任务包的候选表）、decision.csv（最近一次推荐里决策模块对每个候选的打分）、data/（任务包里公开的数据文件，比如候选特征）。用 print 输出结论；写出的文件会留在这次分析的目录里。这里不能测量新候选，测量只能经 pp_submit_selection。代码和输出都会记录。',
+    description: '在本任务的运行目录里跑一段 Python 做分析（只保证 Python 标准库和 numpy；pandas、scipy、sklearn 等未提供）。当前目录下有 observations.csv（id, round, replicate 加每个读数字段，全部测量）、candidates.csv（任务包的候选表）、decision.csv（最近一次推荐里决策模块对每个候选的打分）、data/（任务包里公开的数据文件，比如候选特征）。用 print 输出结论；写出的文件会留在这次分析的目录里。这里不能测量新候选，测量只能经 pp_submit_selection。代码和输出都会记录。',
     parameters: {
       code: { type: 'string', required: true, description: '完整的 Python 脚本' },
       purpose: { type: 'string', required: true, description: '一句话：这段分析要回答什么' },

@@ -103,6 +103,13 @@ test('errors, timeouts and a missing interpreter are reported, not thrown', asyn
   assert.deepEqual(events.map((e) => [e.data.exit_code === 0, e.data.timed_out]), [[false, false], [false, true], [false, false]])
 })
 
+test('missing third party packages get a clear environment message', async () => {
+  const res = await runAnalysis(run, { code: 'import pandas', purpose: '验证环境边界' }, opts())
+  assert.equal(res.exit_code, 1)
+  assert.match(res.stderr, /当前分析环境只提供 Python 标准库和 numpy/)
+  assert.match(res.stderr, /当前环境不提供 pandas/)
+})
+
 test('analysis needs code, a purpose and an open run', async () => {
   await assert.rejects(runAnalysis(run, { code: ' ', purpose: 'x' }, opts()), /code 不能为空/)
   await assert.rejects(runAnalysis(run, { code: 'print(1)', purpose: '' }, opts()), /purpose/)

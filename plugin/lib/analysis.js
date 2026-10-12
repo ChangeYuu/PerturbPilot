@@ -113,6 +113,14 @@ function clip(text, max) {
   return text.length <= max ? text : `${text.slice(0, max)}\n…（截断，共 ${text.length} 字符）`
 }
 
+function explainPythonError(stderr) {
+  const missing = stderr.match(/ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]/);
+  if (!missing) return stderr;
+  const packageName = missing[1].split('.')[0];
+  if (packageName === 'numpy') return stderr;
+  return `当前分析环境只提供 Python 标准库和 numpy；当前环境不提供 ${packageName}。请改用标准库或 numpy。\n\n${stderr}`;
+}
+
 function exec({ python, dir, timeoutMs, signal, env }) {
   return new Promise((resolvePromise) => {
     const started = Date.now()
@@ -152,6 +160,7 @@ export async function runAnalysis(run, { code, purpose }, { python, timeoutMs, s
   const inputs = new Set([...FIXED, ...writeInputs(run, dir)])
   const r = await exec({ python, dir, timeoutMs, signal, env })
   if (r.spawnError) r.stderr += `${r.stderr ? '\n' : ''}无法启动 Python（${python}）：${r.spawnError.message}`
+  r.stderr = explainPythonError(r.stderr)
   writeFileSync(join(dir, 'stdout.txt'), r.stdout, 'utf8')
   writeFileSync(join(dir, 'stderr.txt'), r.stderr, 'utf8')
   const files = listOutputs(dir, inputs)

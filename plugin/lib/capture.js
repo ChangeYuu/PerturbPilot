@@ -1,5 +1,5 @@
 // 抓取发往模型服务的原始 HTTP 请求和响应。
-// 做法：替换全局 fetch，URL 命中 pattern 的调用在不耽误响应交付的前提下克隆一份正文落盘。
+// 做法：替换全局 fetch，URL 命中 pattern 的调用在不耽误响应交付的前提下复制一份正文落盘。
 // 请求头和响应头一律不记录（密钥在请求头里）；URL 只保留 origin + pathname。
 
 export function installFetchCapture({ pattern, onCall, logger }) {
@@ -25,15 +25,63 @@ export function installFetchCapture({ pattern, onCall, logger }) {
       emit({ startedAt, url, method: request.method, requestText, error: String(error?.message ?? error) })
       throw error
     }
-    const copy = response.clone()
-    copy.text().then(
-      (responseText) => emit({ startedAt, url, method: request.method, requestText, status: response.status, responseText }),
-      (error) => emit({ startedAt, url, method: request.method, requestText, status: response.status, error: String(error?.message ?? error) }),
+    // DSH consumes streaming responses and may abort the response after the
+    // turn has completed. Cloning here and reading the clone later races with
+    // that lifecycle, which turns a successful HTTP response into a spurious
+    // "This operation was aborted" model-call error. Tee the body before the
+    // caller can consume it so the recorder owns an independent branch.
+    if (!response.body) {
+      emit({
+        startedAt,
+        url,
+        method: request.method,
+        requestText,
+        status: response.status,
+        responseText: '',
+        error: response.ok === false ? 'HTTP ' + response.status : null,
+      })
+      return response
+    }
+    if (typeof response.body.tee !== 'function') {
+      emit({
+        startedAt,
+        url,
+        method: request.method,
+        requestText,
+        status: response.status,
+        error: response.ok === false ? 'HTTP ' + response.status : null,
+        recordError: 'response body does not support tee; response body was not recorded',
+      })
+      return response
+    }
+
+    const [callerBody, captureBody] = response.body.tee()
+    const callerResponse = new Response(callerBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
+    const captureResponse = new Response(captureBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
+    captureResponse.text().then(
+      (responseText) => emit({ startedAt, url, method: request.method, requestText, status: response.status, responseText, error: response.ok === false ? 'HTTP ' + response.status : null }),
+      (error) => emit({
+        startedAt,
+        url,
+        method: request.method,
+        requestText,
+        status: response.status,
+        error: response.ok === false ? 'HTTP ' + response.status : null,
+        recordError: String(error?.message ?? error),
+      }),
     )
-    return response
+    return callerResponse
   }
 
-  function emit({ startedAt, url, method, requestText, status, responseText, error }) {
+  function emit({ startedAt, url, method, requestText, status, responseText, error, recordError }) {
     try {
       onCall({
         started_at: new Date(startedAt).toISOString(),
@@ -44,6 +92,7 @@ export function installFetchCapture({ pattern, onCall, logger }) {
         request: parseMaybeJson(requestText),
         response: responseText === undefined ? null : parseMaybeJson(responseText),
         error: error ?? null,
+        record_error: recordError ?? null,
       })
     } catch (e) {
       logger?.warn?.(`perturbpilot: failed to record model call: ${e?.message ?? e}`)

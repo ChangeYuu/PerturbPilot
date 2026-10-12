@@ -52,6 +52,104 @@ test('matching calls are recorded without headers or query; others are not', asy
   assert.equal(globalThis.fetch, originalFetch)
 })
 
+test('streaming responses are teed before the caller consumes them', async () => {
+  const calls = []
+  const originalFetch = globalThis.fetch
+  let cloneCalled = false
+  globalThis.fetch = async () => ({
+    status: 200,
+    statusText: 'OK',
+    headers: new Headers({ 'content-type': 'application/json' }),
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ ok: true })))
+        controller.close()
+      },
+    }),
+    clone() {
+      cloneCalled = true
+      throw new Error('clone must not be used for streaming responses')
+    },
+  })
+  const capture = installFetchCapture({ pattern: '/llm/', onCall: (c) => calls.push(c) })
+  try {
+    const res = await fetch('http://example.test/llm/stream')
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { ok: true })
+    await new Promise((r) => setTimeout(r, 10))
+  } finally {
+    capture.uninstall()
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(cloneCalled, false)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].status, 200)
+  assert.equal(calls[0].error, null)
+  assert.deepEqual(calls[0].response, { kind: 'json', body: { ok: true } })
+})
+
+test('recording failures are separate from successful HTTP requests', async () => {
+  const calls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    status: 200,
+    statusText: 'OK',
+    headers: new Headers({ 'content-type': 'text/plain' }),
+    body: {
+      tee() {
+        return [
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('caller body'))
+              controller.close()
+            },
+          }),
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error('capture branch failed'))
+            },
+          }),
+        ]
+      },
+    },
+  })
+  const capture = installFetchCapture({ pattern: '/llm/', onCall: (c) => calls.push(c) })
+  try {
+    const res = await fetch('http://example.test/llm/stream')
+    assert.equal(await res.text(), 'caller body')
+    await new Promise((r) => setTimeout(r, 10))
+  } finally {
+    capture.uninstall()
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].status, 200)
+  assert.equal(calls[0].error, null)
+  assert.equal(calls[0].record_error, 'capture branch failed')
+})
+
+test('HTTP failures are distinguished from capture failures', async () => {
+  const calls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: 'unauthorized' }), {
+    status: 401,
+    headers: { 'content-type': 'application/json' },
+  })
+  const capture = installFetchCapture({ pattern: '/llm/', onCall: (c) => calls.push(c) })
+  try {
+    const res = await fetch('http://example.test/llm/auth')
+    await res.json()
+    await new Promise((r) => setTimeout(r, 10))
+  } finally {
+    capture.uninstall()
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].status, 401)
+  assert.equal(calls[0].error, 'HTTP 401')
+  assert.equal(calls[0].record_error, null)
+})
+
 test('network failures are recorded and rethrown', async () => {
   const calls = []
   const capture = installFetchCapture({ pattern: '127\\.0\\.0\\.1:1/', onCall: (c) => calls.push(c) })
