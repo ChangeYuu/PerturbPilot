@@ -128,6 +128,42 @@ test('recording failures are separate from successful HTTP requests', async () =
   assert.equal(calls[0].record_error, 'capture branch failed')
 })
 
+test('expected stream aborts after a successful response are not recorded as failures', async () => {
+  const calls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    status: 200,
+    statusText: 'OK',
+    ok: true,
+    headers: new Headers(),
+    body: {
+      tee() {
+        return [
+          new ReadableStream({
+            start(controller) { controller.close() },
+          }),
+          new ReadableStream({
+            start(controller) { controller.error(new Error('This operation was aborted')) },
+          }),
+        ]
+      },
+    },
+  })
+  const capture = installFetchCapture({ pattern: '/llm/', onCall: (c) => calls.push(c) })
+  try {
+    const res = await fetch('http://example.test/llm/aborted-after-success')
+    await res.text()
+    await new Promise((r) => setTimeout(r, 10))
+  } finally {
+    capture.uninstall()
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].status, 200)
+  assert.equal(calls[0].error, null)
+  assert.equal(calls[0].record_error, null)
+})
+
 test('HTTP failures are distinguished from capture failures', async () => {
   const calls = []
   const originalFetch = globalThis.fetch

@@ -75,7 +75,7 @@ export function installFetchCapture({ pattern, onCall, logger }) {
         requestText,
         status: response.status,
         error: response.ok === false ? 'HTTP ' + response.status : null,
-        recordError: String(error?.message ?? error),
+        recordError: response.ok && isExpectedStreamAbort(error) ? null : String(error?.message ?? error),
       }),
     )
     return callerResponse
@@ -115,4 +115,9 @@ function parseMaybeJson(text) {
   } catch {
     return { kind: 'text', body: text }
   }
+}
+
+function isExpectedStreamAbort(error) {
+  const message = String(error?.message ?? error);
+  return error?.name === 'AbortError' || message === 'This operation was aborted' || message === 'The operation was aborted';
 }
