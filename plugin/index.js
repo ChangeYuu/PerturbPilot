@@ -421,6 +421,25 @@ export function apply(ctx, config) {
       const round = driven.get(agent.id)
       driven.delete(agent.id)
       try {
+        // Some DSH turns reach idle without emitting turn-stopping (for
+        // example after a model response that ends immediately after a tool
+        // result). Give the open round the same bounded steer opportunity in
+        // that path before marking it stalled.
+        if (round !== undefined && run.shouldSteer(round, config.maxSteers)) {
+          run.markSteered(round)
+          const message = createUserMessage({
+            content: [{ type: 'text', text: steerPrompt(round) }],
+            source: { kind: 'perturbpilot', round, steer: true },
+          })
+          // The idle notification is emitted while the agent is finalising
+          // its turn. Queue a normal followup after that lifecycle callback;
+          // calling steer() here cancels the just-created request immediately.
+          queueMicrotask(() => {
+            ctx.agents.withoutInitiator(async () => agent.followup(message))
+              .catch((error) => warn('could not queue idle steer', error))
+          })
+          return
+        }
         if (round !== undefined) run.stallIfOpen(round)
       } catch (error) {
         warn('could not record stalled round', error)

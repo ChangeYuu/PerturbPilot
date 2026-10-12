@@ -55,30 +55,88 @@ export function installFetchCapture({ pattern, onCall, logger }) {
       return response
     }
 
-    const [callerBody, captureBody] = response.body.tee()
-    const callerResponse = new Response(callerBody, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    })
-    const captureResponse = new Response(captureBody, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    })
-    captureResponse.text().then(
-      (responseText) => emit({ startedAt, url, method: request.method, requestText, status: response.status, responseText, error: response.ok === false ? 'HTTP ' + response.status : null }),
-      (error) => emit({
+    // The real fetch implementation exposes a WHATWG reader. Keep a small
+    // tee fallback for host/test response shims that only implement tee().
+    if (typeof response.body.getReader !== 'function') {
+      const [callerBody, captureBody] = response.body.tee()
+      const callerResponse = new Response(callerBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      })
+      new Response(captureBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      }).text().then(
+        (responseText) => emit({ startedAt, url, method: request.method, requestText, status: response.status, responseText, error: response.ok === false ? 'HTTP ' + response.status : null }),
+        (error) => emit({
+          startedAt,
+          url,
+          method: request.method,
+          requestText,
+          status: response.status,
+          error: response.ok === false ? 'HTTP ' + response.status : null,
+          recordError: response.ok && isExpectedStreamAbort(error) ? null : String(error?.message ?? error),
+        }),
+      )
+      return callerResponse
+    }
+
+    // Put the recorder in a pass-through reader instead of teeing the body.
+    // DSH is the sole consumer of the provider stream; a second consumer can
+    // perturb cancellation/backpressure at exactly the point where a turn
+    // finishes. The pass-through preserves the bytes and ordering delivered to
+    // DSH while recording whatever was actually observed.
+    let reader
+    let settled = false
+    const chunks = []
+    const finishCapture = (recordError = null) => {
+      if (settled) return
+      settled = true
+      emit({
         startedAt,
         url,
         method: request.method,
         requestText,
         status: response.status,
+        responseText: decodeChunks(chunks),
         error: response.ok === false ? 'HTTP ' + response.status : null,
-        recordError: response.ok && isExpectedStreamAbort(error) ? null : String(error?.message ?? error),
-      }),
-    )
-    return callerResponse
+        recordError: response.ok && isExpectedStreamAbortMessage(recordError) ? null : recordError,
+      })
+    }
+    const callerBody = new ReadableStream({
+      start(controller) {
+        reader = response.body.getReader()
+        void (async () => {
+          try {
+            while (true) {
+              const { value, done } = await reader.read()
+              if (done) {
+                finishCapture()
+                controller.close()
+                return
+              }
+              chunks.push(toUint8Array(value))
+              controller.enqueue(value)
+            }
+          } catch (error) {
+            const message = String(error?.message ?? error)
+            finishCapture(message)
+            controller.error(error)
+          }
+        })()
+      },
+      cancel(reason) {
+        void reader?.cancel(reason)
+        finishCapture(String(reason?.message ?? reason ?? 'stream cancelled'))
+      },
+    })
+    return new Response(callerBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
   }
 
   function emit({ startedAt, url, method, requestText, status, responseText, error, recordError }) {
@@ -118,6 +176,26 @@ function parseMaybeJson(text) {
 }
 
 function isExpectedStreamAbort(error) {
-  const message = String(error?.message ?? error);
-  return error?.name === 'AbortError' || message === 'This operation was aborted' || message === 'The operation was aborted';
+  return isExpectedStreamAbortMessage(error)
+}
+
+function isExpectedStreamAbortMessage(error) {
+  const message = String(error?.message ?? error)
+  return error?.name === 'AbortError' || message === 'This operation was aborted' || message === 'The operation was aborted'
+}
+
+function toUint8Array(value) {
+  if (value instanceof Uint8Array) return value
+  return new Uint8Array(value)
+}
+
+function decodeChunks(chunks) {
+  const total = chunks.reduce((size, chunk) => size + chunk.byteLength, 0)
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return new TextDecoder().decode(bytes)
 }
