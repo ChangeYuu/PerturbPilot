@@ -83,6 +83,24 @@ export function installFetchCapture({ pattern, onCall, logger }) {
       return callerResponse
     }
 
+    // Preserve native text/event-stream Responses for DSH. Reconstructing a
+    // Response around a wrapped SSE stream is not compatible with every DSH
+    // stream reader;
+    // the request, HTTP status, and the durable DSH/session trace remain
+    // recorded here while the caller owns the original body.
+    const contentType = response.headers.get('content-type') ?? ''
+    if (/text\/event-stream/i.test(contentType)) {
+      emit({
+        startedAt,
+        url,
+        method: request.method,
+        requestText,
+        status: response.status,
+        error: response.ok === false ? 'HTTP ' + response.status : null,
+      })
+      return response
+    }
+
     // Put the recorder in a pass-through reader instead of teeing the body.
     // DSH is the sole consumer of the provider stream; a second consumer can
     // perturb cancellation/backpressure at exactly the point where a turn
