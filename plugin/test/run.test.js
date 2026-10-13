@@ -193,6 +193,35 @@ test('retries a lost decision response without advancing the decision twice', as
   assert.equal(services.calls.filter((c) => c.name === 'observe').length, 2)
   assert.equal(recovered.receipt.state_version_after, 1)
 })
+test('retrieval lifecycle records started and aborted calls', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  const started = run.recordRetrievalStart({ name: 'web_fetch', arguments: JSON.stringify({ url: 'https://example.org/paper.pdf' }) })
+  assert.equal(started.id, 'R1')
+  assert.equal(run.state.retrievals[0].status, 'started')
+  assert.equal(readJson(join(dir, 'retrieval', 'R1.json')).status, 'started')
+  assert.equal(run.abortRetrieval('R1', 'agent disposed'), true)
+  assert.equal(run.state.retrievals[0].status, 'aborted')
+  assert.equal(readJson(join(dir, 'retrieval', 'R1.json')).status, 'aborted')
+  const types = readJsonl(join(dir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => e.type)
+  assert.deepEqual(types, ['retrieval/started', 'retrieval/aborted'])
+  assert.equal(run.abortRetrieval('R1', 'duplicate'), false)
+})
+
+test('aborted tool results are marked as aborted while retaining the completion summary', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  run.recordRetrievalStart({ name: 'web_search', arguments: { queries: ['G001'] } })
+  run.recordRetrieval(
+    { name: 'web_search', arguments: { queries: ['G001'] } },
+    { message: { isError: true, error: { name: 'AbortError', message: 'tool call aborted' }, content: [{ type: 'text', text: 'tool call aborted' }] }, meta: {} },
+    'R1',
+  )
+  assert.equal(run.state.retrievals[0].status, 'aborted')
+  const events = readJsonl(join(dir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/'))
+  assert.deepEqual(events.map((e) => e.type), ['retrieval/started', 'retrieval/searched', 'retrieval/aborted'])
+})
+
 test('the decision is asked for the batch plus alternatives and returns the method and numbers', async () => {
   const services = fakeServices()
   const run = await Run.start({ dir, runId: 's1', services })

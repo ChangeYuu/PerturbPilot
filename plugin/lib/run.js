@@ -388,40 +388,113 @@ export class Run {
   // ---- 检索记录（web_search / web_fetch 由 DSH 执行，这里只记下来，不拦截） ----
 
   /**
-   * 记一次检索。call 是会话里 tool/call 的 {name, arguments}，result 是 tool/result 的
-   * {message: {isError, content}, meta}。原文落到 retrieval/R<N>.json，事件和状态里只放摘要。
-   * 任务结束后查的也记（事后审计要看得到），所以不检查状态。
+   * 先记录检索调用已经开始。结果尚未回来时也要留下记录，便于区分
+   * “没有调用”与“调用后中断”。
    */
-  recordRetrieval(call, result) {
+  recordRetrievalStart(call) {
     this.state.retrievals ??= []
     const id = `R${this.state.retrievals.length + 1}`
-    const r = this.state.round
+    const round = this.state.round
+    const args = parseArguments(call.arguments)
+    const at = new Date().toISOString()
+    const file = `retrieval/${id}.json`
+    const entry = { id, round, at, tool: call.name, status: 'started', is_error: null, file }
+    this.state.retrievals.push(entry)
+    this.recorder.writeJson(join('retrieval', `${id}.json`), {
+      id,
+      round,
+      tool: call.name,
+      arguments: args,
+      status: 'started',
+      started_at: at,
+    })
+    const summary = call.name === 'web_search'
+      ? { queries: args?.queries ?? (args?.query ? [args.query] : []) }
+      : { url: args?.url ?? null }
+    this.recorder.event('retrieval/started', 'model', round, { id, tool: call.name, file, ...summary })
+    this.save()
+    return entry
+  }
+
+  /**
+   * 记一次检索结果。call 是会话里的 tool/call，result 是 tool/result。
+   * 原文落到 retrieval/R<N>.json，事件和状态里只放摘要。
+   */
+  recordRetrieval(call, result, retrievalId = null) {
+    this.state.retrievals ??= []
+    let entry = retrievalId ? this.state.retrievals.find((x) => x.id === retrievalId) : null
+    if (!entry) entry = this.recordRetrievalStart(call)
+    const id = entry.id
+    const round = entry.round
     const text = (result.message?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
     const isError = Boolean(result.message?.isError)
+    const error = result.message?.error ?? result.error ?? null
+    const aborted = isError && (error?.name === 'AbortError' || /\babort(?:ed|ing)?\b/i.test(`${error?.message ?? ''} ${text}`))
+    const status = aborted ? 'aborted' : 'completed'
+    const completedAt = new Date().toISOString()
     const file = `retrieval/${id}.json`
     const args = parseArguments(call.arguments)
     this.recorder.writeJson(join('retrieval', `${id}.json`), {
       id,
-      round: r,
+      round,
       tool: call.name,
       arguments: args,
+      status,
+      started_at: entry.at,
+      completed_at: completedAt,
       is_error: isError,
+      ...(error ? { error } : {}),
       meta: result.meta ?? null,
       text,
     })
     this.retrievalTexts.set(id, text)
-    const entry = { id, round: r, at: new Date().toISOString(), tool: call.name, is_error: isError }
-    this.state.retrievals.push(entry)
+    entry.status = status
+    entry.completed_at = completedAt
+    entry.is_error = isError
+    if (error) entry.error = error
     if (call.name === 'web_search') {
       const queries = args?.queries ?? (args?.query ? [args.query] : [])
       const results = (result.meta?.sources ?? []).map((x) => ({ title: x.title ?? null, url: x.url }))
-      this.recorder.event('retrieval/searched', 'model', r, { id, queries, results, is_error: isError, file })
+      this.recorder.event('retrieval/searched', 'model', round, { id, queries, results, is_error: isError, file })
     } else {
       const url = args?.url ?? result.meta?.url ?? null
-      this.recorder.event('retrieval/fetched', 'model', r, { id, url, status: result.meta?.statusCode ?? null, chars: text.length, is_error: isError, file })
+      this.recorder.event('retrieval/fetched', 'model', round, { id, url, status: result.meta?.statusCode ?? null, chars: text.length, is_error: isError, file })
+    }
+    if (aborted) {
+      this.recorder.event('retrieval/aborted', 'framework', round, {
+        id,
+        tool: call.name,
+        reason: (error?.message ?? text) || 'tool result reported an aborted call',
+        file,
+      })
     }
     this.save()
     return entry
+  }
+
+  /** 记录 DSH agent 在检索结果回来前终止或出错。 */
+  abortRetrieval(retrievalId, reason = 'agent stopped before the retrieval result arrived') {
+    this.state.retrievals ??= []
+    const entry = this.state.retrievals.find((x) => x.id === retrievalId)
+    if (!entry || entry.status !== 'started') return false
+    const at = new Date().toISOString()
+    const file = entry.file ?? `retrieval/${entry.id}.json`
+    const record = this.recorder.readJson(file) ?? { id: entry.id, round: entry.round, tool: entry.tool, arguments: null }
+    entry.status = 'aborted'
+    entry.completed_at = at
+    entry.is_error = true
+    entry.error = { name: 'AbortError', message: reason }
+    this.recorder.writeJson(file, {
+      ...record,
+      status: 'aborted',
+      started_at: record.started_at ?? entry.at,
+      aborted_at: at,
+      is_error: true,
+      error: entry.error,
+    })
+    this.recorder.event('retrieval/aborted', 'framework', entry.round, { id: entry.id, tool: entry.tool, reason, file })
+    this.save()
+    return true
   }
 
   /** 检索正文；审计还会把结构化来源标题和 URL 作为证据文本。 */

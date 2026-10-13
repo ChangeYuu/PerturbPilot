@@ -424,7 +424,7 @@ window.__ModuleLoader__.load({
 					h("span", { className: "pp-kind pp-kind-retrieval" }, "检索"),
 					h("div", null,
 						h("b", null, item.id), " ", what,
-						item.is_error ? h("span", { className: "pp-sub pp-fail" }, " · 出错") : null,
+						item.status === "started" ? h("span", { className: "pp-sub" }, " · 进行中") : item.status === "aborted" ? h("span", { className: "pp-sub pp-fail" }, " · 中断") : item.is_error ? h("span", { className: "pp-sub pp-fail" }, " · 出错") : null,
 						item.results?.length ? h("details", null,
 							h("summary", { className: "pp-sub" }, "结果"),
 							h("ul", { className: "pp-list" }, ...item.results.map((x) => h("li", null, x.title || x.url, " ", h("span", { className: "pp-sub" }, x.url))))) : null));

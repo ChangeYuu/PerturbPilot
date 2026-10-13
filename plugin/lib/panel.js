@@ -94,11 +94,34 @@ export function panelView(run, { events = 40 } = {}) {
     hypotheses: s.hypotheses.map((h) => ({ ...h, history: h.history ?? [], updates: h.history?.length ?? 0 })),
     notes: s.notes,
     analyses: all.filter((e) => e.type === 'analysis/executed').map((e) => ({ round: e.round, ts: e.ts, ...e.data })),
-    retrievals: all
-      .filter((e) => e.type === 'retrieval/searched' || e.type === 'retrieval/fetched')
-      .map((e) => ({ round: e.round, ts: e.ts, tool: e.type === 'retrieval/searched' ? 'web_search' : 'web_fetch', ...e.data })),
+    retrievals: retrievalView(all),
     events: all.slice(-events).map(({ seq, ts, round, type, source }) => ({ seq, ts, round, type, source })),
   }
+}
+
+function retrievalView(events) {
+  const byId = new Map()
+  for (const event of events) {
+    if (!event.type.startsWith('retrieval/')) continue
+    const id = event.data?.id
+    if (!id) continue
+    const previous = byId.get(id) ?? { round: event.round, ts: event.ts, id }
+    if (event.type === 'retrieval/started') {
+      byId.set(id, { ...previous, ...event.data, round: event.round, ts: event.ts, status: 'started', tool: event.data.tool })
+    } else if (event.type === 'retrieval/searched' || event.type === 'retrieval/fetched') {
+      byId.set(id, {
+        ...previous,
+        ...event.data,
+        round: event.round,
+        ts: event.ts,
+        status: event.data.is_error ? 'completed_error' : 'completed',
+        tool: event.type === 'retrieval/searched' ? 'web_search' : 'web_fetch',
+      })
+    } else if (event.type === 'retrieval/aborted') {
+      byId.set(id, { ...previous, ...event.data, round: event.round, ts: event.ts, status: 'aborted', is_error: true })
+    }
+  }
+  return [...byId.values()]
 }
 
 function readEvents(dir) {

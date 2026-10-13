@@ -28,7 +28,7 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 | `decision/NN-propose-K.json`、`NN-observe.json`、`NN-snapshot.json` | 决策模块的原始往返：推荐（含全候选池）、回执、可恢复快照 |
 | `oracle/NN-run.json` | oracle 的原始读数 |
 | `state.json` / `memory.json` | 完整运行状态（`format: 2`；没有这个字段的是早期格式，面板标“旧格式”，插件不再打开）/ 假设和笔记 |
-| `retrieval/R<N>.json` | 第 N 次 `web_search` / `web_fetch`：参数、结果全文、所在轮。每次对应一条 `retrieval/searched` 或 `retrieval/fetched` 事件 |
+| `retrieval/R<N>.json` | 第 N 次 `web_search` / `web_fetch`：参数、所在轮和生命周期状态。调用开始写 `retrieval/started`；正常返回写 `retrieval/searched` / `retrieval/fetched`；工具结果或 agent 终止导致中断时写 `retrieval/aborted`。正常结果包含全文，未完成调用也保留状态 |
 | `analysis/A<N>/` | 第 N 次 `pp_run_python`：`code.py`、导出的 `observations.csv`、`candidates.csv`、`data/`、`decision.csv`、`stdout.txt`、`stderr.txt`，以及脚本自己写出的文件。每次对应一条 `analysis/executed` 事件（`id, purpose, exit_code, timed_out, duration_ms, dir, files`） |
 | `audit.json` | 配对审计，每轮检查：调用了决策模块 → 提交了选择 → 文献核对（literature 组里的候选 id 按整词、不分大小写，在本轮提交前成功的检索结果全文里找；没找到的列在 `unbacked`，有一个就不通过；本批里没标 literature、但检索里提到了的列在 `unlabelled`，只作参考；本轮既没有 literature 组也没有成功的检索时为 n/a）→ 回执完整（收下的加拒收的对得上本轮读数）且版本号 +1 → 下一轮用的状态版本对得上。另外还查后面是否有假设或笔记引用了本轮的读数 |
 

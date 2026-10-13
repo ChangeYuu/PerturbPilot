@@ -225,10 +225,22 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
     type: 'tool/result',
     data: { message: { toolCallId: 'w1', isError: false, content: [{ type: 'text', text: '搜到一篇，讲 G003' }] }, meta: { sources: [{ url: 'https://example.org/a', title: 'A' }] } },
   })
-  assert.deepEqual(readJsonl(join(runDir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => [e.type, e.data.id]), [['retrieval/searched', 'R1']])
+  assert.deepEqual(readJsonl(join(runDir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => [e.type, e.data.id]), [['retrieval/started', 'R1'], ['retrieval/searched', 'R1']])
   const saved = JSON.parse(readFileSync(join(runDir, 'retrieval', 'R1.json'), 'utf8'))
   assert.equal(saved.text, '搜到一篇，讲 G003')
   assert.deepEqual(saved.arguments, { queries: ['G009 通路'] }) // DSH 给的是 JSON 字符串，记录时解析
+
+  host.handlers['session/event'](agent.session, { type: 'tool/call', data: { turn: 2, step: 4, callId: 'w2', name: 'web_fetch', arguments: '{\"url\":\"https://example.org/paper.pdf\"}' } })
+  host.handlers['agent/error']({ agent, turn: 2, step: 4, error: new Error('session ended') })
+  const aborted = JSON.parse(readFileSync(join(runDir, 'retrieval', 'R2.json'), 'utf8'))
+  assert.equal(aborted.status, 'aborted')
+  assert.equal(aborted.error.name, 'AbortError')
+  assert.deepEqual(readJsonl(join(runDir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => [e.type, e.data.id]), [
+    ['retrieval/started', 'R1'],
+    ['retrieval/searched', 'R1'],
+    ['retrieval/started', 'R2'],
+    ['retrieval/aborted', 'R2'],
+  ])
 
   const decision = await host.tools.pp_get_decision.execute({}, exec(agent))
   assert.equal(decision.method, 'coverage')

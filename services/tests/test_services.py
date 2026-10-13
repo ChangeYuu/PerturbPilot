@@ -1,6 +1,11 @@
 import json
+import socket
+import subprocess
+import sys
 import threading
+import time
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -487,6 +492,51 @@ def _post(url, body=None, headers=None):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _get(url):
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _start_ppsvc_process(root, hidden, oracle_port, decision_port):
+    services_root = Path(__file__).parents[1]
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "ppsvc",
+            "--task",
+            str(root),
+            "--hidden",
+            str(hidden),
+            "--oracle-port",
+            str(oracle_port),
+            "--decision-port",
+            str(decision_port),
+        ],
+        cwd=services_root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _wait_service(url, process):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"ppsvc exited with code {process.returncode}")
+        try:
+            return _get(f"{url}/health")
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.05)
+    raise TimeoutError(f"service did not become ready: {url}")
+
+
 def test_http_roundtrip(tmp_path):
     root = write_synthetic_package(tmp_path / "syn", tmp_path / "syn-hidden", seed=0)
     oracle, d = Oracle(Package.load(root), tmp_path / "syn-hidden"), DecisionService()
@@ -539,6 +589,44 @@ def test_http_request_ids_are_idempotent_and_conflicts_are_rejected(tmp_path):
     finally:
         for server in servers:
             server.shutdown()
+
+def test_real_service_process_restart_replays_idempotent_requests(tmp_path):
+    root = write_synthetic_package(tmp_path / "syn", tmp_path / "syn-hidden", seed=0)
+    hidden = tmp_path / "syn-hidden"
+    oracle_port, decision_port = _free_port(), _free_port()
+    oracle_url = f"http://127.0.0.1:{oracle_port}"
+    decision_url = f"http://127.0.0.1:{decision_port}"
+    process = _start_ppsvc_process(root, hidden, oracle_port, decision_port)
+    replacement = None
+    try:
+        _wait_service(oracle_url, process)
+        _wait_service(decision_url, process)
+        task = _get(f"{oracle_url}/task")
+        _post(f"{decision_url}/init", {"task": task, "package_dir": task["package_dir"]})
+        run_body = {"round": 1, "batch": ["G005"], "request_id": "restart-run-1"}
+        first = _post(f"{oracle_url}/run", run_body)
+        observe_body = {"round": 1, "observations": [ro(first["results"][0])], "request_id": "restart-observe-1"}
+        receipt = _post(f"{decision_url}/observe", observe_body)
+        process.terminate()
+        process.wait(timeout=5)
+        replacement = _start_ppsvc_process(root, hidden, oracle_port, decision_port)
+        _wait_service(oracle_url, replacement)
+        _wait_service(decision_url, replacement)
+        assert _post(f"{oracle_url}/run", run_body) == first
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{oracle_url}/run", {**run_body, "batch": ["G006"]})
+        assert error.value.code == 409
+        _post(f"{decision_url}/init", {"task": task, "package_dir": task["package_dir"]})
+        assert _post(f"{decision_url}/observe", observe_body) == receipt
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{decision_url}/observe", {**observe_body, "round": 2})
+        assert error.value.code == 409
+    finally:
+        for child in (replacement, process):
+            if child is not None and child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+
 
 def test_token_required_when_configured(tmp_path):
     oracle, _, _ = make(tmp_path)

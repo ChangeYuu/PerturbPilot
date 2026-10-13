@@ -421,8 +421,16 @@ export function apply(ctx, config) {
     function trackRetrieval(sessionId, event) {
       const data = event.data ?? {}
       if (event.type === 'tool/call') {
-        if (RETRIEVAL_TOOLS.includes(data.name) && runById(sessionId)) {
-          retrievalCalls.set(data.callId, { agent_id: sessionId, name: data.name, arguments: data.arguments })
+        if (RETRIEVAL_TOOLS.includes(data.name)) {
+          const run = runById(sessionId)
+          if (run) {
+            try {
+              const started = run.recordRetrievalStart({ name: data.name, arguments: data.arguments })
+              retrievalCalls.set(data.callId, { agent_id: sessionId, name: data.name, arguments: data.arguments, retrieval_id: started.id })
+            } catch (error) {
+              warn('could not record retrieval start', error)
+            }
+          }
         }
         return
       }
@@ -431,11 +439,31 @@ export function apply(ctx, config) {
       if (!call) return
       retrievalCalls.delete(id)
       try {
-        runById(call.agent_id)?.recordRetrieval(call, data)
+        runById(call.agent_id)?.recordRetrieval(call, data, call.retrieval_id)
       } catch (error) {
         warn('could not record retrieval', error)
       }
     }
+
+    function abortRetrievals(agentId, reason) {
+      for (const [callId, call] of retrievalCalls) {
+        if (call.agent_id !== agentId) continue
+        retrievalCalls.delete(callId)
+        try {
+          runById(agentId)?.abortRetrieval(call.retrieval_id, reason)
+        } catch (error) {
+          warn('could not record retrieval abort', error)
+        }
+      }
+    }
+
+    ctx.on('agent/error', ({ agent, error }) => {
+      abortRetrievals(agent.id, `agent error: ${error?.message ?? String(error)}`)
+    })
+
+    ctx.on('agent/disposed', ({ agent }) => {
+      abortRetrievals(agent.id, 'agent disposed before the retrieval result arrived')
+    })
 
     ctx.on('agent/turn-stopping', ({ agent }) => {
       const run = runFor(agent)
