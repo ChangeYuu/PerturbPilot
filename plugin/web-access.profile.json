@@ -1,0 +1,14 @@
+{
+  "webSearch": { "enabled": false },
+  "tools": {
+    "fetchContent": { "enabled": false },
+    "getSearchContent": { "enabled": false },
+    "sourceCheck": { "enabled": false }
+  },
+  "commands": {
+    "websearch": { "enabled": false },
+    "search": { "enabled": false },
+    "curator": { "enabled": false },
+    "google-account": { "enabled": false }
+  }
+}
