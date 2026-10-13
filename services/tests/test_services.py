@@ -1,6 +1,11 @@
 import json
+import socket
+import subprocess
+import sys
 import threading
+import time
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -110,6 +115,18 @@ def test_readout_independent_of_submission_order(tmp_path):
     assert {r["id"]: r["readout"] for r in r1} == {r["id"]: r["readout"] for r in r2}
 
 
+def test_oracle_run_is_durable_and_idempotent(tmp_path):
+    o, root, _ = make(tmp_path)
+    body = {"task_id": "fake-task", "round": 1, "batch": ["G005"], "request_id": "run-1"}
+    first = o.run(body)
+    assert o.run(body) == first
+    assert o.replicates["G005"] == 1
+    with pytest.raises(HttpError, match="different request"):
+        o.run({**body, "batch": ["G006"]})
+    reloaded = Oracle(Package.load(root.root), hidden_of(root.root))
+    assert reloaded.run(body) == first
+
+
 def test_replicates_differ_and_reset_restores(tmp_path):
     o, _, _ = make(tmp_path)
     v0 = o.run({"batch": ["G005"]})["results"][0]["readout"]
@@ -161,6 +178,20 @@ def test_decision_needs_init_and_required_inputs(tmp_path):
         d.init({"package_dir": str(root)})
     with pytest.raises(HttpError, match="cannot load"):
         DecisionService().init({"package_dir": str(tmp_path / "nope")})
+
+
+def test_decision_observe_is_durable_and_idempotent(tmp_path):
+    _, root, d = make(tmp_path)
+    body = {"round": 1, "observations": [{"id": "G001", "readout": {"phenotype_reduction": 0.5}}], "request_id": "observe-1"}
+    first = d.observe(body)
+    assert d.observe(body) == first
+    assert d.version == 1
+    reloaded = DecisionService("auto")
+    reloaded.init({"package_dir": str(root.root)})
+    assert reloaded.observe(body) == first
+    assert reloaded.version == 1
+    with pytest.raises(HttpError, match="different request"):
+        reloaded.observe({**body, "observations": [{"id": "G002", "readout": {"phenotype_reduction": 0.5}}]})
 
 
 def test_auto_picks_method_by_inputs(tmp_path):
@@ -461,6 +492,51 @@ def _post(url, body=None, headers=None):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _get(url):
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _start_ppsvc_process(root, hidden, oracle_port, decision_port):
+    services_root = Path(__file__).parents[1]
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "ppsvc",
+            "--task",
+            str(root),
+            "--hidden",
+            str(hidden),
+            "--oracle-port",
+            str(oracle_port),
+            "--decision-port",
+            str(decision_port),
+        ],
+        cwd=services_root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _wait_service(url, process):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"ppsvc exited with code {process.returncode}")
+        try:
+            return _get(f"{url}/health")
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.05)
+    raise TimeoutError(f"service did not become ready: {url}")
+
+
 def test_http_roundtrip(tmp_path):
     root = write_synthetic_package(tmp_path / "syn", tmp_path / "syn-hidden", seed=0)
     oracle, d = Oracle(Package.load(root), tmp_path / "syn-hidden"), DecisionService()
@@ -482,6 +558,74 @@ def test_http_roundtrip(tmp_path):
     finally:
         for s in servers:
             s.shutdown()
+
+
+def test_http_request_ids_are_idempotent_and_conflicts_are_rejected(tmp_path):
+    root = write_synthetic_package(tmp_path / "syn", tmp_path / "syn-hidden", seed=0)
+    oracle, d = Oracle(Package.load(root), tmp_path / "syn-hidden"), DecisionService()
+    servers = [make_server("127.0.0.1", 0, oracle.routes()), make_server("127.0.0.1", 0, d.routes())]
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    ob, db = (f"http://127.0.0.1:{server.server_address[1]}" for server in servers)
+    try:
+        task = _post(f"{ob}/task")
+        _post(f"{db}/init", {"task": task, "package_dir": task["package_dir"]})
+        run_body = {"round": 1, "batch": ["G005"], "request_id": "http-run-1"}
+        first = _post(f"{ob}/run", run_body)
+        assert _post(f"{ob}/run", run_body) == first
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{ob}/run", {**run_body, "batch": ["G006"]})
+        assert error.value.code == 409
+        observe_body = {"round": 1, "observations": [ro(first["results"][0])], "request_id": "http-observe-1"}
+        receipt = _post(f"{db}/observe", observe_body)
+        assert _post(f"{db}/observe", observe_body) == receipt
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{db}/observe", {**observe_body, "round": 2})
+        assert error.value.code == 409
+        assert oracle.replicates["G005"] == 1
+        assert d.version == 1
+        assert json.loads((tmp_path / "syn-hidden" / ".perturbpilot-idempotency.json").read_text(encoding="utf-8"))["version"] == 1
+        assert (tmp_path / ".perturbpilot-decision-synthetic-screen-seed0.json").exists()
+    finally:
+        for server in servers:
+            server.shutdown()
+
+def test_real_service_process_restart_replays_idempotent_requests(tmp_path):
+    root = write_synthetic_package(tmp_path / "syn", tmp_path / "syn-hidden", seed=0)
+    hidden = tmp_path / "syn-hidden"
+    oracle_port, decision_port = _free_port(), _free_port()
+    oracle_url = f"http://127.0.0.1:{oracle_port}"
+    decision_url = f"http://127.0.0.1:{decision_port}"
+    process = _start_ppsvc_process(root, hidden, oracle_port, decision_port)
+    replacement = None
+    try:
+        _wait_service(oracle_url, process)
+        _wait_service(decision_url, process)
+        task = _get(f"{oracle_url}/task")
+        _post(f"{decision_url}/init", {"task": task, "package_dir": task["package_dir"]})
+        run_body = {"round": 1, "batch": ["G005"], "request_id": "restart-run-1"}
+        first = _post(f"{oracle_url}/run", run_body)
+        observe_body = {"round": 1, "observations": [ro(first["results"][0])], "request_id": "restart-observe-1"}
+        receipt = _post(f"{decision_url}/observe", observe_body)
+        process.terminate()
+        process.wait(timeout=5)
+        replacement = _start_ppsvc_process(root, hidden, oracle_port, decision_port)
+        _wait_service(oracle_url, replacement)
+        _wait_service(decision_url, replacement)
+        assert _post(f"{oracle_url}/run", run_body) == first
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{oracle_url}/run", {**run_body, "batch": ["G006"]})
+        assert error.value.code == 409
+        _post(f"{decision_url}/init", {"task": task, "package_dir": task["package_dir"]})
+        assert _post(f"{decision_url}/observe", observe_body) == receipt
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{decision_url}/observe", {**observe_body, "round": 2})
+        assert error.value.code == 409
+    finally:
+        for child in (replacement, process):
+            if child is not None and child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
 
 
 def test_token_required_when_configured(tmp_path):

@@ -74,6 +74,7 @@ export class Run {
       retrievals: [],
     }
     const run = new Run(recorder, state)
+    run.servicesReady = true
     recorder.event('run/started', 'framework', 1, {
       task_id: card.task_id,
       synthetic: card.synthetic,
@@ -97,6 +98,7 @@ export class Run {
     this.state = state
     this.candidateSet = new Set(state.candidateIds)
     this.retrievalTexts = new Map() // 检索编号 -> 结果全文；检索记录写了就不再变
+    this.servicesReady = false
   }
 
   get budget() {
@@ -138,8 +140,41 @@ export class Run {
 
   // ---- 决策模块 ----
 
+  async ensureServices(services, signal) {
+    if (this.servicesReady) return
+    const init = await services.init({
+      task: this.state.task,
+      package_dir: this.state.task.package_dir,
+      method: this.state.decision.method,
+    }, signal)
+    const replicates = {}
+    for (const observation of this.state.observations) {
+      const next = Number.isInteger(observation.replicate) ? observation.replicate + 1 : 1
+      replicates[observation.id] = Math.max(replicates[observation.id] ?? 0, next)
+    }
+    await services.resetOracle({
+      task_id: this.state.task.task_id,
+      batch_size: this.budget.batch_size,
+      replicates,
+    }, signal)
+    const snapshot = this.latestSnapshot()
+    if (snapshot) await services.restore({ snapshot }, signal)
+    this.servicesReady = true
+    this.state.decision.version = init.decision_version ?? this.state.decision.version
+    this.save()
+  }
+
+  latestSnapshot() {
+    for (let r = this.state.round; r >= 1; r--) {
+      const snapshot = this.recorder.readJson(join('decision', roundFile('snapshot', r)))
+      if (snapshot) return snapshot
+    }
+    return null
+  }
+
   async getDecision(services, signal) {
     this.requireOpen()
+    await this.ensureServices(services, signal)
     const r = this.state.round
     const k = this.expectedBatchSize()
     const proposal = await services.propose({ round: r, k: k + ALTERNATIVES }, signal)
@@ -227,7 +262,13 @@ export class Run {
       if (source === undefined) problems.push(`${id} 不在本轮推荐里，要放进一个写了理由的组`)
       else if (source === 'decision') problems.push(`${id} 不在本轮推荐里，它所在组的 source 不能是 decision`)
     }
-    if (problems.length) throw new RunError(`选择不合法：\n- ${problems.join('\n- ')}`)
+    if (problems.length) {
+      const guidance = [
+        `本轮要求 ${expected} 个候选；本轮推荐 ${recs.length} 个；推荐外候选必须使用 prior_knowledge/literature/analysis/hypothesis_test/exploration/data_quality。`,
+        this.budget.allow_repeats ? null : `已测候选不能再次提交：${[...this.measuredIds()].slice(0, 20).join(', ') || '无'}。`,
+      ].filter(Boolean)
+      throw new RunError(`选择不合法：\n- ${problems.join('\n- ')}\n\n修正建议：\n- ${guidance.join('\n- ')}`)
+    }
 
     const bySource = {}
     for (const id of batch) {
@@ -247,37 +288,68 @@ export class Run {
 
   async submitSelection(args, services, signal) {
     this.requireOpen()
+    await this.ensureServices(services, signal)
     const r = this.state.round
     const selection = this.validateSelection(args)
     const rec = this.roundRecord(r)
-    rec.submission = { at: new Date().toISOString(), ...selection }
-    this.recorder.event('selection/submitted', 'model', r, {
-      batch: selection.batch,
-      groups: selection.groups,
-      from_recommendation: selection.from_recommendation,
-      outside: selection.outside,
-      forced: rec.steers > 0,
-    })
+    if (rec.submission && JSON.stringify(rec.submission.batch) !== JSON.stringify(selection.batch)) {
+      throw new RunError(`第 ${r} 轮的提交已经持久化；结果未知时必须重试原 batch，不能换一批候选。`)
+    }
+    const runRequestId = rec.submission?.run_request_id ?? `${this.state.runId}:run:${r}`
+    const observeRequestId = rec.submission?.observe_request_id ?? `${this.state.runId}:observe:${r}`
+    const hadSubmission = Boolean(rec.submission)
+    rec.submission = {
+      at: rec.submission?.at ?? new Date().toISOString(),
+      ...selection,
+      run_request_id: runRequestId,
+      observe_request_id: observeRequestId,
+    }
+    if (!hadSubmission) {
+      this.recorder.event('selection/submitted', 'model', r, {
+        batch: selection.batch,
+        groups: selection.groups,
+        from_recommendation: selection.from_recommendation,
+        outside: selection.outside,
+        forced: rec.steers > 0,
+        run_request_id: runRequestId,
+        observe_request_id: observeRequestId,
+      })
+    }
+    // Persist the intent before the first side-effecting service request. A lost
+    // response can then be retried with the same request IDs after reload.
+    this.save()
 
-    const run = await services.run({ task_id: this.state.task.task_id, round: r, batch: selection.batch }, signal)
-    this.recorder.writeJson(join('oracle', roundFile('run', r)), run)
-    rec.results = run.results
-    for (const x of run.results) this.state.observations.push({ id: x.id, round: r, replicate: x.replicate, readout: x.readout })
-    this.recorder.event('oracle/results', 'environment', r, { oracle_version: run.oracle_version, results: run.results })
-
+    const hadResults = Array.isArray(rec.results)
+    const run = await services.run({ task_id: this.state.task.task_id, round: r, batch: selection.batch, request_id: runRequestId }, signal)
+    if (!hadResults) {
+      this.recorder.writeJson(join('oracle', roundFile('run', r)), run)
+      rec.results = run.results
+      for (const x of run.results) this.state.observations.push({ id: x.id, round: r, replicate: x.replicate, readout: x.readout })
+      this.recorder.event('oracle/results', 'environment', r, { oracle_version: run.oracle_version, results: run.results, request_id: runRequestId })
+      this.save()
+    } else {
+      // The response may have been persisted just before a process crash. The
+      // service call above is still retried with the same request ID, but the
+      // recovered result must not create a second trace event or observation.
+      run.results = rec.results
+    }
     const objective = this.state.task.objective
     let failure = null
     try {
-      const receipt = await services.observe({ round: r, observations: run.results.map((x) => ({ id: x.id, readout: x.readout })) }, signal)
-      this.recorder.writeJson(join('decision', roundFile('observe', r)), receipt)
-      rec.receipt = receipt
-      this.recorder.event('decision/observed', 'decision', r, receipt)
+      let receipt = rec.receipt
+      if (!receipt) {
+        receipt = await services.observe({ round: r, observations: run.results.map((x) => ({ id: x.id, readout: x.readout })), request_id: observeRequestId }, signal)
+        this.recorder.writeJson(join('decision', roundFile('observe', r)), receipt)
+        rec.receipt = receipt
+        this.recorder.event('decision/observed', 'decision', r, { ...receipt, request_id: observeRequestId })
+      }
       if (!checkReceipt(run.results, receipt, objective).ok) {
         failure = '决策模块的回执和提交的读数对不上'
         this.recorder.event('receipt/mismatch', 'framework', r, { batch: selection.batch, receipt })
       }
       const snapshot = await services.snapshot(signal)
       this.recorder.writeJson(join('decision', roundFile('snapshot', r)), snapshot)
+      this.save()
     } catch (error) {
       failure = `决策模块没有收下本轮读数：${error.message}`
       this.recorder.event('decision/observe-failed', 'framework', r, { error: error.message })
@@ -285,13 +357,13 @@ export class Run {
 
     const exhausted = !this.budget.allow_repeats && this.measuredIds().size >= this.state.candidateIds.length
     const finished = r >= this.budget.rounds || exhausted
-    if (finished) {
+    if (finished && !failure) {
       this.state.status = 'finished'
       this.recorder.event('run/finished', 'framework', r, { rounds: r, ...(exhausted && r < this.budget.rounds ? { reason: 'candidates_exhausted' } : {}) })
-    } else {
+    } else if (!finished) {
       this.state.round = r + 1
     }
-    if (failure && !finished) {
+    if (failure) {
       this.state.status = 'paused'
       this.recorder.event('run/paused', 'framework', r, { reason: failure })
     }
@@ -309,50 +381,123 @@ export class Run {
         state_version_after: rec.receipt.state_version_after,
       },
       problem: failure,
-      next: finished ? { finished: true } : { round: r + 1, rounds: this.budget.rounds, status: this.state.status },
+      next: failure ? { round: r, rounds: this.budget.rounds, status: this.state.status } : finished ? { finished: true } : { round: r + 1, rounds: this.budget.rounds, status: this.state.status },
     }
   }
 
   // ---- 检索记录（web_search / web_fetch 由 DSH 执行，这里只记下来，不拦截） ----
 
   /**
-   * 记一次检索。call 是会话里 tool/call 的 {name, arguments}，result 是 tool/result 的
-   * {message: {isError, content}, meta}。原文落到 retrieval/R<N>.json，事件和状态里只放摘要。
-   * 任务结束后查的也记（事后审计要看得到），所以不检查状态。
+   * 先记录检索调用已经开始。结果尚未回来时也要留下记录，便于区分
+   * “没有调用”与“调用后中断”。
    */
-  recordRetrieval(call, result) {
+  recordRetrievalStart(call) {
     this.state.retrievals ??= []
     const id = `R${this.state.retrievals.length + 1}`
-    const r = this.state.round
+    const round = this.state.round
+    const args = parseArguments(call.arguments)
+    const at = new Date().toISOString()
+    const file = `retrieval/${id}.json`
+    const entry = { id, round, at, tool: call.name, status: 'started', is_error: null, file }
+    this.state.retrievals.push(entry)
+    this.recorder.writeJson(join('retrieval', `${id}.json`), {
+      id,
+      round,
+      tool: call.name,
+      arguments: args,
+      status: 'started',
+      started_at: at,
+    })
+    const summary = call.name === 'web_search'
+      ? { queries: args?.queries ?? (args?.query ? [args.query] : []) }
+      : { url: args?.url ?? null }
+    this.recorder.event('retrieval/started', 'model', round, { id, tool: call.name, file, ...summary })
+    this.save()
+    return entry
+  }
+
+  /**
+   * 记一次检索结果。call 是会话里的 tool/call，result 是 tool/result。
+   * 原文落到 retrieval/R<N>.json，事件和状态里只放摘要。
+   */
+  recordRetrieval(call, result, retrievalId = null) {
+    this.state.retrievals ??= []
+    let entry = retrievalId ? this.state.retrievals.find((x) => x.id === retrievalId) : null
+    if (!entry) entry = this.recordRetrievalStart(call)
+    const id = entry.id
+    const round = entry.round
     const text = (result.message?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
     const isError = Boolean(result.message?.isError)
+    const error = result.message?.error ?? result.error ?? null
+    const aborted = isError && (error?.name === 'AbortError' || /\babort(?:ed|ing)?\b/i.test(`${error?.message ?? ''} ${text}`))
+    const status = aborted ? 'aborted' : 'completed'
+    const completedAt = new Date().toISOString()
     const file = `retrieval/${id}.json`
     const args = parseArguments(call.arguments)
     this.recorder.writeJson(join('retrieval', `${id}.json`), {
       id,
-      round: r,
+      round,
       tool: call.name,
       arguments: args,
+      status,
+      started_at: entry.at,
+      completed_at: completedAt,
       is_error: isError,
+      ...(error ? { error } : {}),
       meta: result.meta ?? null,
       text,
     })
     this.retrievalTexts.set(id, text)
-    const entry = { id, round: r, at: new Date().toISOString(), tool: call.name, is_error: isError }
-    this.state.retrievals.push(entry)
+    entry.status = status
+    entry.completed_at = completedAt
+    entry.is_error = isError
+    if (error) entry.error = error
     if (call.name === 'web_search') {
       const queries = args?.queries ?? (args?.query ? [args.query] : [])
       const results = (result.meta?.sources ?? []).map((x) => ({ title: x.title ?? null, url: x.url }))
-      this.recorder.event('retrieval/searched', 'model', r, { id, queries, results, is_error: isError, file })
+      this.recorder.event('retrieval/searched', 'model', round, { id, queries, results, is_error: isError, file })
     } else {
       const url = args?.url ?? result.meta?.url ?? null
-      this.recorder.event('retrieval/fetched', 'model', r, { id, url, status: result.meta?.statusCode ?? null, chars: text.length, is_error: isError, file })
+      this.recorder.event('retrieval/fetched', 'model', round, { id, url, status: result.meta?.statusCode ?? null, chars: text.length, is_error: isError, file })
+    }
+    if (aborted) {
+      this.recorder.event('retrieval/aborted', 'framework', round, {
+        id,
+        tool: call.name,
+        reason: (error?.message ?? text) || 'tool result reported an aborted call',
+        file,
+      })
     }
     this.save()
     return entry
   }
 
-  /** 第 id 次检索的结果全文（文献核对用）；记录读不到时当作空文本。 */
+  /** 记录 DSH agent 在检索结果回来前终止或出错。 */
+  abortRetrieval(retrievalId, reason = 'agent stopped before the retrieval result arrived') {
+    this.state.retrievals ??= []
+    const entry = this.state.retrievals.find((x) => x.id === retrievalId)
+    if (!entry || entry.status !== 'started') return false
+    const at = new Date().toISOString()
+    const file = entry.file ?? `retrieval/${entry.id}.json`
+    const record = this.recorder.readJson(file) ?? { id: entry.id, round: entry.round, tool: entry.tool, arguments: null }
+    entry.status = 'aborted'
+    entry.completed_at = at
+    entry.is_error = true
+    entry.error = { name: 'AbortError', message: reason }
+    this.recorder.writeJson(file, {
+      ...record,
+      status: 'aborted',
+      started_at: record.started_at ?? entry.at,
+      aborted_at: at,
+      is_error: true,
+      error: entry.error,
+    })
+    this.recorder.event('retrieval/aborted', 'framework', entry.round, { id: entry.id, tool: entry.tool, reason, file })
+    this.save()
+    return true
+  }
+
+  /** 检索正文；审计还会把结构化来源标题和 URL 作为证据文本。 */
   retrievalText(id) {
     if (!this.retrievalTexts.has(id)) {
       let text = ''
@@ -364,8 +509,17 @@ export class Run {
     return this.retrievalTexts.get(id)
   }
 
+  retrievalEvidence(id) {
+    try {
+      const record = this.recorder.readJson(join('retrieval', `${id}.json`))
+      return `${record.text ?? ''}\n${JSON.stringify(record.meta ?? {})}`
+    } catch {
+      return this.retrievalText(id)
+    }
+  }
+
   audit() {
-    return auditRun(this.state, (id) => this.retrievalText(id))
+    return auditRun(this.state, (id) => this.retrievalEvidence(id))
   }
 
   // ---- 假设与笔记 ----

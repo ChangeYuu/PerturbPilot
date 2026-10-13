@@ -60,6 +60,11 @@ test('view summarizes rounds, audit, ranked observations and events', () => {
   assert.equal(view.task.objective_text, '找效应最强的基因（看 score，越高越好）')
   assert.deepEqual(view.task.readout_fields, ['score', 'absolute_effect'])
   assert.equal(view.decision.method, 'coverage')
+  assert.equal(view.execution.round, 2)
+  assert.equal(view.execution.rounds, 3)
+  assert.equal(view.execution.label, '笔记已写入')
+  assert.ok(view.execution.steps.some((x) => x.label === '决策模块已收到读数'))
+  assert.ok(view.execution.steps.some((x) => x.type === 'oracle/results'))
   assert.equal(view.rounds.length, 2)
   const [r1, r2] = view.rounds
   assert.equal(r1.method, 'coverage')

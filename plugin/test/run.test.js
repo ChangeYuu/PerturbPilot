@@ -145,6 +145,83 @@ test('full closed loop: rounds advance, audit passes, records written', async ()
   assert.throws(() => run.writeNote({ text: 'x', cites: [] }), RunError)
 })
 
+test('selection uses stable request IDs and persists intent before the oracle call', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  const result = await playRound(run, services)
+  const oracleCall = services.calls.find((c) => c.name === 'run')
+  const observeCall = services.calls.find((c) => c.name === 'observe')
+  assert.equal(oracleCall.body.request_id, 's1:run:1')
+  assert.equal(observeCall.body.request_id, 's1:observe:1')
+  assert.equal(run.state.rounds[1].submission.run_request_id, 's1:run:1')
+  assert.equal(run.state.rounds[1].submission.observe_request_id, 's1:observe:1')
+  assert.equal(readJson(join(dir, 'state.json')).rounds[1].submission.run_request_id, 's1:run:1')
+  assert.equal(result.problem, null)
+})
+
+test('retries a lost oracle response without duplicating measurements or trace events', async () => {
+  const services = fakeServices({ runResponseLossOnce: true })
+  const run = await Run.start({ dir, runId: 's1', services })
+  const decision = await run.getDecision(services)
+  const batch = decision.recommendations.slice(0, 3).map((x) => x.id)
+  await assert.rejects(run.submitSelection({ batch, groups: [] }, services), /simulated lost oracle response/)
+  assert.equal(run.state.rounds[1].submission.run_request_id, 's1:run:1')
+  const reloaded = Run.load(dir, 's1')
+  const recovered = await reloaded.submitSelection({ batch, groups: [] }, services)
+  assert.equal(recovered.problem, null)
+  assert.deepEqual(recovered.results.map((x) => x.replicate), [0, 0, 0])
+  const events = readJsonl(join(dir, 'events.jsonl'))
+  assert.equal(events.filter((e) => e.type === 'selection/submitted').length, 1)
+  assert.equal(events.filter((e) => e.type === 'oracle/results').length, 1)
+  assert.equal(events.filter((e) => e.type === 'decision/observed').length, 1)
+  assert.equal(services.calls.filter((c) => c.name === 'run').length, 2)
+})
+
+test('retries a lost decision response without advancing the decision twice', async () => {
+  const services = fakeServices({ rounds: 1, observeResponseLossOnce: true })
+  const run = await Run.start({ dir, runId: 's1', services })
+  const first = await playRound(run, services)
+  assert.match(first.problem, /simulated lost decision response/)
+  assert.equal(run.state.status, 'paused')
+  const recovered = await run.submitSelection({ batch: first.results.map((x) => x.id), groups: [] }, services)
+  assert.equal(recovered.problem, null)
+  assert.equal(run.state.status, 'finished')
+  const events = readJsonl(join(dir, 'events.jsonl'))
+  assert.equal(events.filter((e) => e.type === 'selection/submitted').length, 1)
+  assert.equal(events.filter((e) => e.type === 'oracle/results').length, 1)
+  assert.equal(events.filter((e) => e.type === 'decision/observed').length, 1)
+  assert.equal(services.calls.filter((c) => c.name === 'observe').length, 2)
+  assert.equal(recovered.receipt.state_version_after, 1)
+})
+test('retrieval lifecycle records started and aborted calls', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  const started = run.recordRetrievalStart({ name: 'web_fetch', arguments: JSON.stringify({ url: 'https://example.org/paper.pdf' }) })
+  assert.equal(started.id, 'R1')
+  assert.equal(run.state.retrievals[0].status, 'started')
+  assert.equal(readJson(join(dir, 'retrieval', 'R1.json')).status, 'started')
+  assert.equal(run.abortRetrieval('R1', 'agent disposed'), true)
+  assert.equal(run.state.retrievals[0].status, 'aborted')
+  assert.equal(readJson(join(dir, 'retrieval', 'R1.json')).status, 'aborted')
+  const types = readJsonl(join(dir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => e.type)
+  assert.deepEqual(types, ['retrieval/started', 'retrieval/aborted'])
+  assert.equal(run.abortRetrieval('R1', 'duplicate'), false)
+})
+
+test('aborted tool results are marked as aborted while retaining the completion summary', async () => {
+  const services = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services })
+  run.recordRetrievalStart({ name: 'web_search', arguments: { queries: ['G001'] } })
+  run.recordRetrieval(
+    { name: 'web_search', arguments: { queries: ['G001'] } },
+    { message: { isError: true, error: { name: 'AbortError', message: 'tool call aborted' }, content: [{ type: 'text', text: 'tool call aborted' }] }, meta: {} },
+    'R1',
+  )
+  assert.equal(run.state.retrievals[0].status, 'aborted')
+  const events = readJsonl(join(dir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/'))
+  assert.deepEqual(events.map((e) => e.type), ['retrieval/started', 'retrieval/searched', 'retrieval/aborted'])
+})
+
 test('the decision is asked for the batch plus alternatives and returns the method and numbers', async () => {
   const services = fakeServices()
   const run = await Run.start({ dir, runId: 's1', services })
@@ -235,6 +312,18 @@ test('citations must refer to measured candidates', async () => {
   assert.equal(run.updateHypothesis({ id: 'H1', status: 'supported', cites: ['G001'] }).status, 'supported')
   assert.deepEqual(run.state.hypotheses[0].cites, ['G000', 'G001'])
   assert.throws(() => run.updateHypothesis({ id: 'H9', status: 'supported', cites: [] }), /没有编号/)
+})
+
+test('a final-round observation failure pauses instead of finishing', async () => {
+  const services = fakeServices({ rounds: 1, observeError: 'decision unavailable' })
+  const run = await Run.start({ dir, runId: 's1', services })
+  const res = await playRound(run, services)
+  assert.match(res.problem, /decision unavailable/)
+  assert.equal(run.state.status, 'paused')
+  assert.equal(run.state.round, 1)
+  assert.deepEqual(res.next, { round: 1, rounds: 1, status: 'paused' })
+  assert.equal(readJsonl(join(dir, 'events.jsonl')).some((e) => e.type === 'run/finished'), false)
+  assert.equal(readJson(join(dir, 'audit.json')).status, 'paused')
 })
 
 test('receipt mismatch pauses the run and fails the audit', async () => {
@@ -341,6 +430,18 @@ test('a run reloads from disk with the same state', async () => {
   const seqs = readJsonl(join(dir, 'events.jsonl')).map((e) => e.seq)
   assert.deepEqual(seqs, seqs.map((_, i) => i + 1))
 })
+
+test('a reloaded run restores oracle and decision service state before proposing', async () => {
+  const firstServices = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services: firstServices })
+  await playRound(run, firstServices)
+  const secondServices = fakeServices()
+  const again = Run.load(dir, 's1')
+  const decision = await again.getDecision(secondServices)
+  assert.equal(decision.state_version, 1)
+  assert.deepEqual(secondServices.calls.filter((x) => ['init', 'resetOracle', 'restore', 'propose'].includes(x.name)).map((x) => x.name), ['init', 'resetOracle', 'restore', 'propose'])
+})
+
 
 test('a legacy run is recognised and not opened', () => {
   writeFileSync(join(dir, 'state.json'), JSON.stringify({ runId: 'old', task: { max_rounds: 3 } }), 'utf8')

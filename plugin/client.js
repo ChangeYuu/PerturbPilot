@@ -152,6 +152,42 @@ window.__ModuleLoader__.load({
 			return h("span", { title: s.groups.map((g) => `${sourceText(g.source)}（${g.ids.join(", ")}）：${g.reason}`).join("\n") }, parts.join("；"));
 		}
 
+		const EVENT_TEXT = {
+			"run/started": "任务已启动",
+			"round/started": "开始新一轮",
+			"decision/proposed": "决策模块已给出推荐",
+			"analysis/executed": "Python 分析完成",
+			"retrieval/started": "正在检索文献",
+			"retrieval/searched": "文献搜索完成",
+			"retrieval/fetched": "网页读取完成",
+			"retrieval/aborted": "文献检索中断",
+			"selection/submitted": "已提交候选，等待读数",
+			"oracle/results": "oracle 已返回读数",
+			"decision/observed": "决策模块已收到读数",
+			"decision/observe-failed": "决策模块接收失败",
+			"hypothesis/updated": "假设已更新",
+			"note/written": "笔记已写入",
+			"run/finished": "任务已完成",
+			"run/paused": "任务已暂停",
+		};
+
+		function activitySection(view) {
+			const execution = view.execution ?? { round: view.round, rounds: view.task.budget.rounds, label: "等待执行事件", detail: "", steps: [] };
+			const total = execution.rounds ?? view.task.budget.rounds;
+			const round = Math.min(execution.round ?? view.round, total);
+			const progress = total ? Math.min(100, Math.round((view.status === "finished" ? total : Math.max(0, round - 1)) / total * 100)) : 0;
+			return section("当前执行",
+				h("div", { className: "pp-live-head" },
+					h("strong", null, execution.label),
+					h("span", { className: "pp-sub" }, `第 ${round}/${total} 轮`)),
+				h("div", { className: "pp-live-track" }, h("span", { style: { width: `${progress}%` } })),
+				h("p", { className: "pp-legend" }, execution.detail || "等待执行事件"),
+				h("ol", { className: "pp-live-timeline" }, ...(execution.steps ?? []).map((e, i) => h("li", { className: i === 0 ? "pp-live-current" : undefined },
+					h("span", { className: "pp-time" }, (e.ts ?? "").slice(11, 19)),
+					h("span", null, e.label, e.detail ? ` · ${e.detail}` : "")))),
+			);
+		}
+
 		function roundsSection(view) {
 			const rows = view.rounds.map((r) => [
 				String(r.round),
@@ -190,7 +226,7 @@ window.__ModuleLoader__.load({
 
 		function eventsSection(view) {
 			const events = view.events.slice(-15).reverse();
-			return section("最近事件",
+			return section("事件时间线",
 				h("ul", { className: "pp-events" }, ...events.map((e) => h("li", null,
 					h("span", { className: "pp-time" }, (e.ts ?? "").slice(11, 19)),
 					h("span", { className: `pp-source pp-source-${e.source}` }, e.source),
@@ -280,6 +316,7 @@ window.__ModuleLoader__.load({
 			}
 			return h("div", { className: "pp-panel" }, banner,
 				header(view, busy, onControl),
+				activitySection(view),
 				roundsSection(view),
 				observationsSection(view),
 				hypothesesSection(view),
@@ -424,7 +461,7 @@ window.__ModuleLoader__.load({
 					h("span", { className: "pp-kind pp-kind-retrieval" }, "检索"),
 					h("div", null,
 						h("b", null, item.id), " ", what,
-						item.is_error ? h("span", { className: "pp-sub pp-fail" }, " · 出错") : null,
+						item.status === "started" ? h("span", { className: "pp-sub" }, " · 进行中") : item.status === "aborted" ? h("span", { className: "pp-sub pp-fail" }, " · 中断") : item.is_error ? h("span", { className: "pp-sub pp-fail" }, " · 出错") : null,
 						item.results?.length ? h("details", null,
 							h("summary", { className: "pp-sub" }, "结果"),
 							h("ul", { className: "pp-list" }, ...item.results.map((x) => h("li", null, x.title || x.url, " ", h("span", { className: "pp-sub" }, x.url))))) : null));
@@ -941,6 +978,7 @@ window.__ModuleLoader__.load({
 .pp-list{margin:0;padding-left:16px}.pp-list li{margin:2px 0}.pp-list b{margin-right:6px}
 .pp-hyp{font-size:11px;margin-right:6px;padding:0 5px;border-radius:6px;border:1px solid rgba(127,127,127,.4)}
 .pp-cites{opacity:.6;margin-left:6px;font-size:12px}
+.pp-live-head{display:flex;justify-content:space-between;gap:8px;align-items:baseline}.pp-live-track{height:6px;border-radius:4px;background:var(--pp-soft);overflow:hidden;margin:8px 0}.pp-live-track span{display:block;height:100%;border-radius:4px;background:var(--pp-accent);transition:width .25s ease}.pp-live-timeline{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}.pp-live-timeline li{display:flex;gap:8px;align-items:baseline;font-size:12px;opacity:.7}.pp-live-timeline .pp-live-current{opacity:1;font-weight:600}.pp-live-timeline .pp-live-current::before{content:"→";color:var(--pp-accent)}
 .pp-events{list-style:none;margin:0;padding:0;font-size:12px}.pp-events li{display:flex;gap:8px}
 .pp-time{opacity:.55;font-variant-numeric:tabular-nums}.pp-source{opacity:.75;min-width:72px}
 .pp-error{color:#c53030;margin-bottom:8px}

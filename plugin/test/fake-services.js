@@ -10,6 +10,8 @@ import { join } from 'node:path'
  * @param options.empty - 这些候选的读数为空（readout: null）
  * @param options.required - 决策模块默认方法声明的必需输入 [{role, modality}]
  * @param options.otherTask - 再列一个任务（同一个任务包，换了 task_id 和标题），用来测选任务
+ * @param options.runResponseLossOnce - oracle 完成一次请求后模拟响应丢失；同一 request_id 重试返回原响应
+ * @param options.observeResponseLossOnce - 决策模块完成一次请求后模拟响应丢失；同一 request_id 重试返回原回执
  */
 export function fakeServices({
   n = 20,
@@ -17,10 +19,13 @@ export function fakeServices({
   rounds = 3,
   allowRepeats = true,
   dropFromReceipt = null,
+  observeError = null,
   empty = [],
   direction = 'high',
   required = [],
   otherTask = false,
+  runResponseLossOnce = false,
+  observeResponseLossOnce = false,
 } = {}) {
   const ids = Array.from({ length: n }, (_, i) => `G${String(i).padStart(3, '0')}`)
   const truth = Object.fromEntries(ids.map((id, i) => [id, Math.sin(i)]))
@@ -54,6 +59,10 @@ export function fakeServices({
   let replicates = {}
   let obs = []
   let version = 0
+  let loseRunResponse = runResponseLossOnce
+  let loseObserveResponse = observeResponseLossOnce
+  const runResponses = new Map()
+  const observeResponses = new Map()
   const calls = []
   const log = (name, body) => calls.push({ name, body })
   return {
@@ -115,23 +124,32 @@ export function fakeServices({
     },
     async run(body) {
       log('run', body)
+      if (body.request_id && runResponses.has(body.request_id)) return runResponses.get(body.request_id)
       const results = body.batch.map((id) => {
         const rep = replicates[id] ?? 0
         replicates[id] = rep + 1
         const v = truth[id] + rep * 0.01
         return { id, replicate: rep, readout: empty.includes(id) ? null : { score: v, absolute_effect: Math.abs(v) } }
       })
-      return { oracle_version: 'fake-oracle/0', round: body.round, results }
+      const response = { oracle_version: 'fake-oracle/0', round: body.round, results }
+      if (body.request_id) runResponses.set(body.request_id, response)
+      if (loseRunResponse) {
+        loseRunResponse = false
+        throw new Error('simulated lost oracle response')
+      }
+      return response
     },
     async observe(body) {
       log('observe', body)
+      if (body.request_id && observeResponses.has(body.request_id)) return observeResponses.get(body.request_id)
+      if (observeError) throw new Error(observeError)
       const usable = body.observations.filter((o) => typeof o.readout?.score === 'number')
       const accepted = usable.filter((o) => o.id !== dropFromReceipt)
       const rejected = body.observations.filter((o) => !usable.includes(o)).map((o) => ({ id: o.id, reason: 'empty_readout' }))
       const before = version
       obs.push(...accepted)
       if (accepted.length) version += 1
-      return {
+      const response = {
         decision_version: 'fake/0',
         round: body.round,
         accepted: accepted.map((o) => o.id),
@@ -140,6 +158,12 @@ export function fakeServices({
         state_version_after: version,
         n_observations: obs.length,
       }
+      if (body.request_id) observeResponses.set(body.request_id, response)
+      if (loseObserveResponse) {
+        loseObserveResponse = false
+        throw new Error('simulated lost decision response')
+      }
+      return response
     },
     async snapshot() {
       log('snapshot')

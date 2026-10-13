@@ -46,7 +46,7 @@ export function auditRun(state, retrievalText) {
  * 本轮既没有 literature 理由也没有成功的检索时不适用。
  */
 function literatureCheck(state, r, sub, retrievalText) {
-  const found = (state.retrievals ?? []).filter((x) => x.round === r && x.at <= sub.at && !x.is_error).map((x) => x.id)
+  const found = (state.retrievals ?? []).filter((x) => x.round === r && x.at <= sub.at && (x.status ? x.status === 'completed' && !x.is_error : !x.is_error)).map((x) => x.id)
   const literature = sub.groups.filter((g) => g.source === 'literature')
   if (literature.length === 0 && found.length === 0) return { result: 'n/a' }
   const texts = found.map((id) => retrievalText(id) ?? '')

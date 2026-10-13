@@ -181,21 +181,41 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   assert.equal(agent.followups.length, 1)
   assert.equal((await panelPost(`${panelBase}/start`, {})).status, 400)
   assert.deepEqual(agent.followups[0].source, { kind: 'perturbpilot', round: 1 })
-  host.handlers['session/event'](agent.session, { type: 'user/message', data: agent.followups[0] })
-
-  // 快结束还没交 → 催一次
+  // 即使 DSH 没有回放内部的 perturbpilot user/message 事件，框架也要记住
+  // 自己驱动的轮次并在工具错误后的 idle 路径催交。
+  host.handlers['agent/status']({ agent, status: 'idle' })
+  await tick()
+  assert.equal(agent.steers.length, 0)
+  assert.equal(agent.followups.length, 2)
+  assert.equal(agent.followups[1].source.round, 1)
+  host.handlers['session/event'](agent.session, { type: 'user/message', data: agent.followups[1] })
   await host.handlers['agent/turn-stopping']({ agent, turn: 2 })
   assert.equal(agent.steers.length, 1)
 
   // 模型调用抓取：归属到最近一次 agent/request
-  await host.handlers['agent/request']({ agent, turn: 2, step: 3 }, async () => ({}))
-  await fetch(`${base}/llm/chat`, { method: 'POST', headers: { authorization: 'Bearer sk-x' }, body: '{"q":1}' })
+  await host.handlers['agent/request']({ agent, turn: 2, step: 3 }, async () => {
+    await fetch(`${base}/llm/chat`, { method: 'POST', headers: { authorization: 'Bearer sk-x' }, body: '{"q":1}' })
+  })
   await tick()
   const llm = readJsonl(join(runDir, 'llm_calls.jsonl'))
   assert.equal(llm.length, 1)
   assert.equal(llm[0].turn, 2)
   assert.equal(llm[0].step, 3)
+  assert.equal(llm[0].correlation, 'request-context')
   assert.ok(!JSON.stringify(llm).includes('sk-x'))
+
+  // 两个并发 agent/request 上下文不能互相覆盖模型调用归属。
+  const firstRequest = host.handlers['agent/request']({ agent, turn: 10, step: 1 }, async () => {
+    await tick()
+    await fetch(`${base}/llm/chat`, { method: 'POST', body: '{}'})
+  })
+  const secondRequest = host.handlers['agent/request']({ agent, turn: 11, step: 2 }, async () => {
+    await fetch(`${base}/llm/chat`, { method: 'POST', body: '{}'})
+  })
+  await Promise.all([firstRequest, secondRequest])
+  await tick()
+  const concurrentLlm = readJsonl(join(runDir, 'llm_calls.jsonl'))
+  assert.deepEqual(concurrentLlm.slice(-2).map((x) => [x.turn, x.step, x.correlation]), [[11, 2, 'request-context'], [10, 1, 'request-context']])
 
   // 检索：web_search 的调用和结果经 session/event 到达，只记录；别的工具不记
   host.handlers['session/event'](agent.session, { type: 'tool/call', data: { turn: 2, step: 3, callId: 'w1', name: 'web_search', arguments: '{"queries": ["G009 通路"]}' } })
@@ -205,10 +225,22 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
     type: 'tool/result',
     data: { message: { toolCallId: 'w1', isError: false, content: [{ type: 'text', text: '搜到一篇，讲 G003' }] }, meta: { sources: [{ url: 'https://example.org/a', title: 'A' }] } },
   })
-  assert.deepEqual(readJsonl(join(runDir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => [e.type, e.data.id]), [['retrieval/searched', 'R1']])
+  assert.deepEqual(readJsonl(join(runDir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => [e.type, e.data.id]), [['retrieval/started', 'R1'], ['retrieval/searched', 'R1']])
   const saved = JSON.parse(readFileSync(join(runDir, 'retrieval', 'R1.json'), 'utf8'))
   assert.equal(saved.text, '搜到一篇，讲 G003')
   assert.deepEqual(saved.arguments, { queries: ['G009 通路'] }) // DSH 给的是 JSON 字符串，记录时解析
+
+  host.handlers['session/event'](agent.session, { type: 'tool/call', data: { turn: 2, step: 4, callId: 'w2', name: 'web_fetch', arguments: '{\"url\":\"https://example.org/paper.pdf\"}' } })
+  host.handlers['agent/error']({ agent, turn: 2, step: 4, error: new Error('session ended') })
+  const aborted = JSON.parse(readFileSync(join(runDir, 'retrieval', 'R2.json'), 'utf8'))
+  assert.equal(aborted.status, 'aborted')
+  assert.equal(aborted.error.name, 'AbortError')
+  assert.deepEqual(readJsonl(join(runDir, 'events.jsonl')).filter((e) => e.type.startsWith('retrieval/')).map((e) => [e.type, e.data.id]), [
+    ['retrieval/started', 'R1'],
+    ['retrieval/searched', 'R1'],
+    ['retrieval/started', 'R2'],
+    ['retrieval/aborted', 'R2'],
+  ])
 
   const decision = await host.tools.pp_get_decision.execute({}, exec(agent))
   assert.equal(decision.method, 'coverage')
@@ -233,8 +265,8 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   assert.equal(agent.steers.length, 1)
   host.handlers['agent/status']({ agent, status: 'idle' })
   await tick()
-  assert.equal(agent.followups.length, 2)
-  assert.equal(agent.followups[1].source.round, 2)
+  assert.equal(agent.followups.length, 3)
+  assert.equal(agent.followups[2].source.round, 2)
 
   // 用户插话：记为 human 事件；用户排了消息时框架不抢
   host.handlers['session/event'](agent.session, {
@@ -244,7 +276,7 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   await host.tools.pp_control.execute({ action: 'pause' }, exec(agent))
   host.handlers['agent/status']({ agent, status: 'idle' })
   await tick()
-  assert.equal(agent.followups.length, 2)
+  assert.equal(agent.followups.length, 3)
 
   // 面板路由：读到暂停状态；从面板点"继续"，空闲的会话马上开下一轮
   {
@@ -263,8 +295,8 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
     const resumed = await panelPost(`${panelBase}/control`, { action: 'resume' })
     assert.equal((await resumed.json()).run.status, 'active')
     await tick()
-    assert.equal(agent.followups.length, 3)
-    assert.equal(agent.followups[2].source.round, 2)
+    assert.equal(agent.followups.length, 4)
+    assert.equal(agent.followups[3].source.round, 2)
   }
 
   // 每个服务请求（包括设置页的探测）都带了令牌

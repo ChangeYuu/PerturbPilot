@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from .idempotency import IdempotencyStore
 from .jsonhttp import HttpError
 from .task import Package, TaskError, read_csv, stable_int
 
@@ -55,6 +56,7 @@ class Oracle:
         }
         self.replicates: dict[str, int] = {}
         self.log: list[dict[str, Any]] = []
+        self.idempotency = IdempotencyStore(hidden / '.perturbpilot-idempotency.json')
 
     def measure(self, cid: str, replicate: int) -> dict[str, float | None] | None:
         row = self.table.get(cid)
@@ -78,18 +80,29 @@ class Oracle:
         for cid in batch:
             if cid not in self.known:
                 raise HttpError(400, f"unknown candidate id {cid!r}")
+        payload = {k: v for k, v in body.items() if k != "request_id"}
+        cached = self.idempotency.lookup("run", body.get("request_id"), payload)
+        if cached is not None:
+            after = cached.get("state", {}).get("replicates_after", {})
+            for cid, rep in after.items():
+                self.replicates[cid] = max(self.replicates.get(cid, 0), int(rep))
+            return cached["response"]
         if not self.allow_repeats:
             again = [c for c in batch if self.replicates.get(c)] or [c for i, c in enumerate(batch) if c in batch[:i]]
             if again:
                 raise HttpError(400, f"repeats are not allowed in this task: {again[0]!r}")
+        next_replicates = dict(self.replicates)
         results = []
         for cid in batch:
-            rep = self.replicates.get(cid, 0)
-            self.replicates[cid] = rep + 1
+            rep = next_replicates.get(cid, 0)
+            next_replicates[cid] = rep + 1
             results.append({"id": cid, "replicate": rep, "readout": self.measure(cid, rep)})
         entry = {"round": round_, "results": results}
+        response = {"oracle_version": ORACLE_VERSION, **entry}
+        self.idempotency.save("run", body.get("request_id"), payload, response, {"replicates_after": next_replicates})
+        self.replicates = next_replicates
         self.log.append(entry)
-        return {"oracle_version": ORACLE_VERSION, **entry}
+        return response
 
     def reset(self, body: dict[str, Any]) -> dict[str, Any]:
         """恢复到给定的已测次数（用于分叉重放）；不传则清零。batch_size 改本次任务的批量上限，不传用任务卡片的。"""

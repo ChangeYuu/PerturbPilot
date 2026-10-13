@@ -11,6 +11,16 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'perturbpilot']
+const PROFILE_RUNTIME_PACKAGES = [
+  'dsh-web-access',
+  '@deepseek-ai/dsh-agent-preset',
+  '@deepseek-ai/dsh-persona',
+  '@deepseek-ai/dsh-tool-ask-user',
+  '@deepseek-ai/dsh-tool-web',
+  '@deepseek-ai/dsh-compaction-basic',
+  '@deepseek-ai/dsh-command-compact',
+  '@deepseek-ai/dsh-compaction-tool-result-pruner',
+]
 
 const pluginDir = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const profile = process.argv[2] ?? 'perturbpilot'
@@ -40,7 +50,17 @@ if (!linked) {
 }
 
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-manifest.dependencies = { ...manifest.dependencies, perturbpilot: `link:${pluginDir.split('\\').join('/')}` }
+const runtimeDependencies = {}
+for (const name of PROFILE_RUNTIME_PACKAGES) {
+  const packageJson = join(pluginDir, 'node_modules', ...name.split('/'), 'package.json')
+  if (!existsSync(packageJson)) throw new Error(`插件依赖未安装：${name}；先在 plugin 目录执行 npm install`)
+  runtimeDependencies[name] = JSON.parse(readFileSync(packageJson, 'utf8')).version
+}
+manifest.dependencies = {
+  ...manifest.dependencies,
+  ...runtimeDependencies,
+  perturbpilot: `link:${pluginDir.split('\\').join('/')}`,
+}
 manifest.dsh = { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles: BUNDLES } }
 writeFileSync(manifestPath, JSON.stringify(manifest, undefined, 2) + '\n', 'utf8')
 

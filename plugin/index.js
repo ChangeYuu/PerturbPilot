@@ -5,6 +5,7 @@
 // agent 用 DSH 自带的 web_search / web_fetch 查文献，这里只记录检索，不拦截。
 // 科学状态放在会话之外（runs/<会话 id>/），每一步通过 systemPrompt.context 注入，所以上下文压缩不会丢。
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { join, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -16,6 +17,7 @@ import { createServices } from './lib/services.js'
 import { PANEL_ROUTE, PanelError, createPanelHandler, listRuns, taskPreview } from './lib/panel.js'
 import { MAX_ROUNDS, checkSetup } from './lib/setup.js'
 import { ROLE_PROMPT, roundPrompt, steerPrompt } from './lib/prompts.js'
+import { TaskLock, TaskLockError } from './lib/task-lock.js'
 
 export const name = 'perturbpilot'
 export const inject = ['agents', 'tools']
@@ -27,7 +29,7 @@ export const Config = z.object({
   llmUrlPattern: z.string().default('deepseek').description('URL 命中这个正则的 fetch 调用记为模型调用'),
   maxSteers: z.natural().default(2).description('一轮快结束还没提交时最多催几次'),
   pythonPath: z.string().default('python').description('pp_run_python 用的 Python；带目录的相对路径按启动 dsh 时的目录解析'),
-  pythonTimeoutMs: z.natural().default(60000).description('一次 pp_run_python 最多跑多久（毫秒），超时杀掉'),
+  pythonTimeoutMs: z.natural().default(120000).description('一次 pp_run_python 最多跑多久（毫秒），超时杀掉'),
   serviceTokenEnv: z.string().default('PERTURBPILOT_SERVICE_TOKEN').description('服务令牌所在的环境变量名；设了就随每个服务请求带上'),
 })
 
@@ -42,14 +44,15 @@ export function apply(ctx, config) {
   const retrievalCalls = new Map() // callId -> 还没回来的 web_search / web_fetch 调用 {agent_id, name, arguments}
   const driven = new Map() // agent.id -> 由框架发起、正在进行的轮次号
   const proposals = new Map() // agent.id -> agent 用 pp_propose_task 提的、等用户确认的设置
-  let lastRequest = null // 最近一次 agent/request 的 {agent_id, turn, step}，用来给模型调用记录挂上归属
+  const requestContext = new AsyncLocalStorage()
 
   const capture = installFetchCapture({
     pattern: config.llmUrlPattern,
     logger: ctx.logger,
     onCall(record) {
-      const run = lastRequest && runs.get(lastRequest.agent_id)
-      if (run) run.recordLlmCall(record, { turn: lastRequest.turn, step: lastRequest.step, correlation: 'latest-request' })
+      const current = requestContext.getStore()
+      const run = current && runs.get(current.agent_id)
+      if (run) run.recordLlmCall(record, { turn: current.turn, step: current.step, correlation: 'request-context' })
     },
   })
   const serviceOptions = {
@@ -101,6 +104,14 @@ export function apply(ctx, config) {
   }
 
   const starting = new Set() // 正在开始任务的会话，防止连点开出两个
+  const taskLock = new TaskLock(runsDir)
+  let lockSessionId = null
+
+  function releaseTaskLock(run) {
+    if (!run || lockSessionId !== run.state.runId || !run.closed) return
+    taskLock.release()
+    lockSessionId = null
+  }
 
   /**
    * 面板上确认开始：按 setup（{task_id, method, rounds, batch_size}）建运行记录，然后由框架开第 1 轮（会话正忙时等它空下来再开）。
@@ -113,15 +124,30 @@ export function apply(ctx, config) {
     const dir = join(runsDir, sessionId)
     if (Run.isLegacy(dir)) throw new RunError('这个会话里有旧格式的任务记录，不能再开任务；新开一个会话。')
     if (starting.size) throw new RunError('正在开始任务')
+    for (const disk of listRuns(runsDir)) {
+      if (disk.run_id !== sessionId && (disk.status === 'active' || disk.status === 'paused')) {
+        throw new RunError(`会话 ${disk.run_id} 的任务还没结束（${disk.status === 'paused' ? '已暂停' : '进行中'}）。决策模块和 oracle 同一时间只跑一个任务，先在那个会话里结束它。`)
+      }
+    }
     for (const [id, other] of runs) {
       if (id !== sessionId && !other.closed) {
         throw new RunError(`会话 ${id} 的任务还没结束（${other.state.status === 'paused' ? '已暂停' : '进行中'}）。决策模块和 oracle 同一时间只跑一个任务，先在那个会话里结束它。`)
       }
     }
     starting.add(sessionId)
+    let acquired = false
     try {
+      try {
+        taskLock.acquire(sessionId)
+        lockSessionId = sessionId
+        acquired = true
+      } catch (error) {
+        if (error instanceof TaskLockError) throw new RunError(error.message)
+        throw error
+      }
       runs.set(sessionId, await Run.start({ dir, runId: sessionId, services, setup, proposal: proposals.get(sessionId) ?? null }))
     } finally {
+      if (!acquired) taskLock.release()
       starting.delete(sessionId)
     }
     proposals.delete(sessionId)
@@ -221,7 +247,9 @@ export function apply(ctx, config) {
       },
     },
     async execute(args, exec) {
-      const result = await requireRun(exec).submitSelection(args, services, exec.signal)
+      const run = requireRun(exec)
+      const result = await run.submitSelection(args, services, exec.signal)
+      releaseTaskLock(run)
       exec.concludeTurn()
       return result
     },
@@ -265,7 +293,7 @@ export function apply(ctx, config) {
 
   tool({
     name: 'pp_run_python',
-    description: '在本任务的运行目录里跑一段 Python 做分析（只保证 Python 标准库和 numpy；pandas、scipy、sklearn 等未提供）。当前目录下有 observations.csv（id, round, replicate 加每个读数字段，全部测量）、candidates.csv（任务包的候选表）、decision.csv（最近一次推荐里决策模块对每个候选的打分）、data/（任务包里公开的数据文件，比如候选特征）。用 print 输出结论；写出的文件会留在这次分析的目录里。这里不能测量新候选，测量只能经 pp_submit_selection。代码和输出都会记录。',
+    description: '在本任务的运行目录里跑一段 Python 做分析（使用仓库的 analysis-ready 环境，预装 numpy、pandas、scipy、scikit-learn、statsmodels；不要假设其他第三方库存在）。当前目录下有 observations.csv（id, round, replicate 加每个读数字段，全部测量）、candidates.csv（任务包的候选表）、decision.csv（最近一次推荐里决策模块对每个候选的打分）、data/（任务包里公开的数据文件，比如候选特征）。用 print 输出结论；写出的文件会留在这次分析的目录里。这里不能测量新候选，测量只能经 pp_submit_selection。代码和输出都会记录。',
     parameters: {
       code: { type: 'string', required: true, description: '完整的 Python 脚本' },
       purpose: { type: 'string', required: true, description: '一句话：这段分析要回答什么' },
@@ -282,7 +310,10 @@ export function apply(ctx, config) {
       action: { type: 'string', required: true, enum: [...CONTROL_ACTIONS] },
     },
     async execute(args, exec) {
-      return requireRun(exec).control(args.action, 'human')
+      const run = requireRun(exec)
+      const result = run.control(args.action, 'human')
+      releaseTaskLock(run)
+      return result
     },
   })
 
@@ -296,6 +327,11 @@ export function apply(ctx, config) {
     if (round === null) return
     try {
       ctx.agents.withoutInitiator(async () => {
+        // Keep the driver marker before DSH emits any lifecycle event. Some
+        // tool-error paths close a turn without replaying the internal
+        // perturbpilot user/message event; status handling must still get a
+        // bounded chance to steer the open round before stalling it.
+        driven.set(agent.id, round)
         run.markDriven(round)
         agent.followup(createUserMessage({
           content: [{ type: 'text', text: roundPrompt(run.state, round) }],
@@ -316,9 +352,12 @@ export function apply(ctx, config) {
     const handler = createPanelHandler({
       getRun: runById,
       control(sessionId, action) {
-        runById(sessionId).control(action, 'human')
+        const run = runById(sessionId)
+        const result = run.control(action, 'human')
+        releaseTaskLock(run)
         const agent = ctx.agents.get(sessionId)
         if (action === 'resume' && agent) drive(agent)
+        return result
       },
       start: startTask,
       proposal: (sessionId) => proposals.get(sessionId) ?? null,
@@ -351,8 +390,8 @@ export function apply(ctx, config) {
 
   ctx.effect(function* () {
     ctx.on('agent/request', async ({ agent, turn, step }, next) => {
-      if (runs.has(agent.id)) lastRequest = { agent_id: agent.id, turn, step }
-      return next()
+      const context = { agent_id: agent.id, turn, step }
+      return requestContext.run(context, () => next())
     })
 
     ctx.on('session/event', (session, event) => {
@@ -382,8 +421,16 @@ export function apply(ctx, config) {
     function trackRetrieval(sessionId, event) {
       const data = event.data ?? {}
       if (event.type === 'tool/call') {
-        if (RETRIEVAL_TOOLS.includes(data.name) && runById(sessionId)) {
-          retrievalCalls.set(data.callId, { agent_id: sessionId, name: data.name, arguments: data.arguments })
+        if (RETRIEVAL_TOOLS.includes(data.name)) {
+          const run = runById(sessionId)
+          if (run) {
+            try {
+              const started = run.recordRetrievalStart({ name: data.name, arguments: data.arguments })
+              retrievalCalls.set(data.callId, { agent_id: sessionId, name: data.name, arguments: data.arguments, retrieval_id: started.id })
+            } catch (error) {
+              warn('could not record retrieval start', error)
+            }
+          }
         }
         return
       }
@@ -392,11 +439,31 @@ export function apply(ctx, config) {
       if (!call) return
       retrievalCalls.delete(id)
       try {
-        runById(call.agent_id)?.recordRetrieval(call, data)
+        runById(call.agent_id)?.recordRetrieval(call, data, call.retrieval_id)
       } catch (error) {
         warn('could not record retrieval', error)
       }
     }
+
+    function abortRetrievals(agentId, reason) {
+      for (const [callId, call] of retrievalCalls) {
+        if (call.agent_id !== agentId) continue
+        retrievalCalls.delete(callId)
+        try {
+          runById(agentId)?.abortRetrieval(call.retrieval_id, reason)
+        } catch (error) {
+          warn('could not record retrieval abort', error)
+        }
+      }
+    }
+
+    ctx.on('agent/error', ({ agent, error }) => {
+      abortRetrievals(agent.id, `agent error: ${error?.message ?? String(error)}`)
+    })
+
+    ctx.on('agent/disposed', ({ agent }) => {
+      abortRetrievals(agent.id, 'agent disposed before the retrieval result arrived')
+    })
 
     ctx.on('agent/turn-stopping', ({ agent }) => {
       const run = runFor(agent)
@@ -453,7 +520,11 @@ export function apply(ctx, config) {
       driven.delete(agent.id)
     })
 
-    yield () => capture.uninstall()
+    yield () => {
+      capture.uninstall()
+      taskLock.release()
+      lockSessionId = null
+    }
   }, 'perturbpilot lifecycle')
 }
 

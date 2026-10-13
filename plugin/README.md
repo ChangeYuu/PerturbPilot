@@ -13,22 +13,22 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 - 浏览器面板：DSH web 端右侧栏里的 “PerturbPilot 任务” 页（点右侧栏的 “+” 打开），每 2 秒刷新本会话的任务状态、各轮推荐 / 选择 / 读数 / 审计、读数排名、假设、笔记、检索和最近事件，并有暂停 / 继续 / 结束按钮。会话还没有任务时，这一页是开始任务的表单：选任务包（下面显示它的扰动、目标、原定预算和候选数）、决策方法、轮数和每轮个数；agent 提议过的话，表单按提议填好，上面显示提议的理由，按钮是“确认开始”。对话照常在 DSH 的对话区进行。
 - 科学台账页：左侧栏的 “科学台账” 入口打开一个占满主区的页面。左边列出 `runs/` 下所有任务（最近更新的在前，默认选第一个；早期格式的记录标“旧格式”，只列出、点不开），右边是选中任务的记录，从上往下：总览（目标、当前最佳、已测多少、推荐以外的有多少、审计，加一张每轮读数和至今最佳的进展图）；当前结论（每条假设的最新状态，可展开看历次更新）；逐轮记录（每轮一张卡片，按“决策模块推荐 → 分析与判断（含检索） → 本轮测的和分组理由 → 读数 → 审计和回执”排）；最后折叠着全部读数排名和最近事件。也有暂停 / 继续 / 结束按钮。
 - 设置里的 “PerturbPilot” 一页：oracle 和决策模块连不连得上、服务令牌设了没有、插件当前的配置。这一页只读。
-- 数据分析：agent 可以调 `pp_run_python(code, purpose)`，在这次分析自己的目录里跑一段 Python（numpy 可用）。目录里事先导出了 `observations.csv`（id, round, replicate, 再加每个读数字段一列，空读数留空）、`candidates.csv`（任务包的候选表原样）、`data/`（任务包里公开的数据文件）和 `decision.csv`（本轮决策模块给的全候选池：id, measured, 再加方法给的数值列）。这个工具不能测量新候选：两个服务都要求 `x-perturbpilot-token` 头，令牌只有框架有，Python 子进程拿到的环境变量是白名单里的那几项，不含令牌和模型密钥。
+- 数据分析：agent 可以调 `pp_run_python(code, purpose)`，在这次分析自己的目录里跑一段 Python（numpy 可用）。目录里事先导出了 `observations.csv`（id, round, replicate, 再加每个读数字段一列，空读数留空）、`candidates.csv`（任务包的候选表原样）、`data/`（任务包里公开的数据文件）和 `decision.csv`（本轮决策模块给的全候选池：id, measured, 再加方法给的数值列）。analysis-ready 环境预装 `numpy`、`pandas`、`scipy`、`scikit-learn`、`statsmodels`；候选 id 应当按字符串处理，复杂分析应避免对全候选库做 O(n²) 两两扫描。这个工具不能测量新候选：两个服务都要求 `x-perturbpilot-token` 头，令牌只有框架有，Python 子进程拿到的环境变量是白名单里的那几项，不含令牌和模型密钥。
   - **Windows 上没有沙箱。** 子进程能读写本机文件，包括 oracle 的源码；令牌只防它直接调服务测量。所有代码和输出都记录下来，可以事后查。
 - 对话区里每个 `pp_*` 工具调用显示成卡片：任务列表、提议的任务设置和理由、推荐表（按方法给的数值列显示）、本轮提交的批次和分组理由、读数表、假设和笔记，不再是原始 JSON。
 - 新会话页中间的 logo 下面有一段指引，告诉用户可以用自然语言描述想发现什么。
-- 专用模式：插件的 bundle patch（`cordis.patch.yml`）只留一个“科学发现”模式。这个模式只有 `pp_*` 工具、`ask_user_question`、`web_search` / `web_fetch` 和上下文压缩，没有 shell、文件读写、子 agent、计划模式、技能，也不读工作区里的 AGENTS.md / CLAUDE.md。web 端自带的 4 个模式、模式选择器、计划模式开关、预设设置页和插件设置页都关掉了。
+- 专用模式：插件的 bundle patch（`cordis.patch.yml`）只留一个“科学发现”模式。这个模式只有 `pp_*` 工具、`ask_user_question`、`web_search` / `web_fetch`（web_fetch 由 profile 的 `web-access` provider 承接）和上下文压缩，没有 shell、文件读写、子 agent、计划模式、技能，也不读工作区里的 AGENTS.md / CLAUDE.md。web 端自带的 4 个模式、模式选择器、计划模式开关、预设设置页和插件设置页都关掉了。
 
 ## 运行记录 `runs/<会话 id>/`
 
 | 文件 | 内容 |
 |---|---|
 | `events.jsonl` | 事件流：`seq, ts, run_id, round, type, source, data`。source 取值为 framework / model / environment / human / decision |
-| `llm_calls.jsonl` | 发往模型服务的原始请求体和响应体，挂在最近一次 `agent/request` 的 turn/step 上。**不存请求头和响应头**，URL 去掉 query |
+| `llm_calls.jsonl` | 发往模型服务的原始请求体和响应体，按 `agent/request` 的异步上下文挂到对应 turn/step。**不存请求头和响应头**，URL 去掉 query |
 | `decision/NN-propose-K.json`、`NN-observe.json`、`NN-snapshot.json` | 决策模块的原始往返：推荐（含全候选池）、回执、可恢复快照 |
 | `oracle/NN-run.json` | oracle 的原始读数 |
 | `state.json` / `memory.json` | 完整运行状态（`format: 2`；没有这个字段的是早期格式，面板标“旧格式”，插件不再打开）/ 假设和笔记 |
-| `retrieval/R<N>.json` | 第 N 次 `web_search` / `web_fetch`：参数、结果全文、所在轮。每次对应一条 `retrieval/searched` 或 `retrieval/fetched` 事件 |
+| `retrieval/R<N>.json` | 第 N 次 `web_search` / `web_fetch`：参数、所在轮和生命周期状态。调用开始写 `retrieval/started`；正常返回写 `retrieval/searched` / `retrieval/fetched`；工具结果或 agent 终止导致中断时写 `retrieval/aborted`。正常结果包含全文，未完成调用也保留状态 |
 | `analysis/A<N>/` | 第 N 次 `pp_run_python`：`code.py`、导出的 `observations.csv`、`candidates.csv`、`data/`、`decision.csv`、`stdout.txt`、`stderr.txt`，以及脚本自己写出的文件。每次对应一条 `analysis/executed` 事件（`id, purpose, exit_code, timed_out, duration_ms, dir, files`） |
 | `audit.json` | 配对审计，每轮检查：调用了决策模块 → 提交了选择 → 文献核对（literature 组里的候选 id 按整词、不分大小写，在本轮提交前成功的检索结果全文里找；没找到的列在 `unbacked`，有一个就不通过；本批里没标 literature、但检索里提到了的列在 `unlabelled`，只作参考；本轮既没有 literature 组也没有成功的检索时为 n/a）→ 回执完整（收下的加拒收的对得上本轮读数）且版本号 +1 → 下一轮用的状态版本对得上。另外还查后面是否有假设或笔记引用了本轮的读数 |
 
@@ -39,6 +39,7 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 - **Node ≥ 22.19**。DSH 0.1.7-rc.1 的入口用了 `import.meta.main`，Node 22.14 上 `dsh` 什么都不做就退出。本机 `C:\Program Files\nodejs` 是 22.14；`D:\DeepSeek\npm-global\node.exe` 是 22.23.2，下面的命令都用它。
 - 用插件目录里装的 DSH 0.1.7-rc.1（`plugin\node_modules\@deepseek-ai\dsh`），不要用全局的 `dsh`（全局那个是 0.1.0-rc.6）。
 - 不需要 pnpm：第 3 步用 `scripts/link-profile.js` 代替 `dsh plugin add`（后者会转发给 pnpm）。
+- PerturbPilot profile 默认把 DSH 工作步骤设为 `verbose`，对话区会展开 turn process；右侧 PerturbPilot 面板的“当前执行”区域还会显示轮次进度、最近阶段和最近事件时间线。
 
 在 PowerShell 里依次执行：
 
@@ -59,6 +60,7 @@ cd D:\internwork\科学发现智能体系统\services
 # 2. 密钥只放进环境变量，不写进任何文件；DSH_HOME 用单独的目录，不和日常用的 DSH 共用会话、工作区和设置
 $env:DEEPSEEK_API_KEY = (Get-Content <密钥文件> -Raw).Trim()
 $env:DSH_HOME = 'D:\DeepSeek\pp-home'
+Copy-Item D:\internwork\科学发现智能体系统\plugin\web-access.profile.json $env:DSH_HOME\web-access.json -Force
 
 # 3. 第一次用时：建空 profile，再把插件挂进去（不经过 pnpm）
 $node = 'D:\DeepSeek\npm-global\node.exe'
@@ -86,7 +88,7 @@ cd D:\internwork\科学发现智能体系统
   candidates.csv   id + 公开属性列
   data/            data_cards 里列出的公开数据文件；candidate_features 可以是 id + 数值列的 CSV，也可以是含 X 的 numpy .npz（可选 id；没有 id 时按 candidates.csv 顺序对齐）
 
-<隐藏数据目录>/     服务启动时用 --hidden 指定；用 --tasks 时是 --hidden-root 下和任务包同名的子目录
+<隐藏数据目录>/     服务启动时用 --hidden 指定；用 --tasks 时是 --hidden-root 下和任务包同名的子目录；oracle `/run` 和决策模块 `/observe` 都要求稳定的 `request_id`，重复相同请求返回原响应，复用同一 ID 但请求体不同返回 409
   scores.csv       id + 各读数字段
   hits.txt         命中名单，可选；运行时不读，事后评估用
 ```
@@ -118,7 +120,7 @@ cd D:\internwork\科学发现智能体系统\services
 | `llmUrlPattern` | `deepseek` | URL 命中这个正则的 fetch 调用记为模型调用 |
 | `maxSteers` | `2` | 一轮里最多催几次 |
 | `pythonPath` | `python` | `pp_run_python` 用的 Python。只写名字就从 PATH 找；带目录的相对路径按启动 dsh 的目录解析。建议设成 `.venv\Scripts\python.exe`（有 numpy） |
-| `pythonTimeoutMs` | `60000` | 一次分析最长跑多久，超时杀掉 |
+| `pythonTimeoutMs` | `120000` | 一次分析最长跑多久，超时杀掉；复杂分析可在 profile 中调高 |
 | `serviceTokenEnv` | `PERTURBPILOT_SERVICE_TOKEN` | 服务令牌所在的环境变量名。没设这个变量时服务不查令牌（ppsvc 启动时会警告），分析用的 Python 就能直接调服务 |
 
 ## 测试
