@@ -16,6 +16,7 @@ import { createServices } from './lib/services.js'
 import { PANEL_ROUTE, PanelError, createPanelHandler, listRuns, taskPreview } from './lib/panel.js'
 import { MAX_ROUNDS, checkSetup } from './lib/setup.js'
 import { ROLE_PROMPT, roundPrompt, steerPrompt } from './lib/prompts.js'
+import { TaskLock, TaskLockError } from './lib/task-lock.js'
 
 export const name = 'perturbpilot'
 export const inject = ['agents', 'tools']
@@ -101,6 +102,14 @@ export function apply(ctx, config) {
   }
 
   const starting = new Set() // 正在开始任务的会话，防止连点开出两个
+  const taskLock = new TaskLock(runsDir)
+  let lockSessionId = null
+
+  function releaseTaskLock(run) {
+    if (!run || lockSessionId !== run.state.runId || !run.closed) return
+    taskLock.release()
+    lockSessionId = null
+  }
 
   /**
    * 面板上确认开始：按 setup（{task_id, method, rounds, batch_size}）建运行记录，然后由框架开第 1 轮（会话正忙时等它空下来再开）。
@@ -124,9 +133,19 @@ export function apply(ctx, config) {
       }
     }
     starting.add(sessionId)
+    let acquired = false
     try {
+      try {
+        taskLock.acquire(sessionId)
+        lockSessionId = sessionId
+        acquired = true
+      } catch (error) {
+        if (error instanceof TaskLockError) throw new RunError(error.message)
+        throw error
+      }
       runs.set(sessionId, await Run.start({ dir, runId: sessionId, services, setup, proposal: proposals.get(sessionId) ?? null }))
     } finally {
+      if (!acquired) taskLock.release()
       starting.delete(sessionId)
     }
     proposals.delete(sessionId)
@@ -226,7 +245,9 @@ export function apply(ctx, config) {
       },
     },
     async execute(args, exec) {
-      const result = await requireRun(exec).submitSelection(args, services, exec.signal)
+      const run = requireRun(exec)
+      const result = await run.submitSelection(args, services, exec.signal)
+      releaseTaskLock(run)
       exec.concludeTurn()
       return result
     },
@@ -287,7 +308,10 @@ export function apply(ctx, config) {
       action: { type: 'string', required: true, enum: [...CONTROL_ACTIONS] },
     },
     async execute(args, exec) {
-      return requireRun(exec).control(args.action, 'human')
+      const run = requireRun(exec)
+      const result = run.control(args.action, 'human')
+      releaseTaskLock(run)
+      return result
     },
   })
 
@@ -326,9 +350,12 @@ export function apply(ctx, config) {
     const handler = createPanelHandler({
       getRun: runById,
       control(sessionId, action) {
-        runById(sessionId).control(action, 'human')
+        const run = runById(sessionId)
+        const result = run.control(action, 'human')
+        releaseTaskLock(run)
         const agent = ctx.agents.get(sessionId)
         if (action === 'resume' && agent) drive(agent)
+        return result
       },
       start: startTask,
       proposal: (sessionId) => proposals.get(sessionId) ?? null,
@@ -463,7 +490,11 @@ export function apply(ctx, config) {
       driven.delete(agent.id)
     })
 
-    yield () => capture.uninstall()
+    yield () => {
+      capture.uninstall()
+      taskLock.release()
+      lockSessionId = null
+    }
   }, 'perturbpilot lifecycle')
 }
 
