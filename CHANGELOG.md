@@ -36,7 +36,7 @@ PerturbPilot v0.1 完成一次 18 个真实任务包的正式闭环运行，并�
 
 - DSH 官方 `web-fetch-http` 本身仍然只支持文本类响应；PerturbPilot 通过独立 web provider 增强 PDF 和页面提取。不同网站的登录墙、反爬、robots 或动态渲染仍可能失败。
 - oracle HTTP 提交尚未引入跨进程请求幂等键；如果进程在 oracle 已完成但响应丢失的窗口崩溃，仍需要后续补充“结果未知”状态。
-- 模型调用记录仍以当前 agent/request 生命周期关联；多会话并发模型请求的精确归属需要后续改成请求级关联。
+- 模型调用记录已按 agent/request 异步上下文关联；仍需在真实多进程环境继续观察 DSH provider 是否把同一请求拆成多个异步阶段。
 - 文献审计保持候选 ID 的严格原样匹配；别名、蛋白名和基因名映射不会自动放宽证据标准。
 
 ## v0.1.1 计划
@@ -54,3 +54,4 @@ PerturbPilot v0.1 完成一次 18 个真实任务包的正式闭环运行，并�
 - 调整 agent 指引：提交前自检候选、减少依赖工具报错纠错；明确 H 编号、空 cites、Python 字符串 ID、避免全候选 O(n²) 扫描和必须填写 purpose。
 - `pp_run_python` 默认超时从 60 秒提高到 120 秒，profile 明确使用仓库 `.venv\Scripts\python.exe`。
 - 文献审计仍有 13 个 `literature_backed` 失败和 4 个 `cited_later` 失败。前者主要是搜索结果没有原样出现候选 ID，后者是最后几轮没有后续假设/笔记可供引用；这两类不能用放宽审计规则来伪装成通过。
+- 模型调用 trace 关联从全局最近请求改为异步请求上下文，补充了并发 agent 回归测试。
