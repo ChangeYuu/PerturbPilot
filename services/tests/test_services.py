@@ -110,6 +110,18 @@ def test_readout_independent_of_submission_order(tmp_path):
     assert {r["id"]: r["readout"] for r in r1} == {r["id"]: r["readout"] for r in r2}
 
 
+def test_oracle_run_is_durable_and_idempotent(tmp_path):
+    o, root, _ = make(tmp_path)
+    body = {"task_id": "fake-task", "round": 1, "batch": ["G005"], "request_id": "run-1"}
+    first = o.run(body)
+    assert o.run(body) == first
+    assert o.replicates["G005"] == 1
+    with pytest.raises(HttpError, match="different request"):
+        o.run({**body, "batch": ["G006"]})
+    reloaded = Oracle(Package.load(root.root), hidden_of(root.root))
+    assert reloaded.run(body) == first
+
+
 def test_replicates_differ_and_reset_restores(tmp_path):
     o, _, _ = make(tmp_path)
     v0 = o.run({"batch": ["G005"]})["results"][0]["readout"]
@@ -161,6 +173,20 @@ def test_decision_needs_init_and_required_inputs(tmp_path):
         d.init({"package_dir": str(root)})
     with pytest.raises(HttpError, match="cannot load"):
         DecisionService().init({"package_dir": str(tmp_path / "nope")})
+
+
+def test_decision_observe_is_durable_and_idempotent(tmp_path):
+    _, root, d = make(tmp_path)
+    body = {"round": 1, "observations": [{"id": "G001", "readout": {"phenotype_reduction": 0.5}}], "request_id": "observe-1"}
+    first = d.observe(body)
+    assert d.observe(body) == first
+    assert d.version == 1
+    reloaded = DecisionService("auto")
+    reloaded.init({"package_dir": str(root.root)})
+    assert reloaded.observe(body) == first
+    assert reloaded.version == 1
+    with pytest.raises(HttpError, match="different request"):
+        reloaded.observe({**body, "observations": [{"id": "G002", "readout": {"phenotype_reduction": 0.5}}]})
 
 
 def test_auto_picks_method_by_inputs(tmp_path):
@@ -483,6 +509,36 @@ def test_http_roundtrip(tmp_path):
         for s in servers:
             s.shutdown()
 
+
+def test_http_request_ids_are_idempotent_and_conflicts_are_rejected(tmp_path):
+    root = write_synthetic_package(tmp_path / "syn", tmp_path / "syn-hidden", seed=0)
+    oracle, d = Oracle(Package.load(root), tmp_path / "syn-hidden"), DecisionService()
+    servers = [make_server("127.0.0.1", 0, oracle.routes()), make_server("127.0.0.1", 0, d.routes())]
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    ob, db = (f"http://127.0.0.1:{server.server_address[1]}" for server in servers)
+    try:
+        task = _post(f"{ob}/task")
+        _post(f"{db}/init", {"task": task, "package_dir": task["package_dir"]})
+        run_body = {"round": 1, "batch": ["G005"], "request_id": "http-run-1"}
+        first = _post(f"{ob}/run", run_body)
+        assert _post(f"{ob}/run", run_body) == first
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{ob}/run", {**run_body, "batch": ["G006"]})
+        assert error.value.code == 409
+        observe_body = {"round": 1, "observations": [ro(first["results"][0])], "request_id": "http-observe-1"}
+        receipt = _post(f"{db}/observe", observe_body)
+        assert _post(f"{db}/observe", observe_body) == receipt
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{db}/observe", {**observe_body, "round": 2})
+        assert error.value.code == 409
+        assert oracle.replicates["G005"] == 1
+        assert d.version == 1
+        assert json.loads((tmp_path / "syn-hidden" / ".perturbpilot-idempotency.json").read_text(encoding="utf-8"))["version"] == 1
+        assert (tmp_path / ".perturbpilot-decision-synthetic-screen-seed0.json").exists()
+    finally:
+        for server in servers:
+            server.shutdown()
 
 def test_token_required_when_configured(tmp_path):
     oracle, _, _ = make(tmp_path)

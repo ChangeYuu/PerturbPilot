@@ -24,7 +24,7 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 | 文件 | 内容 |
 |---|---|
 | `events.jsonl` | 事件流：`seq, ts, run_id, round, type, source, data`。source 取值为 framework / model / environment / human / decision |
-| `llm_calls.jsonl` | 发往模型服务的原始请求体和响应体，挂在最近一次 `agent/request` 的 turn/step 上。**不存请求头和响应头**，URL 去掉 query |
+| `llm_calls.jsonl` | 发往模型服务的原始请求体和响应体，按 `agent/request` 的异步上下文挂到对应 turn/step。**不存请求头和响应头**，URL 去掉 query |
 | `decision/NN-propose-K.json`、`NN-observe.json`、`NN-snapshot.json` | 决策模块的原始往返：推荐（含全候选池）、回执、可恢复快照 |
 | `oracle/NN-run.json` | oracle 的原始读数 |
 | `state.json` / `memory.json` | 完整运行状态（`format: 2`；没有这个字段的是早期格式，面板标“旧格式”，插件不再打开）/ 假设和笔记 |
@@ -87,7 +87,7 @@ cd D:\internwork\科学发现智能体系统
   candidates.csv   id + 公开属性列
   data/            data_cards 里列出的公开数据文件；candidate_features 可以是 id + 数值列的 CSV，也可以是含 X 的 numpy .npz（可选 id；没有 id 时按 candidates.csv 顺序对齐）
 
-<隐藏数据目录>/     服务启动时用 --hidden 指定；用 --tasks 时是 --hidden-root 下和任务包同名的子目录
+<隐藏数据目录>/     服务启动时用 --hidden 指定；用 --tasks 时是 --hidden-root 下和任务包同名的子目录；oracle `/run` 和决策模块 `/observe` 都要求稳定的 `request_id`，重复相同请求返回原响应，复用同一 ID 但请求体不同返回 409
   scores.csv       id + 各读数字段
   hits.txt         命中名单，可选；运行时不读，事后评估用
 ```

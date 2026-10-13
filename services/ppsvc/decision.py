@@ -14,7 +14,7 @@
   GET  /manifest   能力声明：方法、需要/可用的输入（[{role, modality}]）
   POST /init       {task, package_dir}                   -> 读任务包，缺必需输入时 400
   POST /propose    {round, k, exclude?}                  -> 推荐（id、rank + 方法自己的数值）+ 全候选池
-  POST /observe    {round, observations:[{id,readout}]}  -> 回执（接受/拒绝、更新前后版本）
+  POST /observe    {round, observations:[{id,readout}], request_id}  -> 回执（接受/拒绝、更新前后版本）；重复 request_id 返回原回执
   GET  /snapshot   -> 可恢复的完整状态
   POST /restore    {snapshot}
 
@@ -31,6 +31,7 @@ from typing import Any
 
 import numpy as np
 
+from .idempotency import IdempotencyStore
 from .jsonhttp import HttpError
 from .task import Features, Package, TaskError, stable_int, target_sign
 
@@ -135,6 +136,7 @@ class DecisionService:
         self.inputs_used: list[dict[str, str]] = []
         self.obs: list[tuple[str, float]] = []
         self.version = 0
+        self.idempotency: IdempotencyStore | None = None
 
     # ---- 状态 ----
 
@@ -185,6 +187,7 @@ class DecisionService:
         if method in FEATURE_METHODS and feats is None:
             raise HttpError(400, "missing required input candidate_features/embedding")
         self.package = pkg
+        self.idempotency = IdempotencyStore(pkg.root.parent / f'.perturbpilot-decision-{pkg.card["task_id"]}.json')
         self.ids = pkg.ids
         self.index = {cid: i for i, cid in enumerate(self.ids)}
         self.objective = pkg.card["objective"]
@@ -248,6 +251,16 @@ class DecisionService:
         items = body.get("observations")
         if not isinstance(items, list):
             raise HttpError(400, "observations must be a list")
+        payload = {k: v for k, v in body.items() if k != "request_id"}
+        cached = self.idempotency.lookup("observe", body.get("request_id"), payload) if self.idempotency else None
+        if cached is not None:
+            state = cached.get("state", {})
+            cached_version = int(state.get("version_after", self.version))
+            if self.version < cached_version:
+                self.obs = [(str(c), float(v)) for c, v in state.get("observations_after", [])]
+                self.version = cached_version
+                self._refit()
+            return cached["response"]
         field = self.objective["field"]
         accepted, rejected = [], []
         for it in items:
@@ -263,19 +276,27 @@ class DecisionService:
             else:
                 accepted.append((cid, float(val) * self.sign))
         before = self.version
-        if accepted:
-            self.obs.extend(accepted)
-            self.version += 1
-            self._refit()
-        return {
+        observations_after = self.obs + accepted
+        after = before + (1 if accepted else 0)
+        response = {
             "decision_version": DECISION_VERSION,
             "round": body.get("round"),
             "accepted": [c for c, _ in accepted],
             "rejected": rejected,
             "state_version_before": before,
-            "state_version_after": self.version,
-            "n_observations": len(self.obs),
+            "state_version_after": after,
+            "n_observations": len(observations_after),
         }
+        if self.idempotency:
+            self.idempotency.save("observe", body.get("request_id"), payload, response, {
+                "version_after": after,
+                "observations_after": observations_after,
+            })
+        self.obs = observations_after
+        self.version = after
+        if accepted:
+            self._refit()
+        return response
 
     def snapshot(self, _body: dict[str, Any]) -> dict[str, Any]:
         self._need_init()

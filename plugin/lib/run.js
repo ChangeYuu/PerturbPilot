@@ -292,34 +292,64 @@ export class Run {
     const r = this.state.round
     const selection = this.validateSelection(args)
     const rec = this.roundRecord(r)
-    rec.submission = { at: new Date().toISOString(), ...selection }
-    this.recorder.event('selection/submitted', 'model', r, {
-      batch: selection.batch,
-      groups: selection.groups,
-      from_recommendation: selection.from_recommendation,
-      outside: selection.outside,
-      forced: rec.steers > 0,
-    })
+    if (rec.submission && JSON.stringify(rec.submission.batch) !== JSON.stringify(selection.batch)) {
+      throw new RunError(`第 ${r} 轮的提交已经持久化；结果未知时必须重试原 batch，不能换一批候选。`)
+    }
+    const runRequestId = rec.submission?.run_request_id ?? `${this.state.runId}:run:${r}`
+    const observeRequestId = rec.submission?.observe_request_id ?? `${this.state.runId}:observe:${r}`
+    const hadSubmission = Boolean(rec.submission)
+    rec.submission = {
+      at: rec.submission?.at ?? new Date().toISOString(),
+      ...selection,
+      run_request_id: runRequestId,
+      observe_request_id: observeRequestId,
+    }
+    if (!hadSubmission) {
+      this.recorder.event('selection/submitted', 'model', r, {
+        batch: selection.batch,
+        groups: selection.groups,
+        from_recommendation: selection.from_recommendation,
+        outside: selection.outside,
+        forced: rec.steers > 0,
+        run_request_id: runRequestId,
+        observe_request_id: observeRequestId,
+      })
+    }
+    // Persist the intent before the first side-effecting service request. A lost
+    // response can then be retried with the same request IDs after reload.
+    this.save()
 
-    const run = await services.run({ task_id: this.state.task.task_id, round: r, batch: selection.batch }, signal)
-    this.recorder.writeJson(join('oracle', roundFile('run', r)), run)
-    rec.results = run.results
-    for (const x of run.results) this.state.observations.push({ id: x.id, round: r, replicate: x.replicate, readout: x.readout })
-    this.recorder.event('oracle/results', 'environment', r, { oracle_version: run.oracle_version, results: run.results })
-
+    const hadResults = Array.isArray(rec.results)
+    const run = await services.run({ task_id: this.state.task.task_id, round: r, batch: selection.batch, request_id: runRequestId }, signal)
+    if (!hadResults) {
+      this.recorder.writeJson(join('oracle', roundFile('run', r)), run)
+      rec.results = run.results
+      for (const x of run.results) this.state.observations.push({ id: x.id, round: r, replicate: x.replicate, readout: x.readout })
+      this.recorder.event('oracle/results', 'environment', r, { oracle_version: run.oracle_version, results: run.results, request_id: runRequestId })
+      this.save()
+    } else {
+      // The response may have been persisted just before a process crash. The
+      // service call above is still retried with the same request ID, but the
+      // recovered result must not create a second trace event or observation.
+      run.results = rec.results
+    }
     const objective = this.state.task.objective
     let failure = null
     try {
-      const receipt = await services.observe({ round: r, observations: run.results.map((x) => ({ id: x.id, readout: x.readout })) }, signal)
-      this.recorder.writeJson(join('decision', roundFile('observe', r)), receipt)
-      rec.receipt = receipt
-      this.recorder.event('decision/observed', 'decision', r, receipt)
+      let receipt = rec.receipt
+      if (!receipt) {
+        receipt = await services.observe({ round: r, observations: run.results.map((x) => ({ id: x.id, readout: x.readout })), request_id: observeRequestId }, signal)
+        this.recorder.writeJson(join('decision', roundFile('observe', r)), receipt)
+        rec.receipt = receipt
+        this.recorder.event('decision/observed', 'decision', r, { ...receipt, request_id: observeRequestId })
+      }
       if (!checkReceipt(run.results, receipt, objective).ok) {
         failure = '决策模块的回执和提交的读数对不上'
         this.recorder.event('receipt/mismatch', 'framework', r, { batch: selection.batch, receipt })
       }
       const snapshot = await services.snapshot(signal)
       this.recorder.writeJson(join('decision', roundFile('snapshot', r)), snapshot)
+      this.save()
     } catch (error) {
       failure = `决策模块没有收下本轮读数：${error.message}`
       this.recorder.event('decision/observe-failed', 'framework', r, { error: error.message })
