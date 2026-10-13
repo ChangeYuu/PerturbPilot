@@ -5,6 +5,7 @@
 // agent 用 DSH 自带的 web_search / web_fetch 查文献，这里只记录检索，不拦截。
 // 科学状态放在会话之外（runs/<会话 id>/），每一步通过 systemPrompt.context 注入，所以上下文压缩不会丢。
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { join, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -43,14 +44,15 @@ export function apply(ctx, config) {
   const retrievalCalls = new Map() // callId -> 还没回来的 web_search / web_fetch 调用 {agent_id, name, arguments}
   const driven = new Map() // agent.id -> 由框架发起、正在进行的轮次号
   const proposals = new Map() // agent.id -> agent 用 pp_propose_task 提的、等用户确认的设置
-  let lastRequest = null // 最近一次 agent/request 的 {agent_id, turn, step}，用来给模型调用记录挂上归属
+  const requestContext = new AsyncLocalStorage()
 
   const capture = installFetchCapture({
     pattern: config.llmUrlPattern,
     logger: ctx.logger,
     onCall(record) {
-      const run = lastRequest && runs.get(lastRequest.agent_id)
-      if (run) run.recordLlmCall(record, { turn: lastRequest.turn, step: lastRequest.step, correlation: 'latest-request' })
+      const current = requestContext.getStore()
+      const run = current && runs.get(current.agent_id)
+      if (run) run.recordLlmCall(record, { turn: current.turn, step: current.step, correlation: 'request-context' })
     },
   })
   const serviceOptions = {
@@ -388,8 +390,8 @@ export function apply(ctx, config) {
 
   ctx.effect(function* () {
     ctx.on('agent/request', async ({ agent, turn, step }, next) => {
-      if (runs.has(agent.id)) lastRequest = { agent_id: agent.id, turn, step }
-      return next()
+      const context = { agent_id: agent.id, turn, step }
+      return requestContext.run(context, () => next())
     })
 
     ctx.on('session/event', (session, event) => {

@@ -193,14 +193,29 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   assert.equal(agent.steers.length, 1)
 
   // 模型调用抓取：归属到最近一次 agent/request
-  await host.handlers['agent/request']({ agent, turn: 2, step: 3 }, async () => ({}))
-  await fetch(`${base}/llm/chat`, { method: 'POST', headers: { authorization: 'Bearer sk-x' }, body: '{"q":1}' })
+  await host.handlers['agent/request']({ agent, turn: 2, step: 3 }, async () => {
+    await fetch(`${base}/llm/chat`, { method: 'POST', headers: { authorization: 'Bearer sk-x' }, body: '{"q":1}' })
+  })
   await tick()
   const llm = readJsonl(join(runDir, 'llm_calls.jsonl'))
   assert.equal(llm.length, 1)
   assert.equal(llm[0].turn, 2)
   assert.equal(llm[0].step, 3)
+  assert.equal(llm[0].correlation, 'request-context')
   assert.ok(!JSON.stringify(llm).includes('sk-x'))
+
+  // 两个并发 agent/request 上下文不能互相覆盖模型调用归属。
+  const firstRequest = host.handlers['agent/request']({ agent, turn: 10, step: 1 }, async () => {
+    await tick()
+    await fetch(`${base}/llm/chat`, { method: 'POST', body: '{}'})
+  })
+  const secondRequest = host.handlers['agent/request']({ agent, turn: 11, step: 2 }, async () => {
+    await fetch(`${base}/llm/chat`, { method: 'POST', body: '{}'})
+  })
+  await Promise.all([firstRequest, secondRequest])
+  await tick()
+  const concurrentLlm = readJsonl(join(runDir, 'llm_calls.jsonl'))
+  assert.deepEqual(concurrentLlm.slice(-2).map((x) => [x.turn, x.step, x.correlation]), [[11, 2, 'request-context'], [10, 1, 'request-context']])
 
   // 检索：web_search 的调用和结果经 session/event 到达，只记录；别的工具不记
   host.handlers['session/event'](agent.session, { type: 'tool/call', data: { turn: 2, step: 3, callId: 'w1', name: 'web_search', arguments: '{"queries": ["G009 通路"]}' } })
