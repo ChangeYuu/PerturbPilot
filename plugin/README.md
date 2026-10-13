@@ -59,6 +59,7 @@ cd D:\internwork\科学发现智能体系统\services
 # 2. 密钥只放进环境变量，不写进任何文件；DSH_HOME 用单独的目录，不和日常用的 DSH 共用会话、工作区和设置
 $env:DEEPSEEK_API_KEY = (Get-Content <密钥文件> -Raw).Trim()
 $env:DSH_HOME = 'D:\DeepSeek\pp-home'
+Copy-Item D:\internwork\科学发现智能体系统\plugin\web-access.profile.json $env:DSH_HOME\web-access.json -Force
 
 # 3. 第一次用时：建空 profile，再把插件挂进去（不经过 pnpm）
 $node = 'D:\DeepSeek\npm-global\node.exe'
