@@ -1,5 +1,5 @@
 // 分析工具测试：真实的 Run（oracle 和决策模块用替身）+ 真实的 Python 子进程。
-// 用仓库的 .venv 里的 Python（有 numpy）；没有时用 PATH 上的 python。
+// 用仓库的 .venv 里的 analysis-ready Python；没有时用 PATH 上的 python。
 
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -103,11 +103,18 @@ test('errors, timeouts and a missing interpreter are reported, not thrown', asyn
   assert.deepEqual(events.map((e) => [e.data.exit_code === 0, e.data.timed_out]), [[false, false], [false, true], [false, false]])
 })
 
-test('missing third party packages get a clear environment message', async () => {
-  const res = await runAnalysis(run, { code: 'import pandas', purpose: '验证环境边界' }, opts())
+test('analysis-ready packages are available to the real analysis subprocess', async () => {
+  const res = await runAnalysis(run, { code: 'import pandas, scipy, sklearn, statsmodels; print(pandas.__version__)', purpose: '验证分析环境' }, opts())
+  assert.equal(res.exit_code, 0)
+  assert.equal(res.timed_out, false)
+  assert.match(res.stdout, /\d+\./)
+})
+
+test('missing packages explain how to extend the analysis environment', async () => {
+  const res = await runAnalysis(run, { code: 'import package_that_does_not_exist', purpose: '验证缺失库提示' }, opts())
   assert.equal(res.exit_code, 1)
-  assert.match(res.stderr, /当前分析环境只提供 Python 标准库和 numpy/)
-  assert.match(res.stderr, /当前环境不提供 pandas/)
+  assert.match(res.stderr, /analysis-ready/)
+  assert.match(res.stderr, /package_that_does_not_exist/)
 })
 
 test('analysis needs code, a purpose and an open run', async () => {

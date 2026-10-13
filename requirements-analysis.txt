@@ -1,0 +1,8 @@
+# Analysis-ready packages for pp_run_python.
+# The runtime still blocks network access and service credentials; these packages
+# only improve local analysis of exported task data.
+numpy>=2.0
+pandas>=2.2
+scipy>=1.14
+scikit-learn>=1.5
+statsmodels>=0.14

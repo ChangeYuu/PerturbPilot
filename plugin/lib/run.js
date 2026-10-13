@@ -74,6 +74,7 @@ export class Run {
       retrievals: [],
     }
     const run = new Run(recorder, state)
+    run.servicesReady = true
     recorder.event('run/started', 'framework', 1, {
       task_id: card.task_id,
       synthetic: card.synthetic,
@@ -97,6 +98,7 @@ export class Run {
     this.state = state
     this.candidateSet = new Set(state.candidateIds)
     this.retrievalTexts = new Map() // 检索编号 -> 结果全文；检索记录写了就不再变
+    this.servicesReady = false
   }
 
   get budget() {
@@ -138,8 +140,41 @@ export class Run {
 
   // ---- 决策模块 ----
 
+  async ensureServices(services, signal) {
+    if (this.servicesReady) return
+    const init = await services.init({
+      task: this.state.task,
+      package_dir: this.state.task.package_dir,
+      method: this.state.decision.method,
+    }, signal)
+    const replicates = {}
+    for (const observation of this.state.observations) {
+      const next = Number.isInteger(observation.replicate) ? observation.replicate + 1 : 1
+      replicates[observation.id] = Math.max(replicates[observation.id] ?? 0, next)
+    }
+    await services.resetOracle({
+      task_id: this.state.task.task_id,
+      batch_size: this.budget.batch_size,
+      replicates,
+    }, signal)
+    const snapshot = this.latestSnapshot()
+    if (snapshot) await services.restore({ snapshot }, signal)
+    this.servicesReady = true
+    this.state.decision.version = init.decision_version ?? this.state.decision.version
+    this.save()
+  }
+
+  latestSnapshot() {
+    for (let r = this.state.round; r >= 1; r--) {
+      const snapshot = this.recorder.readJson(join('decision', roundFile('snapshot', r)))
+      if (snapshot) return snapshot
+    }
+    return null
+  }
+
   async getDecision(services, signal) {
     this.requireOpen()
+    await this.ensureServices(services, signal)
     const r = this.state.round
     const k = this.expectedBatchSize()
     const proposal = await services.propose({ round: r, k: k + ALTERNATIVES }, signal)
@@ -227,7 +262,13 @@ export class Run {
       if (source === undefined) problems.push(`${id} 不在本轮推荐里，要放进一个写了理由的组`)
       else if (source === 'decision') problems.push(`${id} 不在本轮推荐里，它所在组的 source 不能是 decision`)
     }
-    if (problems.length) throw new RunError(`选择不合法：\n- ${problems.join('\n- ')}`)
+    if (problems.length) {
+      const guidance = [
+        `本轮要求 ${expected} 个候选；本轮推荐 ${recs.length} 个；推荐外候选必须使用 prior_knowledge/literature/analysis/hypothesis_test/exploration/data_quality。`,
+        this.budget.allow_repeats ? null : `已测候选不能再次提交：${[...this.measuredIds()].slice(0, 20).join(', ') || '无'}。`,
+      ].filter(Boolean)
+      throw new RunError(`选择不合法：\n- ${problems.join('\n- ')}\n\n修正建议：\n- ${guidance.join('\n- ')}`)
+    }
 
     const bySource = {}
     for (const id of batch) {
@@ -247,6 +288,7 @@ export class Run {
 
   async submitSelection(args, services, signal) {
     this.requireOpen()
+    await this.ensureServices(services, signal)
     const r = this.state.round
     const selection = this.validateSelection(args)
     const rec = this.roundRecord(r)
@@ -285,13 +327,13 @@ export class Run {
 
     const exhausted = !this.budget.allow_repeats && this.measuredIds().size >= this.state.candidateIds.length
     const finished = r >= this.budget.rounds || exhausted
-    if (finished) {
+    if (finished && !failure) {
       this.state.status = 'finished'
       this.recorder.event('run/finished', 'framework', r, { rounds: r, ...(exhausted && r < this.budget.rounds ? { reason: 'candidates_exhausted' } : {}) })
-    } else {
+    } else if (!finished) {
       this.state.round = r + 1
     }
-    if (failure && !finished) {
+    if (failure) {
       this.state.status = 'paused'
       this.recorder.event('run/paused', 'framework', r, { reason: failure })
     }
@@ -309,7 +351,7 @@ export class Run {
         state_version_after: rec.receipt.state_version_after,
       },
       problem: failure,
-      next: finished ? { finished: true } : { round: r + 1, rounds: this.budget.rounds, status: this.state.status },
+      next: failure ? { round: r, rounds: this.budget.rounds, status: this.state.status } : finished ? { finished: true } : { round: r + 1, rounds: this.budget.rounds, status: this.state.status },
     }
   }
 
@@ -352,7 +394,7 @@ export class Run {
     return entry
   }
 
-  /** 第 id 次检索的结果全文（文献核对用）；记录读不到时当作空文本。 */
+  /** 检索正文；审计还会把结构化来源标题和 URL 作为证据文本。 */
   retrievalText(id) {
     if (!this.retrievalTexts.has(id)) {
       let text = ''
@@ -364,8 +406,17 @@ export class Run {
     return this.retrievalTexts.get(id)
   }
 
+  retrievalEvidence(id) {
+    try {
+      const record = this.recorder.readJson(join('retrieval', `${id}.json`))
+      return `${record.text ?? ''}\n${JSON.stringify(record.meta ?? {})}`
+    } catch {
+      return this.retrievalText(id)
+    }
+  }
+
   audit() {
-    return auditRun(this.state, (id) => this.retrievalText(id))
+    return auditRun(this.state, (id) => this.retrievalEvidence(id))
   }
 
   // ---- 假设与笔记 ----

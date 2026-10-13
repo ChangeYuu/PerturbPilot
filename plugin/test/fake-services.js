@@ -17,6 +17,7 @@ export function fakeServices({
   rounds = 3,
   allowRepeats = true,
   dropFromReceipt = null,
+  observeError = null,
   empty = [],
   direction = 'high',
   required = [],
@@ -125,6 +126,7 @@ export function fakeServices({
     },
     async observe(body) {
       log('observe', body)
+      if (observeError) throw new Error(observeError)
       const usable = body.observations.filter((o) => typeof o.readout?.score === 'number')
       const accepted = usable.filter((o) => o.id !== dropFromReceipt)
       const rejected = body.observations.filter((o) => !usable.includes(o)).map((o) => ({ id: o.id, reason: 'empty_readout' }))

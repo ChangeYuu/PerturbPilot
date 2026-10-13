@@ -237,6 +237,18 @@ test('citations must refer to measured candidates', async () => {
   assert.throws(() => run.updateHypothesis({ id: 'H9', status: 'supported', cites: [] }), /没有编号/)
 })
 
+test('a final-round observation failure pauses instead of finishing', async () => {
+  const services = fakeServices({ rounds: 1, observeError: 'decision unavailable' })
+  const run = await Run.start({ dir, runId: 's1', services })
+  const res = await playRound(run, services)
+  assert.match(res.problem, /decision unavailable/)
+  assert.equal(run.state.status, 'paused')
+  assert.equal(run.state.round, 1)
+  assert.deepEqual(res.next, { round: 1, rounds: 1, status: 'paused' })
+  assert.equal(readJsonl(join(dir, 'events.jsonl')).some((e) => e.type === 'run/finished'), false)
+  assert.equal(readJson(join(dir, 'audit.json')).status, 'paused')
+})
+
 test('receipt mismatch pauses the run and fails the audit', async () => {
   const services = fakeServices({ dropFromReceipt: 'G001' })
   const run = await Run.start({ dir, runId: 's1', services })
@@ -341,6 +353,18 @@ test('a run reloads from disk with the same state', async () => {
   const seqs = readJsonl(join(dir, 'events.jsonl')).map((e) => e.seq)
   assert.deepEqual(seqs, seqs.map((_, i) => i + 1))
 })
+
+test('a reloaded run restores oracle and decision service state before proposing', async () => {
+  const firstServices = fakeServices()
+  const run = await Run.start({ dir, runId: 's1', services: firstServices })
+  await playRound(run, firstServices)
+  const secondServices = fakeServices()
+  const again = Run.load(dir, 's1')
+  const decision = await again.getDecision(secondServices)
+  assert.equal(decision.state_version, 1)
+  assert.deepEqual(secondServices.calls.filter((x) => ['init', 'resetOracle', 'restore', 'propose'].includes(x.name)).map((x) => x.name), ['init', 'resetOracle', 'restore', 'propose'])
+})
+
 
 test('a legacy run is recognised and not opened', () => {
   writeFileSync(join(dir, 'state.json'), JSON.stringify({ runId: 'old', task: { max_rounds: 3 } }), 'utf8')

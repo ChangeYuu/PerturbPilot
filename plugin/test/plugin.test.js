@@ -181,9 +181,14 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   assert.equal(agent.followups.length, 1)
   assert.equal((await panelPost(`${panelBase}/start`, {})).status, 400)
   assert.deepEqual(agent.followups[0].source, { kind: 'perturbpilot', round: 1 })
-  host.handlers['session/event'](agent.session, { type: 'user/message', data: agent.followups[0] })
-
-  // 快结束还没交 → 催一次
+  // 即使 DSH 没有回放内部的 perturbpilot user/message 事件，框架也要记住
+  // 自己驱动的轮次并在工具错误后的 idle 路径催交。
+  host.handlers['agent/status']({ agent, status: 'idle' })
+  await tick()
+  assert.equal(agent.steers.length, 0)
+  assert.equal(agent.followups.length, 2)
+  assert.equal(agent.followups[1].source.round, 1)
+  host.handlers['session/event'](agent.session, { type: 'user/message', data: agent.followups[1] })
   await host.handlers['agent/turn-stopping']({ agent, turn: 2 })
   assert.equal(agent.steers.length, 1)
 
@@ -233,8 +238,8 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   assert.equal(agent.steers.length, 1)
   host.handlers['agent/status']({ agent, status: 'idle' })
   await tick()
-  assert.equal(agent.followups.length, 2)
-  assert.equal(agent.followups[1].source.round, 2)
+  assert.equal(agent.followups.length, 3)
+  assert.equal(agent.followups[2].source.round, 2)
 
   // 用户插话：记为 human 事件；用户排了消息时框架不抢
   host.handlers['session/event'](agent.session, {
@@ -244,7 +249,7 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
   await host.tools.pp_control.execute({ action: 'pause' }, exec(agent))
   host.handlers['agent/status']({ agent, status: 'idle' })
   await tick()
-  assert.equal(agent.followups.length, 2)
+  assert.equal(agent.followups.length, 3)
 
   // 面板路由：读到暂停状态；从面板点"继续"，空闲的会话马上开下一轮
   {
@@ -263,8 +268,8 @@ test('plugin drives rounds, steers, validates and records', async (t) => {
     const resumed = await panelPost(`${panelBase}/control`, { action: 'resume' })
     assert.equal((await resumed.json()).run.status, 'active')
     await tick()
-    assert.equal(agent.followups.length, 3)
-    assert.equal(agent.followups[2].source.round, 2)
+    assert.equal(agent.followups.length, 4)
+    assert.equal(agent.followups[3].source.round, 2)
   }
 
   // 每个服务请求（包括设置页的探测）都带了令牌

@@ -13,11 +13,11 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 - 浏览器面板：DSH web 端右侧栏里的 “PerturbPilot 任务” 页（点右侧栏的 “+” 打开），每 2 秒刷新本会话的任务状态、各轮推荐 / 选择 / 读数 / 审计、读数排名、假设、笔记、检索和最近事件，并有暂停 / 继续 / 结束按钮。会话还没有任务时，这一页是开始任务的表单：选任务包（下面显示它的扰动、目标、原定预算和候选数）、决策方法、轮数和每轮个数；agent 提议过的话，表单按提议填好，上面显示提议的理由，按钮是“确认开始”。对话照常在 DSH 的对话区进行。
 - 科学台账页：左侧栏的 “科学台账” 入口打开一个占满主区的页面。左边列出 `runs/` 下所有任务（最近更新的在前，默认选第一个；早期格式的记录标“旧格式”，只列出、点不开），右边是选中任务的记录，从上往下：总览（目标、当前最佳、已测多少、推荐以外的有多少、审计，加一张每轮读数和至今最佳的进展图）；当前结论（每条假设的最新状态，可展开看历次更新）；逐轮记录（每轮一张卡片，按“决策模块推荐 → 分析与判断（含检索） → 本轮测的和分组理由 → 读数 → 审计和回执”排）；最后折叠着全部读数排名和最近事件。也有暂停 / 继续 / 结束按钮。
 - 设置里的 “PerturbPilot” 一页：oracle 和决策模块连不连得上、服务令牌设了没有、插件当前的配置。这一页只读。
-- 数据分析：agent 可以调 `pp_run_python(code, purpose)`，在这次分析自己的目录里跑一段 Python（numpy 可用）。目录里事先导出了 `observations.csv`（id, round, replicate, 再加每个读数字段一列，空读数留空）、`candidates.csv`（任务包的候选表原样）、`data/`（任务包里公开的数据文件）和 `decision.csv`（本轮决策模块给的全候选池：id, measured, 再加方法给的数值列）。这个工具不能测量新候选：两个服务都要求 `x-perturbpilot-token` 头，令牌只有框架有，Python 子进程拿到的环境变量是白名单里的那几项，不含令牌和模型密钥。
+- 数据分析：agent 可以调 `pp_run_python(code, purpose)`，在这次分析自己的目录里跑一段 Python（numpy 可用）。目录里事先导出了 `observations.csv`（id, round, replicate, 再加每个读数字段一列，空读数留空）、`candidates.csv`（任务包的候选表原样）、`data/`（任务包里公开的数据文件）和 `decision.csv`（本轮决策模块给的全候选池：id, measured, 再加方法给的数值列）。analysis-ready 环境预装 `numpy`、`pandas`、`scipy`、`scikit-learn`、`statsmodels`；候选 id 应当按字符串处理，复杂分析应避免对全候选库做 O(n²) 两两扫描。这个工具不能测量新候选：两个服务都要求 `x-perturbpilot-token` 头，令牌只有框架有，Python 子进程拿到的环境变量是白名单里的那几项，不含令牌和模型密钥。
   - **Windows 上没有沙箱。** 子进程能读写本机文件，包括 oracle 的源码；令牌只防它直接调服务测量。所有代码和输出都记录下来，可以事后查。
 - 对话区里每个 `pp_*` 工具调用显示成卡片：任务列表、提议的任务设置和理由、推荐表（按方法给的数值列显示）、本轮提交的批次和分组理由、读数表、假设和笔记，不再是原始 JSON。
 - 新会话页中间的 logo 下面有一段指引，告诉用户可以用自然语言描述想发现什么。
-- 专用模式：插件的 bundle patch（`cordis.patch.yml`）只留一个“科学发现”模式。这个模式只有 `pp_*` 工具、`ask_user_question`、`web_search` / `web_fetch` 和上下文压缩，没有 shell、文件读写、子 agent、计划模式、技能，也不读工作区里的 AGENTS.md / CLAUDE.md。web 端自带的 4 个模式、模式选择器、计划模式开关、预设设置页和插件设置页都关掉了。
+- 专用模式：插件的 bundle patch（`cordis.patch.yml`）只留一个“科学发现”模式。这个模式只有 `pp_*` 工具、`ask_user_question`、`web_search` / `web_fetch`（web_fetch 由 profile 的 `web-access` provider 承接）和上下文压缩，没有 shell、文件读写、子 agent、计划模式、技能，也不读工作区里的 AGENTS.md / CLAUDE.md。web 端自带的 4 个模式、模式选择器、计划模式开关、预设设置页和插件设置页都关掉了。
 
 ## 运行记录 `runs/<会话 id>/`
 
@@ -118,7 +118,7 @@ cd D:\internwork\科学发现智能体系统\services
 | `llmUrlPattern` | `deepseek` | URL 命中这个正则的 fetch 调用记为模型调用 |
 | `maxSteers` | `2` | 一轮里最多催几次 |
 | `pythonPath` | `python` | `pp_run_python` 用的 Python。只写名字就从 PATH 找；带目录的相对路径按启动 dsh 的目录解析。建议设成 `.venv\Scripts\python.exe`（有 numpy） |
-| `pythonTimeoutMs` | `60000` | 一次分析最长跑多久，超时杀掉 |
+| `pythonTimeoutMs` | `120000` | 一次分析最长跑多久，超时杀掉；复杂分析可在 profile 中调高 |
 | `serviceTokenEnv` | `PERTURBPILOT_SERVICE_TOKEN` | 服务令牌所在的环境变量名。没设这个变量时服务不查令牌（ppsvc 启动时会警告），分析用的 Python 就能直接调服务 |
 
 ## 测试

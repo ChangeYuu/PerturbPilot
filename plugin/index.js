@@ -27,7 +27,7 @@ export const Config = z.object({
   llmUrlPattern: z.string().default('deepseek').description('URL 命中这个正则的 fetch 调用记为模型调用'),
   maxSteers: z.natural().default(2).description('一轮快结束还没提交时最多催几次'),
   pythonPath: z.string().default('python').description('pp_run_python 用的 Python；带目录的相对路径按启动 dsh 时的目录解析'),
-  pythonTimeoutMs: z.natural().default(60000).description('一次 pp_run_python 最多跑多久（毫秒），超时杀掉'),
+  pythonTimeoutMs: z.natural().default(120000).description('一次 pp_run_python 最多跑多久（毫秒），超时杀掉'),
   serviceTokenEnv: z.string().default('PERTURBPILOT_SERVICE_TOKEN').description('服务令牌所在的环境变量名；设了就随每个服务请求带上'),
 })
 
@@ -113,6 +113,11 @@ export function apply(ctx, config) {
     const dir = join(runsDir, sessionId)
     if (Run.isLegacy(dir)) throw new RunError('这个会话里有旧格式的任务记录，不能再开任务；新开一个会话。')
     if (starting.size) throw new RunError('正在开始任务')
+    for (const disk of listRuns(runsDir)) {
+      if (disk.run_id !== sessionId && (disk.status === 'active' || disk.status === 'paused')) {
+        throw new RunError(`会话 ${disk.run_id} 的任务还没结束（${disk.status === 'paused' ? '已暂停' : '进行中'}）。决策模块和 oracle 同一时间只跑一个任务，先在那个会话里结束它。`)
+      }
+    }
     for (const [id, other] of runs) {
       if (id !== sessionId && !other.closed) {
         throw new RunError(`会话 ${id} 的任务还没结束（${other.state.status === 'paused' ? '已暂停' : '进行中'}）。决策模块和 oracle 同一时间只跑一个任务，先在那个会话里结束它。`)
@@ -265,7 +270,7 @@ export function apply(ctx, config) {
 
   tool({
     name: 'pp_run_python',
-    description: '在本任务的运行目录里跑一段 Python 做分析（只保证 Python 标准库和 numpy；pandas、scipy、sklearn 等未提供）。当前目录下有 observations.csv（id, round, replicate 加每个读数字段，全部测量）、candidates.csv（任务包的候选表）、decision.csv（最近一次推荐里决策模块对每个候选的打分）、data/（任务包里公开的数据文件，比如候选特征）。用 print 输出结论；写出的文件会留在这次分析的目录里。这里不能测量新候选，测量只能经 pp_submit_selection。代码和输出都会记录。',
+    description: '在本任务的运行目录里跑一段 Python 做分析（使用仓库的 analysis-ready 环境，预装 numpy、pandas、scipy、scikit-learn、statsmodels；不要假设其他第三方库存在）。当前目录下有 observations.csv（id, round, replicate 加每个读数字段，全部测量）、candidates.csv（任务包的候选表）、decision.csv（最近一次推荐里决策模块对每个候选的打分）、data/（任务包里公开的数据文件，比如候选特征）。用 print 输出结论；写出的文件会留在这次分析的目录里。这里不能测量新候选，测量只能经 pp_submit_selection。代码和输出都会记录。',
     parameters: {
       code: { type: 'string', required: true, description: '完整的 Python 脚本' },
       purpose: { type: 'string', required: true, description: '一句话：这段分析要回答什么' },
@@ -296,6 +301,11 @@ export function apply(ctx, config) {
     if (round === null) return
     try {
       ctx.agents.withoutInitiator(async () => {
+        // Keep the driver marker before DSH emits any lifecycle event. Some
+        // tool-error paths close a turn without replaying the internal
+        // perturbpilot user/message event; status handling must still get a
+        // bounded chance to steer the open round before stalling it.
+        driven.set(agent.id, round)
         run.markDriven(round)
         agent.followup(createUserMessage({
           content: [{ type: 'text', text: roundPrompt(run.state, round) }],

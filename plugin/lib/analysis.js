@@ -113,12 +113,14 @@ function clip(text, max) {
   return text.length <= max ? text : `${text.slice(0, max)}\n…（截断，共 ${text.length} 字符）`
 }
 
+const ANALYSIS_IMPORTS = new Set(['numpy', 'pandas', 'scipy', 'sklearn', 'statsmodels']);
+
 function explainPythonError(stderr) {
   const missing = stderr.match(/ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]/);
   if (!missing) return stderr;
   const packageName = missing[1].split('.')[0];
-  if (packageName === 'numpy') return stderr;
-  return `当前分析环境只提供 Python 标准库和 numpy；当前环境不提供 ${packageName}。请改用标准库或 numpy。\n\n${stderr}`;
+  if (ANALYSIS_IMPORTS.has(packageName)) return stderr;
+  return `analysis-ready 环境预装 numpy、pandas、scipy、scikit-learn、statsmodels；当前环境没有 ${packageName}。如确实需要新增库，请更新 requirements-analysis.txt 后重建环境。\n\n${stderr}`;
 }
 
 function exec({ python, dir, timeoutMs, signal, env }) {

@@ -11,6 +11,11 @@
 - insert:
     - id: perturbpilot
       name: perturbpilot
+    - id: dsh-web-access
+      name: dsh-web-access
+      config:
+        registerProviders: true
+        replaceOfficialSearch: false
     - id: preset-perturbpilot
       name: '@deepseek-ai/dsh-agent-preset'
       config:
@@ -34,6 +39,8 @@
             name: '@deepseek-ai/dsh-tool-web'
             config:
               fetch: true
+              fetchTimeoutMs: 90000
+              fetchMaxOutputChars: 200000
               searchTimeoutMs: 60000
           - id: compaction
             name: cordis:group
@@ -53,25 +60,18 @@
                   headChars: 4096
                   tailChars: 1024
 
+- id: web
+  config:
+    searchProvider: deepseek-official
+    fetchProvider: web-access
+
 - id: agent-preset-registry
   config:
     default: perturbpilot
-    modeSelectionEnabled: false
-
-- id: preset-standard
-  disabled: true
-- id: preset-ptc
-  disabled: true
-- id: preset-minimal
-  disabled: true
-- id: preset-cordis
-  disabled: true
 
 - id: ui-plan
   disabled: true
 - id: ui-agent-preset
   disabled: true
 - id: ui-settings-plugins
-  disabled: true
-- id: ui-brand-official
   disabled: true
