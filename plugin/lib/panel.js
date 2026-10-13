@@ -89,6 +89,7 @@ export function panelView(run, { events = 40 } = {}) {
     round: s.round,
     audit_counts: audit.counts,
     controls: run.closed ? [] : s.status === 'paused' ? ['resume', 'stop'] : ['pause', 'stop'],
+    execution: executionView(all, s),
     rounds,
     observations,
     hypotheses: s.hypotheses.map((h) => ({ ...h, history: h.history ?? [], updates: h.history?.length ?? 0 })),
@@ -96,6 +97,64 @@ export function panelView(run, { events = 40 } = {}) {
     analyses: all.filter((e) => e.type === 'analysis/executed').map((e) => ({ round: e.round, ts: e.ts, ...e.data })),
     retrievals: retrievalView(all),
     events: all.slice(-events).map(({ seq, ts, round, type, source }) => ({ seq, ts, round, type, source })),
+  }
+}
+
+const EXECUTION_TEXT = {
+  'run/started': '任务已启动',
+  'round/started': '开始新一轮',
+  'decision/proposed': '决策模块已给出推荐',
+  'analysis/executed': 'Python 分析完成',
+  'retrieval/started': '正在检索文献',
+  'retrieval/searched': '文献搜索完成',
+  'retrieval/fetched': '网页读取完成',
+  'retrieval/aborted': '文献检索中断',
+  'selection/submitted': '已提交候选，等待读数',
+  'oracle/results': 'oracle 已返回读数',
+  'decision/observed': '决策模块已收到读数',
+  'decision/observe-failed': '决策模块接收失败',
+  'hypothesis/updated': '假设已更新',
+  'note/written': '笔记已写入',
+  'run/finished': '任务已完成',
+  'run/paused': '任务已暂停',
+}
+
+function executionDetail(event) {
+  const d = event.data ?? {}
+  if (event.type === 'analysis/executed') return `${d.id ?? '分析'}：${d.exit_code === 0 && !d.timed_out ? '成功' : d.timed_out ? '超时' : '失败'}`
+  if (event.type === 'retrieval/started') return d.tool === 'web_fetch' ? `读取 ${d.url ?? ''}` : `搜索 ${(d.queries ?? []).join('；')}`
+  if (event.type === 'retrieval/searched') return `${(d.queries ?? []).join('；')} · ${(d.results ?? []).length} 条结果${d.is_error ? ' · 出错' : ''}`
+  if (event.type === 'retrieval/fetched') return `${d.url ?? ''}${d.status ? ` · HTTP ${d.status}` : ''}${d.is_error ? ' · 出错' : ''}`
+  if (event.type === 'retrieval/aborted') return d.reason ?? '调用中断'
+  if (event.type === 'selection/submitted') return `${(d.batch ?? []).length} 个候选`
+  if (event.type === 'oracle/results') return `${(d.results ?? []).length} 个读数`
+  if (event.type === 'decision/observed') return `接受 ${d.accepted?.length ?? 0} 个`
+  if (event.type === 'decision/observe-failed') return d.error ?? '服务不可用'
+  if (event.type === 'run/paused') return d.reason ?? '等待继续'
+  return ''
+}
+
+function executionView(events, state) {
+  const relevant = events.filter((e) => EXECUTION_TEXT[e.type])
+  const latest = relevant.at(-1)
+  const total = state.task.budget.rounds
+  const round = Math.min(state.round, total)
+  const steps = relevant.slice(-12).map((e) => ({
+    ts: e.ts,
+    round: e.round,
+    type: e.type,
+    source: e.source,
+    label: EXECUTION_TEXT[e.type],
+    detail: executionDetail(e),
+  }))
+  return {
+    status: state.status,
+    round,
+    rounds: total,
+    label: state.status === 'finished' ? '任务已完成' : state.status === 'paused' ? '任务已暂停' : latest ? EXECUTION_TEXT[latest.type] : '等待执行事件',
+    detail: latest ? executionDetail(latest) : '',
+    updated_at: latest?.ts ?? null,
+    steps,
   }
 }
 

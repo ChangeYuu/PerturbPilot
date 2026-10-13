@@ -39,6 +39,7 @@ PerturbPilot 是一个 DSH 插件，负责把一次扰动筛选任务接进 DSH 
 - **Node ≥ 22.19**。DSH 0.1.7-rc.1 的入口用了 `import.meta.main`，Node 22.14 上 `dsh` 什么都不做就退出。本机 `C:\Program Files\nodejs` 是 22.14；`D:\DeepSeek\npm-global\node.exe` 是 22.23.2，下面的命令都用它。
 - 用插件目录里装的 DSH 0.1.7-rc.1（`plugin\node_modules\@deepseek-ai\dsh`），不要用全局的 `dsh`（全局那个是 0.1.0-rc.6）。
 - 不需要 pnpm：第 3 步用 `scripts/link-profile.js` 代替 `dsh plugin add`（后者会转发给 pnpm）。
+- PerturbPilot profile 默认把 DSH 工作步骤设为 `verbose`，对话区会展开 turn process；右侧 PerturbPilot 面板的“当前执行”区域还会显示轮次进度、最近阶段和最近事件时间线。
 
 在 PowerShell 里依次执行：
 

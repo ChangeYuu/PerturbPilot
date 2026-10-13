@@ -8,6 +8,7 @@ PerturbPilot v0.1 完成一次 18 个真实任务包的正式闭环运行，并�
 
 - 请求级幂等：本轮选择意图先落盘，oracle 和决策模块请求使用稳定 ID；服务端保存响应并支持重启后的重复请求恢复。
 - 检索生命周期：`web_search` / `web_fetch` 在调用开始时记录 `retrieval/started`，正常结果保留原有完成事件，工具中断或 agent 终止时记录 `retrieval/aborted`，未完成调用也会留下 `retrieval/R<N>.json`。
+- 可见执行过程：PerturbPilot 右侧面板增加“当前执行”摘要、轮次进度和最近步骤时间线；profile 将 DSH 工作步骤默认设为 `verbose`，对话区默认展开 turn process。
 - 增加真实多进程 ppsvc 重启演练：服务进程重启后，oracle / decision journal 能重放同一 request_id，冲突请求返回 409。
 
 - 18 个任务全部完成 10 轮；每轮提交、oracle 读数和决策模块回执在运行记录中逐轮对应。

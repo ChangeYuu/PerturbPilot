@@ -276,6 +276,8 @@ test('panel renders loading, empty, error and full states', () => {
   assert.match(all, /合成数据/)
   assert.match(all, /进行中/)
   assert.match(all, /第 2\/3 轮/)
+  assert.match(all, /当前执行/)
+  assert.match(all, /决策模块已收到读数/)
   assert.match(all, /G001 附近值高/)
   for (const r of view.rounds[0].results) assert.ok(all.includes(`${r.id}=${r.value}`))
   // 第 1 轮：调用、提交通过；没写文献理由，文献核对不适用；回执通过
